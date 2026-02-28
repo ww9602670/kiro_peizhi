@@ -1,0 +1,16 @@
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.vscode/
+.idea/
+.env
+.env.local
+.env.*.local
+!.env.development
+.DS_Store
+Thumbs.db
