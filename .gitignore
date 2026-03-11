@@ -1,0 +1,41 @@
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.vscode/
+.idea/
+.env
+.env.local
+.env.*.local
+!.env.development
+.DS_Store
+Thumbs.db
+
+# Hypothesis PBT cache
+.hypothesis/
+
+# Backend data (SQLite)
+backend/data/
+
+# Backend pytest cache
+backend/.pytest_cache/
+
+# Backend root-level test/utility scripts (not part of core app)
+backend/test_*.py
+backend/check_*.py
+backend/monitor_*.py
+backend/stop_*.py
+backend/cleanup_*.py
+backend/fix_*.py
+backend/start_and_test.py
+backend/_*.py
+
+# Backend log files
+backend/*.log
+
+# Frontend screenshots
+frontend/screenshots/

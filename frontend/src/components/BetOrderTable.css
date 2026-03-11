@@ -1,0 +1,91 @@
+.bet-order-table-wrap {
+  overflow-x: auto;
+}
+
+.bet-order-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.bet-order-table th,
+.bet-order-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.bet-order-table th {
+  background: #fafafa;
+  font-weight: 600;
+  color: #666;
+  font-size: 12px;
+}
+
+.row-win {
+  background: #f6ffed;
+}
+
+.row-lose {
+  background: #fff7f0;
+}
+
+.row-fail {
+  background: #fff2f0;
+}
+
+.pnl-positive {
+  color: #52c41a;
+  font-weight: 500;
+}
+
+.pnl-negative {
+  color: #ff4d4f;
+  font-weight: 500;
+}
+
+.order-status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.order-status-pending {
+  background: #e6f7ff;
+  color: #1677ff;
+}
+
+.order-status-bet_success {
+  background: #f6ffed;
+  color: #52c41a;
+}
+
+.order-status-bet_failed {
+  background: #fff2f0;
+  color: #ff4d4f;
+}
+
+.order-status-settled {
+  background: #f5f5f5;
+  color: #666;
+}
+
+.order-status-cancelled {
+  background: #f5f5f5;
+  color: #999;
+}
+
+.td-time {
+  font-size: 12px;
+  color: #999;
+}
+
+.empty-text {
+  text-align: center;
+  color: #999;
+  padding: 40px 0;
+  font-size: 14px;
+}

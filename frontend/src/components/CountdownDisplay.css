@@ -1,0 +1,133 @@
+.countdown-display {
+  padding: 16px;
+  border: 1px solid #e0e0e0;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+.error-banner {
+  padding: 8px;
+  margin-bottom: 12px;
+  background: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: 4px;
+  color: #856404;
+  font-size: 13px;
+}
+
+/* Issue + result row */
+.issue-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.issue-label {
+  font-size: 14px;
+  color: #666;
+}
+
+.issue-number {
+  font-size: 16px;
+  color: #1a1a1a;
+  font-family: 'SF Mono', 'Menlo', monospace;
+  margin-right: 4px;
+}
+
+/* Lottery result balls */
+.result-balls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ball {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.ball-sum {
+  font-size: 14px;
+  font-weight: 600;
+  color: #333;
+  margin-left: 2px;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.no-result {
+  font-size: 13px;
+  color: #999;
+}
+
+/* Countdown row */
+.countdown-row {
+  display: flex;
+  gap: 12px;
+}
+
+.countdown-item {
+  flex: 1;
+  text-align: center;
+}
+
+.countdown-item > span {
+  display: block;
+  font-size: 12px;
+  color: #999;
+  margin-bottom: 4px;
+}
+
+.issue-current {
+  font-size: 16px;
+  color: #1a1a1a;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.cd-value {
+  font-size: 24px;
+  color: #1677ff;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.cd-value small {
+  font-size: 13px;
+  font-weight: 400;
+  color: #999;
+  margin-left: 2px;
+}
+
+/* Lottery state colors */
+.state-value {
+  font-size: 16px;
+  font-weight: 600;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.state-green {
+  color: #52c41a;
+}
+
+.state-red {
+  color: #ff4d4f;
+}
+
+.state-yellow {
+  color: #faad14;
+}
+
+.state-gray {
+  color: #999;
+}
