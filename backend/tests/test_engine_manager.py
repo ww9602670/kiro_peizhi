@@ -160,6 +160,7 @@ class TestStopWorker:
         """ Worker"""
         manager = _make_manager()
         worker = _make_mock_worker(account_id=100)
+        worker._has_unsettled_orders = AsyncMock(return_value=False)
         await manager.registry.register(100, worker)
 
         result = await manager.stop_worker(100)
@@ -220,6 +221,7 @@ class TestAccountKillSwitch:
         """ Worker"""
         manager = _make_manager()
         worker = _make_mock_worker(account_id=100)
+        worker._has_unsettled_orders = AsyncMock(return_value=False)
         await manager.registry.register(100, worker)
 
         result = await manager.account_kill_switch(100)
@@ -239,6 +241,7 @@ class TestAccountKillSwitch:
         """ Worker"""
         manager = _make_manager()
         w1 = _make_mock_worker(account_id=100)
+        w1._has_unsettled_orders = AsyncMock(return_value=False)
         w2 = _make_mock_worker(account_id=200)
         await manager.registry.register(100, w1)
         await manager.registry.register(200, w2)
@@ -445,6 +448,97 @@ class TestGracefulShutdown:
 
         w1.stop.assert_called_once()
         w2.stop.assert_called_once()
+
+
+# 
+# 
+# 
+
+
+# 
+# _build_strategy_runner: registry 契约修复测试
+# 
+
+
+class TestBuildStrategyRunner:
+    def test_unknown_strategy_type_returns_none(self):
+        """未知策略类型应返回 None 而不是抛出 KeyError"""
+        manager = _make_manager()
+        strategy_data = {
+            "id": 1,
+            "type": "nonexistent_strategy",
+            "play_code": "DX1",
+            "base_amount": 100,
+            "status": "running",
+        }
+        result = manager._build_strategy_runner(strategy_data)
+        assert result is None
+
+    def test_flat_strategy_builds_successfully(self):
+        """flat 策略应正常构建"""
+        manager = _make_manager()
+        strategy_data = {
+            "id": 1,
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 100,
+            "status": "running",
+        }
+        result = manager._build_strategy_runner(strategy_data)
+        assert result is not None
+        assert result.strategy_id == 1
+
+    def test_martin_strategy_builds_successfully(self):
+        """martin 策略应正常构建"""
+        manager = _make_manager()
+        strategy_data = {
+            "id": 2,
+            "type": "martin",
+            "play_code": "DX1",
+            "base_amount": 100,
+            "martin_sequence": "[1, 2, 4, 8]",
+            "status": "running",
+        }
+        result = manager._build_strategy_runner(strategy_data)
+        assert result is not None
+        assert result.strategy_id == 2
+
+
+# 
+# _create_adapter: Adapter Factory 测试
+# 
+
+
+class TestAdapterFactory:
+    def test_jnd28web_creates_jnd_adapter(self):
+        """JND28WEB 应创建 JNDAdapter"""
+        from app.engine.adapters.jnd import JNDAdapter
+
+        manager = _make_manager()
+        adapter = manager._create_adapter("JND28WEB")
+        assert isinstance(adapter, JNDAdapter)
+
+    def test_jnd282_creates_jnd_adapter(self):
+        """JND282 应创建 JNDAdapter"""
+        from app.engine.adapters.jnd import JNDAdapter
+
+        manager = _make_manager()
+        adapter = manager._create_adapter("JND282")
+        assert isinstance(adapter, JNDAdapter)
+
+    def test_custom_url_passed_to_adapter(self):
+        """自定义 URL 应传递给 adapter"""
+        from app.engine.adapters.jnd import JNDAdapter
+
+        manager = _make_manager()
+        adapter = manager._create_adapter("JND28WEB", platform_url="https://custom.example.com")
+        assert isinstance(adapter, JNDAdapter)
+
+    def test_unsupported_platform_raises_error(self):
+        """不支持的平台类型应抛出 ValueError"""
+        manager = _make_manager()
+        with pytest.raises(ValueError, match="不支持的平台类型"):
+            manager._create_adapter("UNKNOWN_PLATFORM")
 
 
 # 
