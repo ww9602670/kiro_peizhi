@@ -181,6 +181,23 @@ class EngineManager:
         self._shutting_down: bool = False
 
     # ------------------------------------------------------------------
+    # Adapter Factory
+    # ------------------------------------------------------------------
+
+    def _create_adapter(self, platform_type: str, platform_url: Optional[str] = None) -> PlatformAdapter:
+        """根据 platform_type 创建对应的平台适配器
+
+        当前支持 JND 系列平台，后续新增平台只需在此扩展。
+        """
+        jnd_types = {"JND28WEB", "JND282"}
+        if platform_type in jnd_types:
+            return JNDAdapter(
+                base_url=platform_url or None,
+                platform_type=platform_type,
+            )
+        raise ValueError(f"不支持的平台类型: {platform_type}")
+
+    # ------------------------------------------------------------------
     # Worker 
     # ------------------------------------------------------------------
 
@@ -212,11 +229,8 @@ class EngineManager:
             logger.info("已有运行中 Worker，执行热更新 account_id=%d", account_id)
             return await self._hot_update_worker(existing, strategies)
 
-        # 
-        adapter = JNDAdapter(
-            base_url=platform_url or None,
-            platform_type=platform_type,
-        )
+        # 创建平台适配器（通过 factory）
+        adapter = self._create_adapter(platform_type, platform_url)
         rate_limiter = RateLimiter()
         captcha_service = CaptchaService()
         session = SessionManager(
@@ -538,9 +552,10 @@ class EngineManager:
         from app.engine.strategies.registry import get_strategy_class
 
         strategy_type = strategy_data.get("type", "flat")
-        strategy_cls = get_strategy_class(strategy_type)
-        if strategy_cls is None:
-            logger.warning("type=%s", strategy_type)
+        try:
+            strategy_cls = get_strategy_class(strategy_type)
+        except KeyError:
+            logger.warning("未知策略类型 type=%s", strategy_type)
             return None
 
         # 
