@@ -1,0 +1,28 @@
+.status-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.status-tag-stopped {
+  background: #f5f5f5;
+  color: #999;
+}
+
+.status-tag-running {
+  background: #f6ffed;
+  color: #52c41a;
+}
+
+.status-tag-paused {
+  background: #fffbe6;
+  color: #faad14;
+}
+
+.status-tag-error {
+  background: #fff2f0;
+  color: #ff4d4f;
+}

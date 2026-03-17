@@ -1,0 +1,190 @@
+.dashboard-page {
+  padding: 16px;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.dashboard-title {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0 0 16px;
+}
+
+/* Countdown section */
+.countdown-section {
+  margin-bottom: 24px;
+}
+
+/* Stat cards */
+.stat-cards {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  background: #fff;
+  border-radius: 10px;
+  padding: 16px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: #999;
+}
+
+.stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: #1a1a1a;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.stat-unit {
+  font-size: 12px;
+  color: #999;
+}
+
+.stat-alert {
+  color: #ff4d4f;
+}
+
+.pnl-positive {
+  color: #52c41a;
+}
+
+.pnl-negative {
+  color: #ff4d4f;
+}
+
+/* Sections */
+.dashboard-section {
+  margin-bottom: 24px;
+}
+
+.section-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 12px;
+  color: #1a1a1a;
+}
+
+/* Strategy mini cards */
+.strategy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.strategy-card-mini {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #fff;
+  border-radius: 8px;
+  padding: 12px 16px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.strategy-account {
+  font-size: 12px;
+  color: #1890ff;
+  background: #e6f7ff;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.strategy-platform {
+  font-size: 12px;
+  color: #722ed1;
+  background: #f9f0ff;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.strategy-name {
+  font-weight: 500;
+  flex: 1;
+}
+
+.strategy-type {
+  font-size: 12px;
+  color: #999;
+  background: #f5f5f5;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.strategy-pnl {
+  font-size: 13px;
+  font-weight: 500;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+/* 待结算投注表格 */
+.pending-table-wrap {
+  overflow-x: auto;
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.pending-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.pending-table th {
+  background: #fafafa;
+  padding: 8px 10px;
+  text-align: left;
+  font-weight: 500;
+  color: #666;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.pending-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid #f5f5f5;
+  color: #333;
+}
+
+.pending-table .td-bet-content {
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+
+.pending-table .td-time {
+  color: #999;
+  font-size: 12px;
+}
+
+.loading-text,
+.error-text,
+.empty-text {
+  text-align: center;
+  padding: 40px 0;
+  color: #999;
+  font-size: 14px;
+}
+
+.error-text {
+  color: #ff4d4f;
+}
+
+@media (min-width: 768px) {
+  .stat-cards {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}

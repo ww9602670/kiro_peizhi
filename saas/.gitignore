@@ -1,0 +1,22 @@
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.vscode/
+.idea/
+.env
+.env.local
+.env.*.local
+!frontend/.env.development
+.DS_Store
+Thumbs.db
+
+# Backend data (SQLite, auto-created on startup)
+backend/data/
+
+# Frontend build output
+frontend/dist/
