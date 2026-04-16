@@ -68,20 +68,20 @@ export default function AdminDashboardPage() {
               <tbody>
                 {data.operator_summaries.map((op) => (
                   <tr key={op.id}>
-                    <td>{op.id}</td>
-                    <td>{op.username}</td>
-                    <td>
+                    <td data-label="ID">{op.id}</td>
+                    <td data-label="用户名">{op.username}</td>
+                    <td data-label="状态">
                       <span className={`op-status op-status-${op.status}`}>
                         {op.status === 'active' ? '活跃' : op.status === 'disabled' ? '禁用' : op.status}
                       </span>
                     </td>
-                    <td className={op.daily_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                    <td data-label="当日盈亏" className={op.daily_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
                       {op.daily_pnl > 0 ? '+' : ''}{op.daily_pnl.toFixed(2)}
                     </td>
-                    <td className={op.total_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                    <td data-label="总盈亏" className={op.total_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
                       {op.total_pnl > 0 ? '+' : ''}{op.total_pnl.toFixed(2)}
                     </td>
-                    <td>{op.running_strategies}</td>
+                    <td data-label="运行策略">{op.running_strategies}</td>
                   </tr>
                 ))}
               </tbody>

@@ -14,7 +14,7 @@ from app.engine.adapters.base import (
     PlatformAdapter,
 )
 from app.engine.adapters.config import PLATFORM_CONFIGS
-from app.engine.adapters.jnd import JNDAdapter
+from app.engine.adapters.jnd import InvalidInstallResponse, JNDAdapter
 
 
 # ------------------------------------------------------------------
@@ -187,6 +187,78 @@ class TestLogin:
         assert result.success is False
         assert result.token is None
 
+    @pytest.mark.asyncio
+    async def test_login_ajax_success_with_captcha_code(self, adapter):
+        mock_session = AsyncMock()
+        mock_visitor_resp = AsyncMock()
+        mock_visitor_resp.__aenter__ = AsyncMock(return_value=mock_visitor_resp)
+        mock_visitor_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_ajax_resp = AsyncMock()
+        mock_ajax_resp.__aenter__ = AsyncMock(return_value=mock_ajax_resp)
+        mock_ajax_resp.__aexit__ = AsyncMock(return_value=False)
+        mock_ajax_resp.json = AsyncMock(return_value={"State": 1, "Msg": "ok"})
+
+        mock_cookie = MagicMock()
+        mock_cookie.value = "ajax_token_123"
+        mock_session.get = MagicMock(return_value=mock_visitor_resp)
+        mock_session.post = MagicMock(return_value=mock_ajax_resp)
+        mock_session.cookie_jar = MagicMock()
+        mock_session.cookie_jar.filter_cookies = MagicMock(
+            side_effect=[{}, {"token": mock_cookie}]
+        )
+        mock_session.closed = False
+        adapter._session = mock_session
+
+        result = await adapter.login("testuser", "testpass", captcha_code="1234")
+
+        assert result.success is True
+        assert result.token == "ajax_token_123"
+        assert adapter._token == "ajax_token_123"
+
+    @pytest.mark.asyncio
+    async def test_login_ajax_captcha_required(self, adapter):
+        mock_session = AsyncMock()
+        mock_visitor_resp = AsyncMock()
+        mock_visitor_resp.__aenter__ = AsyncMock(return_value=mock_visitor_resp)
+        mock_visitor_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_ajax_resp = AsyncMock()
+        mock_ajax_resp.__aenter__ = AsyncMock(return_value=mock_ajax_resp)
+        mock_ajax_resp.__aexit__ = AsyncMock(return_value=False)
+        mock_ajax_resp.json = AsyncMock(
+            return_value={"State": 5, "Msg": "captcha invalid"}
+        )
+
+        mock_session.get = MagicMock(return_value=mock_visitor_resp)
+        mock_session.post = MagicMock(return_value=mock_ajax_resp)
+        mock_session.cookie_jar = MagicMock()
+        mock_session.cookie_jar.filter_cookies = MagicMock(return_value={})
+        mock_session.closed = False
+        adapter._session = mock_session
+
+        result = await adapter.login("testuser", "testpass", captcha_code="0000")
+
+        assert result.success is False
+        assert result.captcha_required is True
+        assert "captcha" in result.message
+
+    @pytest.mark.asyncio
+    async def test_get_captcha_returns_image_bytes(self, adapter):
+        mock_session = AsyncMock()
+        mock_resp = AsyncMock()
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.read = AsyncMock(return_value=b"image-bytes")
+        mock_session.get = MagicMock(return_value=mock_resp)
+        mock_session.closed = False
+        adapter._session = mock_session
+
+        data = await adapter.get_captcha()
+
+        assert data == b"image-bytes"
+
 
 # ------------------------------------------------------------------
 # 4. get_current_install() 
@@ -234,6 +306,84 @@ class TestGetCurrentInstall:
 
         assert info.state == 0
         assert info.close_timestamp == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_installments_raises_invalid_install_response(self, adapter):
+        _patch_post(adapter, {
+            "State": 1,
+            "CloseTimeStamp": 20,
+            "OpenTimeStamp": 30,
+        })
+
+        with pytest.raises(InvalidInstallResponse, match="Installments"):
+            await adapter.get_current_install()
+
+    @pytest.mark.asyncio
+    async def test_negative_countdown_is_clamped_to_zero(self, adapter):
+        _patch_post(adapter, {
+            "Installments": "3397190",
+            "State": 1,
+            "CloseTimeStamp": -47,
+            "OpenTimeStamp": "-9",
+            "PreLotteryResult": "1,2,3",
+            "PreInstallments": "3397189",
+        })
+
+        info = await adapter.get_current_install()
+
+        assert info.close_timestamp == 0
+        assert info.open_timestamp == 0
+
+
+class TestGetCurrentInstallDetail:
+    @pytest.mark.asyncio
+    async def test_negative_countdown_is_clamped_to_zero(self, adapter):
+        _patch_post(adapter, {
+            "Installments": "3397191",
+            "State": 1,
+            "CloseTimeStamp": -3,
+            "OpenTimeStamp": "-6",
+            "PreLotteryResult": "2,3,4",
+            "PreInstallments": "3397190",
+            "TemplateCode": "JNDPCDD",
+        })
+
+        detail = await adapter.get_current_install_detail()
+
+        assert detail["close_countdown_sec"] == 0
+        assert detail["open_countdown_sec"] == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_optional_fields_returns_string_defaults(self, adapter):
+        _patch_post(adapter, {
+            "Installments": "3397192",
+            "State": 1,
+            "CloseTimeStamp": 5,
+            "OpenTimeStamp": 8,
+        })
+
+        detail = await adapter.get_current_install_detail()
+
+        assert detail["installments"] == "3397192"
+        assert detail["pre_lottery_result"] == ""
+        assert detail["pre_installments"] == ""
+        assert detail["template_code"] == ""
+        assert isinstance(detail["installments"], str)
+        assert isinstance(detail["pre_lottery_result"], str)
+        assert isinstance(detail["pre_installments"], str)
+        assert isinstance(detail["template_code"], str)
+
+    @pytest.mark.asyncio
+    async def test_missing_installments_returns_empty_string(self, adapter):
+        _patch_post(adapter, {
+            "State": 1,
+            "CloseTimeStamp": 5,
+            "OpenTimeStamp": 9,
+        })
+
+        detail = await adapter.get_current_install_detail()
+
+        assert detail["installments"] == ""
 
 
 # ------------------------------------------------------------------
@@ -430,8 +580,8 @@ class TestGetBetHistory:
         ]
         _patch_post(adapter, records)
 
-        #  _post  list 
-        #  _post  dict get_bet_history  list 
+        #  _post  list
+        #  _post  dict get_bet_history  list
         adapter._post = AsyncMock(return_value=records)
 
         result = await adapter.get_bet_history(count=15)
@@ -440,14 +590,35 @@ class TestGetBetHistory:
         assert len(result) == 2
 
     @pytest.mark.asyncio
+    async def test_history_nested_in_bet_list(self, adapter):
+        """betList"""
+        records = [{"Installments": "3397186", "KeyCode": "DX1"}]
+        _patch_post(adapter, {"betList": records, "total": 1})
+
+        result = await adapter.get_bet_history()
+
+        assert len(result) == 1
+        assert result[0]["KeyCode"] == "DX1"
+
+    @pytest.mark.asyncio
     async def test_history_nested_in_data(self, adapter):
-        """ data """
+        """data"""
         records = [{"issue": "3397186"}]
         _patch_post(adapter, {"data": records})
 
         result = await adapter.get_bet_history()
 
         assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_history_nested_in_data_records(self, adapter):
+        """data.Records"""
+        records = [{"Installments": "3397186", "KeyCode": "DX1"}]
+        _patch_post(adapter, {"data": {"Records": records}})
+
+        result = await adapter.get_bet_history()
+
+        assert result == records
 
     @pytest.mark.asyncio
     async def test_history_empty(self, adapter):
@@ -467,9 +638,11 @@ class TestGetBetHistory:
         await adapter.get_bet_history(count=5)
 
         call_args = adapter._post.call_args
+        url = call_args.args[0]
         form_data = call_args.kwargs.get("data") or call_args[0][1]
-        assert form_data["top"] == "5"
-
+        assert "/BettingList/getBetChecked" in url
+        assert form_data["startIndex"] == "0"
+        assert form_data["rows"] == "5"
 
 # ------------------------------------------------------------------
 # 9. get_lottery_results() 

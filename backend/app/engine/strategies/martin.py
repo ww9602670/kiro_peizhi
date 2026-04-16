@@ -98,7 +98,13 @@ class MartinStrategyImpl(BaseStrategy):
             for kc in self._key_codes
         ]
 
-    def on_result(self, is_win: Optional[int], pnl: int) -> None:
+    def on_result(
+        self,
+        is_win: Optional[int],
+        pnl: int,
+        key_code: str | None = None,
+        martin_level: int | None = None,
+    ) -> None:
         """
 
         is_win=1    level=0 round_loss

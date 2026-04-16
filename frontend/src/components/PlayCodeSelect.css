@@ -1,0 +1,40 @@
+.play-code-select {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  font-size: 14px;
+  background: #fff;
+}
+
+.play-code-select:disabled {
+  background: #f5f5f5;
+  cursor: not-allowed;
+}
+
+.play-code-loading {
+  color: #999;
+  font-size: 14px;
+}
+
+.play-code-error {
+  color: #ff4d4f;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.play-code-retry {
+  padding: 2px 8px;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.play-code-retry:hover {
+  border-color: #1890ff;
+  color: #1890ff;
+}

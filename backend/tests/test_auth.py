@@ -235,7 +235,7 @@ class TestLoginEndpoint:
         assert row is not None
         detail = json.loads(row["detail"])
         assert detail["username"] == "nobody"
-        assert detail["reason"] == ""
+        assert detail["reason"] == "用户名不存在"
 
 
 class TestLogoutEndpoint:

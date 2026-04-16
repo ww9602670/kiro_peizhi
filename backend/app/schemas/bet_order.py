@@ -57,10 +57,21 @@ class BetOrderInfo(BaseModel):
     bet_at: Optional[str] = None
     settled_at: Optional[str] = None
     fail_reason: Optional[str] = None
+    # 新增可选字段（仪表盘待结算投注用）
+    strategy_name: Optional[str] = None
+    account_name: Optional[str] = None
+    payout: Optional[float] = None  # 派彩 = amount + pnl（已结算时）
 
 
 def row_to_bet_order_info(row: dict) -> BetOrderInfo:
     """ DB  BetOrderInfo + key_code_name """
+    amount = row["amount"] / 100
+    pnl = (row["pnl"] / 100) if row.get("pnl") is not None else None
+    # 派彩：已结算时 = amount + pnl，否则 None
+    payout = None
+    if row.get("status") == "settled" and pnl is not None:
+        payout = amount + pnl
+
     return BetOrderInfo(
         id=row["id"],
         idempotent_id=row["idempotent_id"],
@@ -69,16 +80,19 @@ def row_to_bet_order_info(row: dict) -> BetOrderInfo:
         issue=row["issue"],
         key_code=row["key_code"],
         key_code_name=get_key_code_name(row["key_code"]),
-        amount=row["amount"] / 100,  #   
-        odds=(row["odds"] / 10000) if row.get("odds") is not None else None,  # 还原为浮点赔率
+        amount=amount,
+        odds=(row["odds"] / 10000) if row.get("odds") is not None else None,
         status=row["status"],
         open_result=row.get("open_result"),
         sum_value=row.get("sum_value"),
         is_win=row.get("is_win"),
-        pnl=(row["pnl"] / 100) if row.get("pnl") is not None else None,  #   
+        pnl=pnl,
         simulation=bool(row.get("simulation", 0)),
         martin_level=row.get("martin_level"),
         bet_at=row.get("bet_at"),
         settled_at=row.get("settled_at"),
         fail_reason=row.get("fail_reason"),
+        strategy_name=row.get("strategy_name"),
+        account_name=row.get("account_name"),
+        payout=payout,
     )

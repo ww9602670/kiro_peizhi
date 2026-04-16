@@ -8,6 +8,7 @@ import Accounts from '@/pages/operator/Accounts';
 import Strategies from '@/pages/operator/Strategies';
 import BetOrders from '@/pages/operator/BetOrders';
 import Alerts from '@/pages/operator/Alerts';
+import Backtest from '@/pages/operator/Backtest';
 import AdminDashboardPage from '@/pages/admin/Dashboard';
 import Operators from '@/pages/admin/Operators';
 import './App.css';
@@ -18,6 +19,7 @@ const OPERATOR_NAV: NavItem[] = [
   { key: 'strategies', label: '策略' },
   { key: 'bet-orders', label: '投注记录' },
   { key: 'alerts', label: '告警' },
+  { key: 'backtest', label: '回测' },
 ];
 
 const ADMIN_NAV: NavItem[] = [
@@ -63,6 +65,7 @@ function App() {
       {activeTab === 'strategies' && <Strategies />}
       {activeTab === 'bet-orders' && <BetOrders />}
       {activeTab === 'alerts' && <Alerts />}
+      {activeTab === 'backtest' && <Backtest />}
 
       {/* Admin pages */}
       {activeTab === 'admin-dashboard' && <AdminDashboardPage />}

@@ -1,0 +1,173 @@
+/* 回测页面 — 深色背景明亮字体 */
+.backtest-page { padding: 16px; max-width: 800px; margin: 0 auto; color: #f1f5f9; }
+.backtest-title { font-size: 1.4rem; margin-bottom: 12px; color: #f8fafc; }
+
+/* 历史数据状态栏 + 补全按钮 */
+.history-status-bar {
+  background: #1e293b;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: #cbd5e1;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.history-status-info { flex: 1; }
+.gap-warn { color: #fbbf24; }
+.fill-btn {
+  padding: 6px 14px;
+  border: 1px solid #3b82f6;
+  border-radius: 4px;
+  background: transparent;
+  color: #60a5fa;
+  font-size: 0.8rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fill-btn:hover { background: #1e3a5f; }
+.fill-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 表单 */
+.backtest-form {
+  background: #1e293b;
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+.backtest-form .form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.backtest-form label {
+  font-size: 0.85rem;
+  color: #cbd5e1;
+}
+.backtest-form input,
+.backtest-form select {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #475569;
+  background: #0f172a;
+  color: #f1f5f9;
+  font-size: 0.9rem;
+}
+.backtest-form input[type="date"] {
+  color-scheme: dark;
+}
+.form-row-group {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.form-error {
+  color: #f87171;
+  font-size: 0.8rem;
+  margin-bottom: 8px;
+}
+.backtest-submit-btn {
+  width: 100%;
+  padding: 10px;
+  border: none;
+  border-radius: 6px;
+  background: #3b82f6;
+  color: #fff;
+  font-size: 0.95rem;
+  cursor: pointer;
+  margin-top: 4px;
+}
+.backtest-submit-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 结果区域 */
+.backtest-result {
+  background: #1e293b;
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+.backtest-result h2 { font-size: 1.1rem; margin-bottom: 12px; color: #f8fafc; }
+.result-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.summary-item { display: flex; flex-direction: column; gap: 2px; }
+.summary-label { font-size: 0.8rem; color: #94a3b8; }
+.summary-value { font-size: 1rem; font-weight: 600; color: #e2e8f0; }
+.pnl-positive { color: #4ade80 !important; }
+.pnl-negative { color: #f87171 !important; }
+
+/* 图表 */
+.chart-container { margin-top: 16px; }
+.chart-container h3 { font-size: 0.95rem; margin-bottom: 8px; color: #e2e8f0; }
+.pnl-canvas, .martin-canvas {
+  width: 100%;
+  max-width: 600px;
+  background: #0f172a;
+  border-radius: 6px;
+}
+
+/* 运行中 */
+.backtest-running {
+  text-align: center;
+  padding: 20px;
+  color: #cbd5e1;
+  font-size: 0.95rem;
+}
+
+/* 历史任务 */
+.backtest-history {
+  background: #1e293b;
+  padding: 16px;
+  border-radius: 8px;
+}
+.backtest-history h2 { font-size: 1.1rem; margin-bottom: 12px; color: #f8fafc; }
+.history-empty { color: #94a3b8; text-align: center; padding: 20px; }
+.history-list { display: flex; flex-direction: column; gap: 8px; }
+.history-item {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #0f172a;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: border-color 0.15s;
+  color: #e2e8f0;
+}
+.history-item:hover, .history-item.selected { border-color: #3b82f6; }
+.history-item-header { display: flex; justify-content: space-between; margin-bottom: 4px; }
+.history-type { font-weight: 600; font-size: 0.9rem; color: #f1f5f9; }
+.history-status { font-size: 0.8rem; }
+.status-completed { color: #4ade80; }
+.status-failed { color: #f87171; }
+.status-running { color: #fbbf24; }
+.status-pending { color: #94a3b8; }
+.history-item-detail { font-size: 0.8rem; color: #94a3b8; }
+.history-item-meta { font-size: 0.75rem; color: #94a3b8; margin-top: 4px; }
+.history-pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+.history-pagination button {
+  padding: 6px 12px;
+  border: 1px solid #475569;
+  border-radius: 4px;
+  background: transparent;
+  color: #e2e8f0;
+  cursor: pointer;
+}
+.history-pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+.history-pagination span { color: #cbd5e1; }
+
+/* 同步状态指示器 */
+.sync-indicator { font-size: 0.8rem; }
+.sync-running { color: #4ade80; }
+.sync-stopped { color: #94a3b8; }
+.last-sync-info { color: #94a3b8; font-size: 0.8rem; }

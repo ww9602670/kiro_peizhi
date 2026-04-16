@@ -54,13 +54,13 @@ async def login(
     # 1. 
     operator = await operator_get_by_username(db, username=body.username)
     if operator is None:
-        await _log_login_failure(db, ip, body.username, "")
-        raise BizError(2002, "", status_code=401)
+        await _log_login_failure(db, ip, body.username, "用户名不存在")
+        raise BizError(2002, "用户名或密码错误", status_code=401)
 
     # 2. 
     if operator["password"] != body.password:
-        await _log_login_failure(db, ip, body.username, "", operator["id"])
-        raise BizError(2002, "", status_code=401)
+        await _log_login_failure(db, ip, body.username, "密码错误", operator["id"])
+        raise BizError(2002, "用户名或密码错误", status_code=401)
 
     # 3. Task 2.1.6
     if operator["expire_date"]:
@@ -68,19 +68,19 @@ async def login(
             expire_d = date.fromisoformat(operator["expire_date"])
             if expire_d < date.today():
                 await operator_update(db, operator_id=operator["id"], status="expired")
-                await _log_login_failure(db, ip, body.username, "", operator["id"])
-                raise BizError(2002, "", status_code=401)
+                await _log_login_failure(db, ip, body.username, "账户已过期", operator["id"])
+                raise BizError(2002, "账户已过期，请联系管理员", status_code=401)
         except ValueError:
             pass  # 
 
     # 4. 
     status = operator["status"]
     if status == "expired":
-        await _log_login_failure(db, ip, body.username, "", operator["id"])
-        raise BizError(2002, "", status_code=401)
+        await _log_login_failure(db, ip, body.username, "账户已过期", operator["id"])
+        raise BizError(2002, "账户已过期，请联系管理员", status_code=401)
     if status == "disabled":
-        await _log_login_failure(db, ip, body.username, "", operator["id"])
-        raise BizError(2002, "", status_code=401)
+        await _log_login_failure(db, ip, body.username, "账户已禁用", operator["id"])
+        raise BizError(2002, "账户已被禁用，请联系管理员", status_code=401)
 
     # 5.  token + 
     token, jti, expire_at = create_token(operator["id"], operator["role"])
@@ -132,7 +132,7 @@ async def refresh(
     """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        raise BizError(2002, " Authorization header", status_code=401)
+        raise BizError(2002, "缺少认证令牌", status_code=401)
 
     token = auth_header[7:]
 
@@ -145,34 +145,34 @@ async def refresh(
             options={"verify_exp": False},
         )
     except jwt.InvalidTokenError:
-        raise BizError(2002, "Token ", status_code=401)
+        raise BizError(2002, "认证令牌无效，请重新登录", status_code=401)
 
     operator_id = payload.get("sub")
     old_jti = payload.get("jti")
     if not operator_id or not old_jti:
-        raise BizError(2002, "Token ", status_code=401)
+        raise BizError(2002, "认证令牌无效，请重新登录", status_code=401)
 
     operator_id = int(operator_id)
 
     # jti  token
     if not await validate_jti_with_db(db, operator_id, old_jti):
-        raise BizError(2002, "", status_code=401)
+        raise BizError(2002, "登录已失效，请重新登录", status_code=401)
 
     # 
     window_check = check_refresh_window(payload)
     if window_check == "2003":
-        raise BizError(2003, "Token ", status_code=400)
+        raise BizError(2003, "令牌尚未到刷新时间", status_code=400)
     if window_check == "2001":
-        raise BizError(2001, "Token ", status_code=401)
+        raise BizError(2001, "令牌已过期，请重新登录", status_code=401)
 
     # 
     cursor = await db.execute("SELECT * FROM operators WHERE id=?", (operator_id,))
     row = await cursor.fetchone()
     if row is None:
-        raise BizError(2002, "", status_code=401)
+        raise BizError(2002, "账户不存在，请重新登录", status_code=401)
     operator = dict(row)
     if operator["status"] in ("disabled", "expired"):
-        raise BizError(2002, f"{operator['status']}", status_code=401)
+        raise BizError(2002, "账户已被禁用或过期，请联系管理员", status_code=401)
 
     #  token jti token 
     new_token, new_jti, new_expire_at = create_token(operator_id, operator["role"])

@@ -3,7 +3,8 @@
 export interface AccountCreate {
   account_name: string;
   password: string;
-  platform_type: 'JND28WEB' | 'JND282';
+  platform_type?: string;
+  platform_url?: string;
 }
 
 export interface AccountInfo {
@@ -11,6 +12,7 @@ export interface AccountInfo {
   account_name: string;
   password_masked: string; // 前2位+****
   platform_type: string;
+  platform_url?: string;
   status: string;
   balance: number; // API 层返回元
   kill_switch: boolean;

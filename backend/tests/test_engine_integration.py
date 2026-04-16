@@ -21,6 +21,7 @@ from app.engine.adapters.base import (
 )
 from app.engine.alert import AlertService
 from app.engine.executor import BetExecutor
+from app.engine.manager import EngineManager
 from app.engine.poller import IssuePoller
 from app.engine.rate_limiter import RateLimiter
 from app.engine.reconciler import Reconciler
@@ -28,6 +29,7 @@ from app.engine.risk import RiskController
 from app.engine.session import SessionManager
 from app.engine.settlement import SettlementProcessor
 from app.engine.strategies.flat import FlatStrategyImpl
+from app.engine.strategies.base import LotteryResult, StrategyContext
 from app.engine.strategy_runner import BetSignal, StrategyRunner
 from app.engine.worker import AccountWorker
 from app.models.db_ops import (
@@ -238,6 +240,38 @@ async def test_full_betting_flow(db):
     assert betdata[0]["KeyCode"] == "DX1"
     assert betdata[0]["Amount"] == 1000
 
+
+@pytest.mark.asyncio
+async def test_manager_builds_red_wave_runner_with_direction_codes(db):
+    manager = EngineManager(db=db)
+    runner = manager._build_strategy_runner(
+        {
+            "id": 1001,
+            "type": "red_wave_double_martin",
+            "play_code": "B1LM_S,DS4",
+            "base_amount": 1000,
+            "martin_sequence": "[1,2,4]",
+            "status": "running",
+            "simulation": 0,
+        }
+    )
+    assert runner is not None
+
+    signals = runner.collect_signals(
+        StrategyContext(
+            current_issue="20260301001",
+            history=[
+                LotteryResult(
+                    issue="20260301000", balls=[3, 1, 2], sum_value=6
+                )
+            ],
+            balance=1_000_000,
+            strategy_state={},
+        ),
+        issue="20260301001",
+    )
+    assert {s.key_code for s in signals} == {"B1LM_S", "DS4"}
+
     # ?= bet_success
     row = await (await db.execute(
         "SELECT * FROM bet_orders WHERE strategy_id=? AND issue=?",
@@ -287,13 +321,13 @@ async def test_full_betting_flow(db):
     )
     await reconciler.reconcile(account_id=account_id, issue="20260301001")
 
-    # 
-    rec = await (await db.execute(
-        "SELECT * FROM reconcile_records WHERE account_id=? AND issue=?",
-        (account_id, "20260301001"),
-    )).fetchone()
-    assert rec is not None
-    assert rec["local_bet_count"] >= 0  # 
+    # 真实模式对账不写 reconcile_records，只验证终态
+    # 订单已 settled，所以不会触发 unsettled_orders 告警
+    alert_rows = await (await db.execute(
+        "SELECT * FROM alerts WHERE type='unsettled_orders' AND operator_id=?",
+        (operator_id,),
+    )).fetchall()
+    assert len(alert_rows) == 0  # 所有订单已结算，无告警
 
 
 # 

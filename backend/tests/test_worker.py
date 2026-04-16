@@ -188,7 +188,7 @@ class TestDowntimeHandling:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             return mock_cursor_recover
 
@@ -271,7 +271,7 @@ class TestExceptionRecovery:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             return mock_cursor_empty
 
@@ -375,7 +375,7 @@ class TestMainLoop:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             return mock_cursor_empty
 
@@ -448,7 +448,7 @@ class TestMainLoop:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             return mock_cursor_empty
 
@@ -515,7 +515,7 @@ class TestMainLoop:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             return mock_cursor_empty
 
@@ -597,7 +597,7 @@ class TestDataIsolation:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             return mock_cursor_empty
 
@@ -666,7 +666,7 @@ class TestDataIsolation:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             return mock_cursor_empty
 
@@ -812,6 +812,26 @@ class TestSignalCollection:
         assert len(signals) == 1
         assert signals[0].strategy_id == 2
 
+    def test_collect_signals_passes_latest_result_history(self):
+        """install.pre_result is exposed as StrategyContext.history[0]."""
+        worker = _make_worker()
+        runner = MagicMock()
+        runner.collect_signals.return_value = []
+        worker.strategies = {1: runner}
+
+        install = _make_install(
+            issue="20250302002",
+            pre_issue="20250302001",
+            pre_result="1,2,3",
+        )
+        worker._collect_signals(install)
+
+        ctx = runner.collect_signals.call_args.kwargs["ctx"]
+        assert len(ctx.history) == 1
+        assert ctx.history[0].issue == "20250302001"
+        assert ctx.history[0].balls == [1, 2, 3]
+        assert ctx.history[0].sum_value == 6
+
 
 # 
 # PBT: P22  Worker 
@@ -941,7 +961,7 @@ def _make_worker_with_db(has_records: bool = True, **overrides) -> AccountWorker
     async def mock_db_execute(sql, params=None):
         if "COUNT" in sql:
             return mock_cursor_count
-        if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+        if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
             return mock_cursor_lock
         return mock_cursor_empty
 
@@ -1203,7 +1223,7 @@ class TestSettlementDataRetry:
         async def mock_db_execute(sql, params=None):
             if "COUNT" in sql:
                 return mock_cursor_count
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_lock
             if "DISTINCT issue" in sql:
                 return mock_cursor_empty
@@ -1530,7 +1550,7 @@ class TestLockAcquireRenewRelease:
         sql = call_args[0][0]
         assert "worker_lock_token" in sql
         assert "worker_lock_ts" in sql
-        assert "datetime('now', '-5 minutes')" in sql
+        assert "datetime('now', '+8 hours', '-5 minutes')" in sql
 
     @pytest.mark.asyncio
     async def test_acquire_lock_fail_active_lock(self):
@@ -1717,7 +1737,7 @@ class TestRenewFailureStopsWorker:
         original_db_execute = worker.db.execute
 
         async def mock_db_execute(sql, params=None):
-            if "worker_lock_ts=datetime('now')" in sql and "worker_lock_token=?" in sql:
+            if "worker_lock_ts=datetime('now', '+8 hours')" in sql and "worker_lock_token=?" in sql:
                 return mock_cursor_renew
             return await original_db_execute(sql, params)
 
@@ -1918,3 +1938,329 @@ class TestLockConstants:
         """_lock_token 初始化为 None"""
         worker = _make_worker()
         assert worker._lock_token is None
+
+
+# ==================================================================
+# 结算反馈测试：_feedback_settlement_results
+# ==================================================================
+
+
+class TestFeedbackSettlementResults:
+    """测试 _feedback_settlement_results() 方法"""
+
+    @pytest.mark.asyncio
+    async def test_feedback_calls_on_result_for_each_order(self):
+        """正常分发：每个已结算订单调用对应 runner.on_result"""
+        worker = _make_worker()
+        runner1 = AsyncMock()
+        runner1.on_result = AsyncMock()
+        worker.strategies = {10: runner1}
+
+        # Mock DB 返回两笔已结算订单（同一 strategy_id）
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DX1",
+                "is_win": 1,
+                "pnl": 500,
+            },
+            {
+                "strategy_id": 10,
+                "key_code": "DX2",
+                "is_win": 0,
+                "pnl": -1000,
+            },
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        assert runner1.on_result.call_count == 2
+        runner1.on_result.assert_any_call(1, 500, key_code="DX1")
+        runner1.on_result.assert_any_call(0, -1000, key_code="DX2")
+
+    @pytest.mark.asyncio
+    async def test_feedback_dispatches_to_correct_runners(self):
+        """多策略分发：不同 strategy_id 的订单分发给各自的 runner"""
+        worker = _make_worker()
+        runner_a = AsyncMock()
+        runner_a.on_result = AsyncMock()
+        runner_b = AsyncMock()
+        runner_b.on_result = AsyncMock()
+        worker.strategies = {10: runner_a, 20: runner_b}
+
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DX1",
+                "is_win": 1,
+                "pnl": 500,
+            },
+            {
+                "strategy_id": 20,
+                "key_code": "DX2",
+                "is_win": 0,
+                "pnl": -1000,
+            },
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        runner_a.on_result.assert_called_once_with(1, 500, key_code="DX1")
+        runner_b.on_result.assert_called_once_with(0, -1000, key_code="DX2")
+
+    @pytest.mark.asyncio
+    async def test_feedback_skips_missing_strategy(self):
+        """strategy_id 无对应 runner 时安全跳过"""
+        worker = _make_worker()
+        runner1 = AsyncMock()
+        runner1.on_result = AsyncMock()
+        worker.strategies = {10: runner1}
+
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DX1",
+                "is_win": 1,
+                "pnl": 500,
+            },
+            {
+                "strategy_id": 999,
+                "key_code": "DX2",
+                "is_win": 0,
+                "pnl": -1000,
+            },  # 不存在的 strategy
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        # runner1 只收到 strategy_id=10 的调用
+        runner1.on_result.assert_called_once_with(1, 500, key_code="DX1")
+
+    @pytest.mark.asyncio
+    async def test_feedback_continues_on_exception(self):
+        """on_result 异常时不影响其他订单"""
+        worker = _make_worker()
+        runner_bad = AsyncMock()
+        runner_bad.on_result = AsyncMock(side_effect=RuntimeError("boom"))
+        runner_good = AsyncMock()
+        runner_good.on_result = AsyncMock()
+        worker.strategies = {10: runner_bad, 20: runner_good}
+
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DX1",
+                "is_win": 0,
+                "pnl": -500,
+            },
+            {
+                "strategy_id": 20,
+                "key_code": "DX2",
+                "is_win": 1,
+                "pnl": 800,
+            },
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        # runner_good 仍然收到调用
+        runner_good.on_result.assert_called_once_with(1, 800, key_code="DX2")
+
+    @pytest.mark.asyncio
+    async def test_feedback_no_orders(self):
+        """无已结算订单时不调用任何 runner"""
+        worker = _make_worker()
+        runner1 = AsyncMock()
+        runner1.on_result = AsyncMock()
+        worker.strategies = {10: runner1}
+
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=[])
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        runner1.on_result.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_feedback_applies_strategy_stop_request(self):
+        """A StrategyRunner stop request is applied by the worker."""
+        from app.engine.strategies.base import StrategyStopRequest
+
+        worker = _make_worker()
+        runner = AsyncMock()
+        runner.on_result = AsyncMock(
+            return_value=StrategyStopRequest(
+                should_stop=True,
+                reason="target_hit",
+            )
+        )
+        worker.strategies = {10: runner}
+        worker._stop_strategy_runner = AsyncMock()
+
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DX1",
+                "is_win": 1,
+                "pnl": 500,
+            },
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        worker._stop_strategy_runner.assert_called_once_with(10, "target_hit")
+
+    @pytest.mark.asyncio
+    async def test_feedback_ignores_red_wave_settlement_stop_request(self):
+        """Red-wave double must not stop on settlement target-hit requests."""
+        from app.engine.strategies.base import StrategyStopRequest
+
+        worker = _make_worker()
+        runner = AsyncMock()
+        runner.strategy = MagicMock()
+        runner.strategy.name.return_value = "red_wave_double_martin"
+        runner.on_result = AsyncMock(
+            return_value=StrategyStopRequest(
+                should_stop=True,
+                reason="target_hit",
+            )
+        )
+        worker.strategies = {10: runner}
+        worker._stop_strategy_runner = AsyncMock()
+
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DS4",
+                "is_win": 1,
+                "pnl": 500,
+            },
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        runner.on_result.assert_called_once_with(1, 500, key_code="DS4")
+        worker._stop_strategy_runner.assert_not_called()
+
+
+# ==================================================================
+# 主循环集成测试：settle 后调用 feedback
+# ==================================================================
+
+
+class TestMainLoopFeedback:
+    """验证主循环中 settle 后调用了 _feedback_settlement_results"""
+
+    @pytest.mark.asyncio
+    async def test_main_loop_calls_feedback_after_settle(self):
+        """主循环中 settle 后调用 feedback"""
+        worker = _make_worker_with_db()
+        worker.running = True
+
+        betting_install = _make_install(
+            issue="20250302001",
+            state=1,
+            close_countdown_sec=60,
+            open_countdown_sec=10,
+            pre_issue="20250302000",
+            pre_result="3,5,7",
+        )
+        settlement_install = _make_install(
+            issue="20250302002",
+            state=1,
+            close_countdown_sec=60,
+            open_countdown_sec=10,
+            pre_issue="20250302001",
+            pre_result="4,2,6",
+        )
+
+        poll_count = 0
+
+        async def mock_poll():
+            nonlocal poll_count
+            poll_count += 1
+            return betting_install if poll_count <= 1 else settlement_install
+
+        worker.poller.poll = mock_poll
+
+        feedback_calls = []
+        original_feedback = worker._feedback_settlement_results
+
+        async def mock_feedback(issue):
+            feedback_calls.append(issue)
+
+        worker._feedback_settlement_results = mock_feedback
+
+        loop_count = 0
+
+        async def mock_sleep(seconds):
+            nonlocal loop_count
+            loop_count += 1
+            if loop_count >= 2:
+                worker.running = False
+
+        with patch("app.engine.worker.asyncio.sleep", side_effect=mock_sleep):
+            await worker._main_loop()
+
+        assert "20250302001" in feedback_calls
+
+
+class TestRecoverFeedback:
+    """验证补结算后调用了 _feedback_settlement_results"""
+
+    @pytest.mark.asyncio
+    async def test_recover_calls_feedback_after_settle(self):
+        """补结算成功后调用 feedback"""
+        worker = _make_worker()
+
+        # Mock DB: 有一个待补结算的 issue
+        mock_cursor_issues = AsyncMock()
+        mock_cursor_issues.fetchall = AsyncMock(
+            return_value=[{"issue": "20250302001"}]
+        )
+
+        async def mock_db_execute(sql, params=None):
+            return mock_cursor_issues
+
+        worker.db.execute = mock_db_execute
+        worker.db.commit = AsyncMock()
+
+        # Mock adapter 返回历史开奖结果
+        worker.adapter.get_lottery_results = AsyncMock(
+            return_value=[
+                {"Installments": "20250302001", "OpenResult": "3,5,7"}
+            ]
+        )
+
+        # Mock settler.settle
+        worker.settler.settle = AsyncMock()
+
+        feedback_calls = []
+
+        async def mock_feedback(issue):
+            feedback_calls.append(issue)
+
+        worker._feedback_settlement_results = mock_feedback
+
+        await worker._recover_unsettled_orders()
+
+        assert "20250302001" in feedback_calls

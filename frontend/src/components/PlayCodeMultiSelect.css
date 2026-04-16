@@ -1,0 +1,148 @@
+.pcms-wrapper {
+  position: relative;
+  width: 100%;
+}
+
+.pcms-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 38px;
+  padding: 4px 8px;
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.05);
+  cursor: pointer;
+  color: #e0e0e0;
+  gap: 4px;
+}
+
+.pcms-trigger.pcms-open {
+  border-color: #3b82f6;
+}
+
+.pcms-trigger.pcms-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pcms-placeholder {
+  color: #888;
+  font-size: 14px;
+}
+
+.pcms-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+}
+
+.pcms-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 8px;
+  background: #3b82f6;
+  color: #fff;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pcms-tag-remove {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.7);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.pcms-tag-remove:hover {
+  color: #fff;
+}
+
+.pcms-arrow {
+  font-size: 10px;
+  color: #888;
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+
+.pcms-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  background: #1e293b;
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 6px;
+  z-index: 100;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+
+.pcms-group {
+  padding: 4px 0;
+}
+
+.pcms-group-label {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: #94a3b8;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.pcms-group-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px 8px;
+}
+
+.pcms-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 13px;
+  color: #e0e0e0;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+
+.pcms-item:hover {
+  background: rgba(59,130,246,0.2);
+}
+
+.pcms-item-selected {
+  background: rgba(59,130,246,0.3);
+  color: #93c5fd;
+}
+
+.pcms-item-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pcms-check {
+  width: 14px;
+  font-size: 12px;
+  color: #3b82f6;
+}
+
+.pcms-loading {
+  color: #888;
+  font-size: 14px;
+}
+
+.pcms-error {
+  color: #ef4444;
+  font-size: 14px;
+}

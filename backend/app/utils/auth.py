@@ -77,7 +77,7 @@ async def persist_jti(db, operator_id: int, jti: str | None) -> None:
     """ current_jti  operators """
     await db.execute(
         "UPDATE operators SET current_jti=?, updated_at=? WHERE id=?",
-        (jti, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), operator_id),
+        (jti, datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"), operator_id),
     )
     await db.commit()
 

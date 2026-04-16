@@ -55,6 +55,89 @@ for _n in range(1, 4):
         KEY_CODE_MAP[f"B{_n}LM_{_suffix}"] = f"{_BALL_NAMES[_n]}{_label}"
 
 
+# ---------------------------------------------------------------------------
+# 玩法分组常量
+# ---------------------------------------------------------------------------
+
+PLAY_CODE_GROUPS: list[dict] = [
+    {
+        "group_name": "大小",
+        "items": [
+            {"key_code": "DX1", "name": "大"},
+            {"key_code": "DX2", "name": "小"},
+        ],
+    },
+    {
+        "group_name": "单双",
+        "items": [
+            {"key_code": "DS3", "name": "单"},
+            {"key_code": "DS4", "name": "双"},
+        ],
+    },
+    {
+        "group_name": "极值",
+        "items": [
+            {"key_code": "JDX5", "name": "极大"},
+            {"key_code": "JDX6", "name": "极小"},
+        ],
+    },
+    {
+        "group_name": "组合",
+        "items": [
+            {"key_code": "ZH7", "name": "大单"},
+            {"key_code": "ZH8", "name": "大双"},
+            {"key_code": "ZH9", "name": "小单"},
+            {"key_code": "ZH10", "name": "小双"},
+        ],
+    },
+    {
+        "group_name": "色波",
+        "items": [
+            {"key_code": "SB1", "name": "红波"},
+            {"key_code": "SB2", "name": "绿波"},
+            {"key_code": "SB3", "name": "蓝波"},
+        ],
+    },
+    {
+        "group_name": "豹子",
+        "items": [
+            {"key_code": "BZ4", "name": "豹子"},
+        ],
+    },
+    {
+        "group_name": "龙虎和",
+        "items": [
+            {"key_code": "LHH_L", "name": "龙"},
+            {"key_code": "LHH_H", "name": "虎"},
+            {"key_code": "LHH_HE", "name": "和"},
+        ],
+    },
+    {
+        "group_name": "和值",
+        "items": [{"key_code": f"HZ{i}", "name": f"和值{i - 1}"} for i in range(1, 29)],
+    },
+    {
+        "group_name": "单球猜号",
+        "items": [
+            {"key_code": f"B{n}QH{d}", "name": f"{ball_name}{d}"}
+            for n, ball_name in [(1, "第一球"), (2, "第二球"), (3, "第三球")]
+            for d in range(10)
+        ],
+    },
+    {
+        "group_name": "单球大小单双",
+        "items": [
+            {"key_code": f"B{n}LM_{suffix}", "name": f"{ball_name}{label}"}
+            for n, ball_name in [(1, "第一球"), (2, "第二球"), (3, "第三球")]
+            for suffix, label in [("DA", "大"), ("X", "小"), ("D", "单"), ("S", "双")]
+        ],
+    },
+]
+
+# 常用分组名称集合（前 7 个分组）
+COMMON_GROUPS: set[str] = {"大小", "单双", "极值", "组合", "色波", "豹子", "龙虎和"}
+
+
 def get_key_code_name(key_code: str) -> str:
     """ KeyCode  KeyCode """
     return KEY_CODE_MAP.get(key_code, key_code)

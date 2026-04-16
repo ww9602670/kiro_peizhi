@@ -293,6 +293,27 @@ class TestRiskIntegration:
         executor.adapter.place_bet.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_risk_stop_report_returned(self, executor, setup_data):
+        """Risk failures marked stop_strategy are returned to worker."""
+        executor.risk.check = AsyncMock(
+            return_value=RiskCheckResult(
+                passed=False,
+                reason="balance",
+                stop_strategy=True,
+                stop_reason="balance_insufficient",
+            )
+        )
+        signal = make_signal(setup_data["strategy"]["id"])
+        install = make_install()
+
+        report = await executor.execute(install, [signal])
+
+        assert report.stop_strategy_ids == {
+            setup_data["strategy"]["id"]: "balance_insufficient"
+        }
+        executor.adapter.place_bet.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_risk_check_called_per_signal(self, executor, setup_data):
         """"""
         s1 = make_signal(setup_data["strategy"]["id"], key_code="DX1")
@@ -325,6 +346,99 @@ class TestRiskIntegration:
         assert len(betdata) == 1
         assert betdata[0]["KeyCode"] == "DX1"
 
+
+class TestRedWaveAtomicBalanceGuard:
+    @pytest.mark.asyncio
+    async def test_red_wave_group_insufficient_balance_stops_strategy(
+        self, db, executor, setup_data
+    ):
+        red = await strategy_create(
+            db,
+            operator_id=setup_data["operator"]["id"],
+            account_id=setup_data["account"]["id"],
+            name="red_guard",
+            type="red_wave_double_martin",
+            play_code="B1LM_S,DS4",
+            base_amount=100,
+            martin_sequence="[1,2,4]",
+        )
+        red = await strategy_update(
+            db,
+            strategy_id=red["id"],
+            operator_id=setup_data["operator"]["id"],
+            status="running",
+        )
+        await account_update(
+            db,
+            account_id=setup_data["account"]["id"],
+            operator_id=setup_data["operator"]["id"],
+            balance=150,
+        )
+        await odds_batch_upsert(
+            db,
+            account_id=setup_data["account"]["id"],
+            odds_map={"B1LM_S": 19800, "DS4": 19800},
+            confirmed=True,
+        )
+
+        s1 = make_signal(red["id"], key_code="B1LM_S", amount=100)
+        s2 = make_signal(red["id"], key_code="DS4", amount=100)
+        report = await executor.execute(make_install(), [s1, s2])
+
+        assert report.stop_strategy_ids == {red["id"]: "balance_insufficient"}
+        executor.adapter.place_bet.assert_not_called()
+
+        row = await (
+            await db.execute(
+                "SELECT COUNT(*) AS cnt FROM bet_orders "
+                "WHERE strategy_id=? AND issue=?",
+                (red["id"], "20240101001"),
+            )
+        ).fetchone()
+        assert row["cnt"] == 0
+
+    @pytest.mark.asyncio
+    async def test_red_wave_group_sufficient_balance_places_all(
+        self, db, executor, setup_data
+    ):
+        red = await strategy_create(
+            db,
+            operator_id=setup_data["operator"]["id"],
+            account_id=setup_data["account"]["id"],
+            name="red_guard_ok",
+            type="red_wave_double_martin",
+            play_code="B1LM_S,DS4",
+            base_amount=100,
+            martin_sequence="[1,2,4]",
+        )
+        red = await strategy_update(
+            db,
+            strategy_id=red["id"],
+            operator_id=setup_data["operator"]["id"],
+            status="running",
+        )
+        await account_update(
+            db,
+            account_id=setup_data["account"]["id"],
+            operator_id=setup_data["operator"]["id"],
+            balance=300,
+        )
+        await odds_batch_upsert(
+            db,
+            account_id=setup_data["account"]["id"],
+            odds_map={"B1LM_S": 19800, "DS4": 19800},
+            confirmed=True,
+        )
+
+        s1 = make_signal(red["id"], key_code="B1LM_S", amount=100)
+        s2 = make_signal(red["id"], key_code="DS4", amount=100)
+        report = await executor.execute(make_install(), [s1, s2])
+
+        assert report.stop_strategy_ids == {}
+        executor.adapter.place_bet.assert_called_once()
+        betdata = executor.adapter.place_bet.call_args[0][1]
+        assert len(betdata) == 2
+        assert {b["KeyCode"] for b in betdata} == {"B1LM_S", "DS4"}
 
 # 
 # 4.  + betdata 7.2.4

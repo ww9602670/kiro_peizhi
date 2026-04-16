@@ -58,21 +58,21 @@ export default function BetOrderTable({ orders }: BetOrderTableProps) {
                       : ''
               }
             >
-              <td>{o.issue}</td>
-              <td>{o.key_code_name}</td>
-              <td>{o.amount.toFixed(2)}</td>
-              <td>{o.odds != null ? o.odds.toFixed(2) : '-'}</td>
-              <td>
+              <td data-label="期号">{o.issue}</td>
+              <td data-label="玩法">{o.key_code_name}</td>
+              <td data-label="金额">{o.amount.toFixed(2)}</td>
+              <td data-label="赔率">{o.odds != null ? o.odds.toFixed(2) : '-'}</td>
+              <td data-label="状态">
                 <span className={`order-status order-status-${o.status}`}>
                   {STATUS_LABEL[o.status] ?? o.status}
                 </span>
               </td>
-              <td>{o.open_result ?? '-'}</td>
-              <td className={o.pnl != null ? (o.pnl >= 0 ? 'pnl-positive' : 'pnl-negative') : ''}>
+              <td data-label="开奖">{o.open_result ?? '-'}</td>
+              <td data-label="盈亏" className={o.pnl != null ? (o.pnl >= 0 ? 'pnl-positive' : 'pnl-negative') : ''}>
                 {o.pnl != null ? (o.pnl > 0 ? `+${o.pnl.toFixed(2)}` : o.pnl.toFixed(2)) : '-'}
               </td>
-              <td>{o.simulation ? '是' : '否'}</td>
-              <td className="td-time">{o.bet_at ?? '-'}</td>
+              <td data-label="模拟">{o.simulation ? '是' : '否'}</td>
+              <td data-label="时间" className="td-time">{o.bet_at ?? '-'}</td>
             </tr>
           ))}
         </tbody>

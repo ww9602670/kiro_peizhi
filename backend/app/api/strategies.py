@@ -30,9 +30,11 @@ from app.schemas.strategy import (
     StrategyCreate,
     StrategyInfo,
     StrategyUpdate,
+    normalize_red_wave_double_play_code,
     validate_state_transition,
 )
 from app.utils.response import BizError
+from app.utils.key_code_map import get_key_code_name
 
 router = APIRouter()
 
@@ -62,12 +64,18 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
     ms_raw = row.get("martin_sequence")
     martin_sequence = json.loads(ms_raw) if ms_raw else None
 
+    # daily_pnl 日期检查：如果 daily_pnl_date 不是今天，返回 0
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    daily_pnl_raw = row["daily_pnl"] if row.get("daily_pnl_date") == today else 0
+
     return StrategyInfo(
         id=row["id"],
         account_id=row["account_id"],
         name=row["name"],
         type=row["type"],
         play_code=row["play_code"],
+        play_code_name=", ".join(get_key_code_name(c) for c in row["play_code"].split(",")),
         base_amount=_fen_to_yuan(row["base_amount"]),
         martin_sequence=martin_sequence,
         bet_timing=row["bet_timing"],
@@ -76,8 +84,9 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
         martin_level=row["martin_level"],
         stop_loss=_fen_to_yuan_optional(row.get("stop_loss")),
         take_profit=_fen_to_yuan_optional(row.get("take_profit")),
-        daily_pnl=_fen_to_yuan(row["daily_pnl"]),
+        daily_pnl=_fen_to_yuan(daily_pnl_raw),
         total_pnl=_fen_to_yuan(row["total_pnl"]),
+        platform_type=row.get("platform_type", "JND28WEB"),
     )
 
 
@@ -115,6 +124,8 @@ async def create_strategy(
         raise BizError(4001, "", status_code=404)
 
     # 2. 
+    play_code = body.play_code
+
     martin_seq_json = (
         json.dumps(body.martin_sequence) if body.martin_sequence else None
     )
@@ -125,13 +136,14 @@ async def create_strategy(
         account_id=body.account_id,
         name=body.name,
         type=body.type,
-        play_code=body.play_code,
+        play_code=play_code,
         base_amount=_yuan_to_fen(body.base_amount),
         martin_sequence=martin_seq_json,
         bet_timing=body.bet_timing,
         simulation=1 if body.simulation else 0,
         stop_loss=_yuan_to_fen(body.stop_loss) if body.stop_loss is not None else None,
         take_profit=_yuan_to_fen(body.take_profit) if body.take_profit is not None else None,
+        platform_type=body.platform_type,
     )
 
     return ApiResponse[StrategyInfo](data=_to_strategy_info(row))
@@ -160,6 +172,15 @@ async def update_strategy(
         update_fields["name"] = body.name
     if body.base_amount is not None:
         update_fields["base_amount"] = _yuan_to_fen(body.base_amount)
+    if body.play_code is not None:
+        if existing["type"] != "red_wave_double_martin":
+            raise BizError(1002, "only red_wave_double_martin supports play_code update", status_code=400)
+        try:
+            update_fields["play_code"] = normalize_red_wave_double_play_code(
+                body.play_code
+            )
+        except ValueError as exc:
+            raise BizError(1002, str(exc), status_code=400)
     if body.martin_sequence is not None:
         # 
         for v in body.martin_sequence:
@@ -174,6 +195,8 @@ async def update_strategy(
         update_fields["stop_loss"] = _yuan_to_fen(body.stop_loss)
     if body.take_profit is not None:
         update_fields["take_profit"] = _yuan_to_fen(body.take_profit)
+    if body.platform_type is not None:
+        update_fields["platform_type"] = body.platform_type
 
     if not update_fields:
         return ApiResponse[StrategyInfo](data=_to_strategy_info(existing))
@@ -322,12 +345,15 @@ async def _transition_strategy(
         #  Worker
         try:
             logger.info("  engine.start_worker...")
+            # 优先使用策略的 platform_type，回退到账号的 platform_type
+            strategy_platform_type = existing.get("platform_type") or account.get("platform_type", "JND28WEB")
             await engine.start_worker(
                 operator_id=operator["id"],
                 account_id=account["id"],
                 account_name=account["account_name"],
                 password=account["password"],
-                platform_type=account.get("platform_type", "JND28WEB"),
+                platform_type=strategy_platform_type,
+                platform_url=account.get("platform_url"),
                 strategies=running_strategies,
             )
             logger.info(" engine.start_worker ")
@@ -363,6 +389,32 @@ async def _transition_strategy(
             except Exception as e:
                 logger.exception(f"  Worker : {e}")
                 # 
+        else:
+            # 还有其他 running 策略：从 Worker 中移除该策略，不停止 Worker
+            try:
+                worker = await engine.registry.get(existing["account_id"])
+                if worker and worker.running:
+                    worker.remove_strategy(strategy_id)
+                    logger.info(
+                        "从 Worker 移除策略 strategy_id=%d account_id=%d 剩余策略=%d",
+                        strategy_id, existing["account_id"], len(worker.strategies),
+                    )
+            except Exception as e:
+                logger.exception(f"移除策略异常: {e}")
+    
+    # 暂停策略：从 Worker 中移除该策略（不停止 Worker）
+    elif target_status == "paused":
+        logger.info("暂停策略，从 Worker 移除 strategy_id=%d...", strategy_id)
+        try:
+            worker = await engine.registry.get(existing["account_id"])
+            if worker and worker.running:
+                worker.remove_strategy(strategy_id)
+                logger.info(
+                    "暂停：从 Worker 移除策略 strategy_id=%d account_id=%d 剩余策略=%d",
+                    strategy_id, existing["account_id"], len(worker.strategies),
+                )
+        except Exception as e:
+            logger.exception(f"暂停移除策略异常: {e}")
     
     logger.info(" strategy_id=%d new_status=%s", strategy_id, target_status)
     return _to_strategy_info(row)

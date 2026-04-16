@@ -6,7 +6,6 @@
 
 import { request } from '@/api/request';
 import type { BetOrderInfo } from '@/types/api/bet-order';
-import type { PagedData } from '@/types/api/common';
 
 export interface ListBetOrdersParams {
   page?: number;
@@ -14,6 +13,8 @@ export interface ListBetOrdersParams {
   date_from?: string;
   date_to?: string;
   strategy_id?: number;
+  status?: string;
+  account_id?: number;
 }
 
 function buildQuery(params: ListBetOrdersParams): string {
@@ -23,11 +24,26 @@ function buildQuery(params: ListBetOrdersParams): string {
   if (params.date_from) parts.push(`date_from=${params.date_from}`);
   if (params.date_to) parts.push(`date_to=${params.date_to}`);
   if (params.strategy_id !== undefined) parts.push(`strategy_id=${params.strategy_id}`);
+  if (params.status) parts.push(`status=${params.status}`);
+  if (params.account_id !== undefined) parts.push(`account_id=${params.account_id}`);
   return parts.length > 0 ? `?${parts.join('&')}` : '';
 }
 
+export interface BetOrdersResponse {
+  paged: {
+    items: BetOrderInfo[];
+    total: number;
+    page: number;
+    page_size: number;
+  };
+  summary: {
+    total_amount: number;
+    total_payout: number;
+  };
+}
+
 export async function listBetOrders(params: ListBetOrdersParams = {}) {
-  return request<PagedData<BetOrderInfo>>(`/bet-orders${buildQuery(params)}`);
+  return request<BetOrdersResponse>(`/bet-orders${buildQuery(params)}`);
 }
 
 export async function getBetOrder(id: number) {

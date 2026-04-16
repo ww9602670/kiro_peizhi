@@ -103,7 +103,10 @@ async def refresh_account_odds(
     from app.engine.adapters.jnd import JNDAdapter
     from app.models.db_ops import odds_batch_upsert
 
-    adapter = JNDAdapter(platform_type=account.get("platform_type", "JND28WEB"))
+    adapter = JNDAdapter(
+        base_url=account.get("platform_url") or None,
+        platform_type=account.get("platform_type", "JND28WEB"),
+    )
 
     try:
         # 1. 登录

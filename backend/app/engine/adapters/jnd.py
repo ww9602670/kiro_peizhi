@@ -21,6 +21,10 @@ from app.engine.adapters.config import DEFAULT_HEADERS, MID_CODES
 logger = logging.getLogger(__name__)
 
 
+class InvalidInstallResponse(RuntimeError):
+    """Raised when current-install response is missing required fields."""
+
+
 class JNDAdapter(PlatformAdapter):
     """JND28 
 
@@ -44,11 +48,101 @@ class JNDAdapter(PlatformAdapter):
             cfg = PLATFORM_CONFIGS.get(platform_type, {})
             base_url = cfg.get("base_url", "")
             lottery_type = cfg.get("lottery_type", platform_type)
-
         self.base_url = (base_url or "").rstrip("/")
         self.lottery_type = lottery_type or "JND28WEB"
         self._session = session
         self._token: Optional[str] = None
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """Parse int from heterogeneous values with a fallback."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if math.isnan(value) or math.isinf(value):
+                return default
+            return int(value)
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                try:
+                    parsed = float(raw)
+                except ValueError:
+                    return default
+                if math.isnan(parsed) or math.isinf(parsed):
+                    return default
+                return int(parsed)
+        return default
+
+    @classmethod
+    def _non_negative_int(cls, value: Any, default: int = 0) -> int:
+        return max(0, cls._safe_int(value, default))
+
+    @staticmethod
+    def _safe_text(value: Any) -> str:
+        return "" if value is None else str(value)
+
+    @classmethod
+    def _normalize_state(cls, value: Any) -> int:
+        state = cls._safe_int(value, 0)
+        return state if state in (1, 2, 3) else 0
+
+    @classmethod
+    def _safe_response_summary(cls, data: Any, max_len: int = 800) -> str:
+        """Return a redacted response summary for diagnostics."""
+        try:
+            if isinstance(data, dict):
+                redacted: dict[str, Any] = {}
+                for key, value in data.items():
+                    key_text = str(key)
+                    lowered = key_text.lower()
+                    sensitive_markers = (
+                        "token",
+                        "cookie",
+                        "password",
+                        "passwd",
+                        "pwd",
+                        "authorization",
+                    )
+                    if any(marker in lowered for marker in sensitive_markers):
+                        redacted[key_text] = "***"
+                    elif isinstance(value, (dict, list, tuple, set)):
+                        redacted[key_text] = f"<{type(value).__name__}>"
+                    else:
+                        text_value = cls._safe_text(value)
+                        redacted[key_text] = text_value[:120]
+                summary = str(redacted)
+            else:
+                summary = cls._safe_text(data)
+        except Exception:
+            summary = "<unserializable-response>"
+        return summary[:max_len]
+
+    def _require_text(self, data: dict[str, Any], key: str) -> str:
+        value = self._safe_text(data.get(key)).strip()
+        if value:
+            return value
+
+        keys = sorted(str(k) for k in data.keys())
+        logger.warning(
+            "Invalid GetCurrentInstall response: missing key=%s state=%s msg=%s keys=%s summary=%s",
+            key,
+            data.get("State"),
+            self._safe_text(data.get("Msg")),
+            keys,
+            self._safe_response_summary(data),
+        )
+        raise InvalidInstallResponse(
+            f"missing required field '{key}' in GetCurrentInstall response"
+        )
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -102,11 +196,27 @@ class JNDAdapter(PlatformAdapter):
                 text = await resp.text()
                 raise ValueError(f" JSON : {text[:200]}")
 
+    async def get_captcha(self) -> bytes:
+        """Fetch captcha image bytes for formal platform login."""
+        session = await self._ensure_session()
+        url = f"{self.base_url}/Free/VCode"
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.read()
+
     # ------------------------------------------------------------------
     # PlatformAdapter 
     # ------------------------------------------------------------------
 
-    async def login(self, account_name: str, password: str) -> LoginResult:
+    async def login(
+        self,
+        account_name: str,
+        password: str,
+        captcha_code: Optional[str] = None,
+    ) -> LoginResult:
         """
 
          VisitorLogin  token cookie
@@ -136,13 +246,76 @@ class JNDAdapter(PlatformAdapter):
                         token=token_value,
                         message="",
                     )
-                else:
-                    return LoginResult(
-                        success=False,
-                        message=" token cookie",
-                    )
+                logger.info("VisitorLogin did not return token cookie")
         except aiohttp.ClientError as e:
             logger.error(": %s", e)
+            if captcha_code is None:
+                return LoginResult(
+                    success=False,
+                    message=f": {e}",
+                )
+
+        if not captcha_code:
+            return LoginResult(
+                success=False,
+                message=" token cookie",
+            )
+
+        ajax_url = f"{self.base_url}/Member/AjaxLogin"
+        form_data = {
+            "account": account_name,
+            "password": password,
+            "code": captcha_code,
+        }
+        try:
+            async with session.post(
+                ajax_url,
+                data=form_data,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                cookies = session.cookie_jar.filter_cookies(URL(self.base_url))
+                token_value = None
+                for key, cookie in cookies.items():
+                    if key.lower() == "token":
+                        token_value = cookie.value
+                        break
+
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    body = await resp.text()
+                    return LoginResult(
+                        success=False,
+                        message=f"AjaxLogin JSON error: {body[:120]}",
+                    )
+
+                state = self._safe_int(data.get("State"), 0)
+                msg = self._safe_text(data.get("Msg"))
+                if state == 1:
+                    token_value = (
+                        token_value
+                        or self._safe_text(data.get("Token")).strip()
+                        or self._safe_text(data.get("token")).strip()
+                    )
+                    if not token_value:
+                        for cookie in cookies.values():
+                            token_value = cookie.value
+                            break
+                    self._token = token_value or "ajax-session"
+                    return LoginResult(
+                        success=True,
+                        token=self._token,
+                        message=msg,
+                    )
+
+                return LoginResult(
+                    success=False,
+                    message=msg or f"AjaxLogin State={state}",
+                    captcha_required=state in (5, 6),
+                )
+        except aiohttp.ClientError as e:
+            logger.error("AjaxLogin failed: %s", e)
             return LoginResult(
                 success=False,
                 message=f": {e}",
@@ -155,18 +328,42 @@ class JNDAdapter(PlatformAdapter):
             f"?lotteryType={self.lottery_type}"
         )
         data = await self._post(url)
-        
-        #  0
-        raw_state = int(data.get("State", 0))
-        normalized_state = raw_state if raw_state in [1, 2, 3] else 0
-        
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "Invalid GetCurrentInstall response type=%s summary=%s",
+                type(data).__name__,
+                self._safe_response_summary(data),
+            )
+            raise InvalidInstallResponse(
+                "GetCurrentInstall response is not a JSON object"
+            )
+
+        issue = self._require_text(data, "Installments")
+        normalized_state = self._normalize_state(data.get("State", 0))
+        close_countdown = self._non_negative_int(data.get("CloseTimeStamp", 0), 0)
+        open_countdown = self._non_negative_int(data.get("OpenTimeStamp", 0), 0)
+
+        close_raw = self._safe_int(data.get("CloseTimeStamp", 0), 0)
+        open_raw = self._safe_int(data.get("OpenTimeStamp", 0), 0)
+        if close_raw < 0 or open_raw < 0:
+            logger.warning(
+                "GetCurrentInstall returned negative countdown close=%s open=%s "
+                "normalized_close=%s normalized_open=%s issue=%s",
+                close_raw,
+                open_raw,
+                close_countdown,
+                open_countdown,
+                issue,
+            )
+
         return InstallInfo(
-            issue=str(data["Installments"]),
+            issue=issue,
             state=normalized_state,
-            close_countdown_sec=int(data["CloseTimeStamp"]),
-            pre_issue=str(data.get("PreInstallments", "")),
-            pre_result=str(data.get("PreLotteryResult", "")),
-            open_countdown_sec=int(data.get("OpenTimeStamp", 0)),
+            close_countdown_sec=close_countdown,
+            pre_issue=self._safe_text(data.get("PreInstallments")),
+            pre_result=self._safe_text(data.get("PreLotteryResult")),
+            open_countdown_sec=open_countdown,
         )
 
     async def get_current_install_detail(self) -> dict:
@@ -190,18 +387,37 @@ class JNDAdapter(PlatformAdapter):
         #  authenticated session
         data = await self._post(url)
 
-        #  0
-        raw_state = data.get("State", 0)
-        normalized_state = raw_state if raw_state in [1, 2, 3] else 0
+        if not isinstance(data, dict):
+            logger.warning(
+                "Invalid current-install detail response type=%s summary=%s",
+                type(data).__name__,
+                self._safe_response_summary(data),
+            )
+            data = {}
+
+        normalized_state = self._normalize_state(data.get("State", 0))
+        close_countdown = self._non_negative_int(data.get("CloseTimeStamp", 0), 0)
+        open_countdown = self._non_negative_int(data.get("OpenTimeStamp", 0), 0)
+        installments = self._safe_text(data.get("Installments")).strip()
+
+        if not installments:
+            logger.warning(
+                "GetCurrentInstall detail missing Installments state=%s msg=%s "
+                "keys=%s summary=%s",
+                data.get("State"),
+                self._safe_text(data.get("Msg")),
+                sorted(str(k) for k in data.keys()),
+                self._safe_response_summary(data),
+            )
 
         return {
-            "installments": str(data.get("Installments", "")),
-            "state": normalized_state,  # 
-            "close_countdown_sec": int(data.get("CloseTimeStamp", 0)),
-            "open_countdown_sec": int(data.get("OpenTimeStamp", 0)),
-            "pre_lottery_result": str(data.get("PreLotteryResult", "")),
-            "pre_installments": str(data.get("PreInstallments", "")),
-            "template_code": str(data.get("TemplateCode", "")),
+            "installments": installments,
+            "state": normalized_state,
+            "close_countdown_sec": close_countdown,
+            "open_countdown_sec": open_countdown,
+            "pre_lottery_result": self._safe_text(data.get("PreLotteryResult")),
+            "pre_installments": self._safe_text(data.get("PreInstallments")),
+            "template_code": self._safe_text(data.get("TemplateCode")),
         }
 
     async def load_odds(self, issue: str) -> dict[str, int]:
@@ -292,17 +508,32 @@ class JNDAdapter(PlatformAdapter):
 
     async def get_bet_history(self, count: int = 15) -> list[dict]:
         """"""
-        url = f"{self.base_url}/PlaceBet/Topbetlist"
+        url = f"{self.base_url}/BettingList/getBetChecked"
         form_data = {
-            "top": str(count),
-            "lotterytype": self.lottery_type,
+            "startIndex": "0",
+            "rows": str(count),
         }
         resp = await self._post(url, data=form_data)
+        records = self._extract_bet_history_records(resp)
+        return records
+
+    @staticmethod
+    def _extract_bet_history_records(resp: Any) -> list[dict]:
+        """Extract settled bet records from supported platform response shapes."""
         if isinstance(resp, list):
-            return resp
-        if isinstance(resp, dict) and "data" in resp:
-            data = resp["data"]
-            return data if isinstance(data, list) else []
+            return [r for r in resp if isinstance(r, dict)]
+        if not isinstance(resp, dict):
+            return []
+
+        for key in ("betList", "Records", "data"):
+            value = resp.get(key)
+            if isinstance(value, list):
+                return [r for r in value if isinstance(r, dict)]
+            if isinstance(value, dict):
+                for nested_key in ("betList", "Records", "data"):
+                    nested = value.get(nested_key)
+                    if isinstance(nested, list):
+                        return [r for r in nested if isinstance(r, dict)]
         return []
 
     async def get_lottery_results(self, count: int = 10) -> list[dict]:

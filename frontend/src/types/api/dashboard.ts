@@ -11,7 +11,7 @@ export interface OperatorDashboard {
   daily_pnl: number;        // 元
   total_pnl: number;        // 元
   running_strategies: StrategyInfo[];
-  recent_bets: BetOrderInfo[];
+  pending_bets: BetOrderInfo[];
   unread_alerts: number;
 }
 

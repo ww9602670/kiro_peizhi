@@ -4,7 +4,7 @@ AccountCreate
 AccountInfo      
 KillSwitchUpdate  
 """
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,15 +24,18 @@ class AccountCreate(BaseModel):
             "example": {
                 "account_name": "player001",
                 "password": "mypassword",
-                "platform_type": "JND28WEB",
+                "platform_url": "https://example.com",
             }
         }
     )
 
     account_name: str = Field(..., min_length=1, description="")
     password: str = Field(..., min_length=1, description="")
-    platform_type: Literal["JND28WEB", "JND282"] = Field(
-        ..., description="JND28WEB JND2822.0"
+    platform_type: str = Field(
+        default="JND28WEB", description="盘口类型（已移至策略创建，此处保留向后兼容默认值）"
+    )
+    platform_url: Optional[str] = Field(
+        default=None, description="平台地址，留空则使用盘口类型的默认地址"
     )
 
 
@@ -58,6 +61,7 @@ class AccountInfo(BaseModel):
     account_name: str
     password_masked: str  # 2+****
     platform_type: str
+    platform_url: Optional[str] = None
     status: str
     balance: float  # API int / 100
     kill_switch: bool

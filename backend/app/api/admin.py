@@ -226,10 +226,10 @@ async def admin_dashboard(
     db=Depends(get_db_conn),
 ):
     """"""
-    from datetime import datetime
+    from datetime import datetime, timezone, timedelta
 
     operators = await operator_list_all(db)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
 
     summaries: list[OperatorSummary] = []
     active_count = 0

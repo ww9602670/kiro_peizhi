@@ -67,7 +67,9 @@ class StubStrategy(BaseStrategy):
     def compute(self, ctx: StrategyContext) -> list[BetInstruction]:
         return [BetInstruction(key_code=self._key_code, amount=self._amount)]
 
-    def on_result(self, is_win: Optional[int], pnl: int) -> None:
+    def on_result(
+        self, is_win: Optional[int], pnl: int, key_code: str | None = None
+    ) -> None:
         pass
 
 
@@ -80,7 +82,9 @@ class ErrorStrategy(BaseStrategy):
     def compute(self, ctx: StrategyContext) -> list[BetInstruction]:
         raise RuntimeError("")
 
-    def on_result(self, is_win: Optional[int], pnl: int) -> None:
+    def on_result(
+        self, is_win: Optional[int], pnl: int, key_code: str | None = None
+    ) -> None:
         pass
 
 
@@ -97,7 +101,9 @@ class MultiKeyStrategy(BaseStrategy):
     def compute(self, ctx: StrategyContext) -> list[BetInstruction]:
         return [BetInstruction(key_code=kc, amount=self._amount) for kc in self._key_codes]
 
-    def on_result(self, is_win: Optional[int], pnl: int) -> None:
+    def on_result(
+        self, is_win: Optional[int], pnl: int, key_code: str | None = None
+    ) -> None:
         pass
 
 
@@ -389,6 +395,32 @@ class TestMartinLevel:
         signals = runner.collect_signals(default_ctx, "10001")
         assert signals[0].martin_level == 0
 
+    def test_instruction_level_has_priority(self, default_ctx):
+        class _InstructionLevelStrategy(BaseStrategy):
+            def name(self) -> str:
+                return "inst_level"
+
+            def compute(self, ctx: StrategyContext) -> list[BetInstruction]:
+                return [
+                    BetInstruction(
+                        key_code="DX1", amount=1000, martin_level=3
+                    )
+                ]
+
+            def on_result(
+                self,
+                is_win: Optional[int],
+                pnl: int,
+                key_code: str | None = None,
+            ) -> None:
+                pass
+
+        runner = StrategyRunner(strategy_id=1, strategy=_InstructionLevelStrategy())
+        runner.start()
+        signals = runner.collect_signals(default_ctx, "10001")
+        assert len(signals) == 1
+        assert signals[0].martin_level == 3
+
 
 # ---------------------------------------------------------------------------
 # simulation 
@@ -429,7 +461,7 @@ class TestOnResult:
         strategy.on_result = MagicMock()
         runner = StrategyRunner(strategy_id=1, strategy=strategy)
         await runner.on_result(is_win=1, pnl=500)
-        strategy.on_result.assert_called_once_with(1, 500)
+        strategy.on_result.assert_called_once_with(1, 500, key_code=None)
 
     @pytest.mark.asyncio
     async def test_calls_flush_alerts_if_available(self):
@@ -470,6 +502,14 @@ class TestOnResult:
         signals = runner.collect_signals(default_ctx, "10002")
         assert signals[0].amount == 2000
         assert signals[0].martin_level == 1
+
+    @pytest.mark.asyncio
+    async def test_passes_key_code_to_strategy(self):
+        strategy = MagicMock(spec=BaseStrategy)
+        strategy.on_result = MagicMock()
+        runner = StrategyRunner(strategy_id=1, strategy=strategy)
+        await runner.on_result(is_win=1, pnl=500, key_code="DS4")
+        strategy.on_result.assert_called_once_with(1, 500, key_code="DS4")
 
 
 # ---------------------------------------------------------------------------

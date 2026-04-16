@@ -10,12 +10,49 @@ import logging
 from fastapi import APIRouter, Depends, Request
 
 from app.api.dependencies import get_current_operator, get_db_conn
+from app.engine.adapters.jnd import InvalidInstallResponse
 from app.schemas.common import ApiResponse
 from app.schemas.lottery import CurrentInstallResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _default_current_install_response() -> CurrentInstallResponse:
+    return CurrentInstallResponse(
+        installments="",
+        state=0,
+        close_countdown_sec=0,
+        open_countdown_sec=0,
+        pre_lottery_result="",
+        pre_installments="",
+        template_code="",
+    )
+
+
+def _safe_non_negative_int(value: object) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed >= 0 else 0
+
+
+def _build_current_install_response(detail: dict) -> CurrentInstallResponse:
+    return CurrentInstallResponse(
+        installments=str(detail.get("installments") or ""),
+        state=_safe_non_negative_int(detail.get("state", 0)),
+        close_countdown_sec=_safe_non_negative_int(
+            detail.get("close_countdown_sec", 0)
+        ),
+        open_countdown_sec=_safe_non_negative_int(
+            detail.get("open_countdown_sec", 0)
+        ),
+        pre_lottery_result=str(detail.get("pre_lottery_result") or ""),
+        pre_installments=str(detail.get("pre_installments") or ""),
+        template_code=str(detail.get("template_code") or ""),
+    )
 
 
 @router.get("/current-install")
@@ -35,7 +72,6 @@ async def get_current_install(
     engine: EngineManager = request.app.state.engine
     operator_id = operator["id"]
 
-    # Find a running worker for this operator
     adapter = None
     workers = await engine.registry.all_workers()
     for _account_id, worker in workers.items():
@@ -43,7 +79,6 @@ async def get_current_install(
             adapter = worker.adapter
             break
 
-    # Fallback: try any running worker (operator may be admin)
     if adapter is None and operator.get("role") == "admin":
         for _account_id, worker in workers.items():
             if worker.running:
@@ -51,46 +86,36 @@ async def get_current_install(
                 break
 
     if adapter is None:
-        # No running worker — return empty/default response
         return ApiResponse(
             code=0,
             message="success",
-            data=CurrentInstallResponse(
-                installments="",
-                state=0,
-                close_countdown_sec=0,
-                open_countdown_sec=0,
-                pre_lottery_result="",
-                pre_installments="",
-                template_code="",
-            ),
+            data=_default_current_install_response(),
         )
 
     try:
         detail = await adapter.get_current_install_detail()
-        response = CurrentInstallResponse(
-            installments=detail["installments"],
-            state=detail["state"],
-            close_countdown_sec=detail["close_countdown_sec"],
-            open_countdown_sec=detail["open_countdown_sec"],
-            pre_lottery_result=detail["pre_lottery_result"],
-            pre_installments=detail["pre_installments"],
-            template_code=detail["template_code"],
-        )
+        if not isinstance(detail, dict):
+            raise InvalidInstallResponse(
+                f"adapter returned non-dict current-install detail: {type(detail).__name__}"
+            )
+        response = _build_current_install_response(detail)
         return ApiResponse(code=0, message="success", data=response)
-    except Exception as e:
-        logger.error("Failed to get install info: %s", e, exc_info=True)
-        # Return default on error rather than 500
+    except InvalidInstallResponse as e:
+        logger.warning("Invalid current-install response: %s", e)
         return ApiResponse(
             code=0,
             message="success",
-            data=CurrentInstallResponse(
-                installments="",
-                state=0,
-                close_countdown_sec=0,
-                open_countdown_sec=0,
-                pre_lottery_result="",
-                pre_installments="",
-                template_code="",
-            ),
+            data=_default_current_install_response(),
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to get install info type=%s detail=%s",
+            type(e).__name__,
+            e,
+            exc_info=True,
+        )
+        return ApiResponse(
+            code=0,
+            message="success",
+            data=_default_current_install_response(),
         )

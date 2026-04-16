@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+_BJT = timezone(timedelta(hours=8))
 
 import aiosqlite
 
@@ -37,6 +39,8 @@ class RiskCheckResult:
     """"""
     passed: bool
     reason: str = ""
+    stop_strategy: bool = False
+    stop_reason: str = ""
 
 
 class RiskController:
@@ -178,7 +182,6 @@ class RiskController:
 
             if count >= 3:
                 #  3    + 
-                await self._pause_all_strategies()
                 await self.alert_service.send(
                     operator_id=self.operator_id,
                     alert_type="balance_low",
@@ -186,12 +189,15 @@ class RiskController:
                     detail=f"={balance}={signal.amount}",
                     account_id=self.account_id,
                 )
+                await self._pause_all_strategies()
                 # 
                 self._balance_fail_count[self.account_id] = 0
 
             return RiskCheckResult(
                 passed=False,
                 reason=f"={balance}={signal.amount}",
+                stop_strategy=True,
+                stop_reason="balance_insufficient",
             )
 
         # 
@@ -252,7 +258,7 @@ class RiskController:
             return RiskCheckResult(passed=True)
 
         # 
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(_BJT).strftime("%Y-%m-%d")
         row = await (await self.db.execute(
             """SELECT COALESCE(SUM(amount), 0) as total
                FROM bet_orders
@@ -341,6 +347,8 @@ class RiskController:
             return RiskCheckResult(
                 passed=False,
                 reason=f"daily_pnl={daily_pnl}=-{stop_loss}",
+                stop_strategy=True,
+                stop_reason="stop_loss",
             )
 
         return RiskCheckResult(passed=True)
@@ -373,6 +381,8 @@ class RiskController:
             return RiskCheckResult(
                 passed=False,
                 reason=f"daily_pnl={daily_pnl}={take_profit}",
+                stop_strategy=True,
+                stop_reason="take_profit",
             )
 
         return RiskCheckResult(passed=True)
@@ -383,7 +393,7 @@ class RiskController:
 
     async def _calc_daily_pnl(self, strategy_id: int) -> int:
         """is_win=-1 """
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(_BJT).strftime("%Y-%m-%d")
         row = await (await self.db.execute(
             """SELECT COALESCE(SUM(pnl), 0) as total_pnl
                FROM bet_orders

@@ -1,10 +1,14 @@
-""" CaptchaService """
+"""验证码本地 OCR 服务测试
 
-import asyncio
-import json
+测试 CaptchaService 的本地 ddddocr 识别功能：
+- 初始化配置
+- 队列限制
+- 异常处理
+- 线程池隔离
+"""
+
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -14,115 +18,13 @@ from app.utils.captcha import (
     CaptchaError,
     CaptchaServiceBusyError,
     CaptchaServiceUnavailableError,
-    CaptchaTimeoutError,
     MAX_WORKERS,
     QUEUE_LIMIT,
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers:  HTTP mock server
-# ---------------------------------------------------------------------------
-
-class MockOCRHandler(BaseHTTPRequestHandler):
-    """ OCR  HTTP handler"""
-
-    def do_POST(self):
-        if self.path == "/ocr":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"code": "AB12"}).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        pass  # 
-
-
-class SlowOCRHandler(BaseHTTPRequestHandler):
-    """ OCR """
-
-    def do_POST(self):
-        import time
-        time.sleep(5)  # 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"code": "SLOW"}).encode())
-
-    def log_message(self, format, *args):
-        pass
-
-
-class ErrorOCRHandler(BaseHTTPRequestHandler):
-    """ 500  OCR """
-
-    def do_POST(self):
-        self.send_response(500)
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
-
-
-class EmptyCodeHandler(BaseHTTPRequestHandler):
-    """ OCR """
-
-    def do_POST(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"code": ""}).encode())
-
-    def log_message(self, format, *args):
-        pass
-
-
-def start_mock_server(handler_class, port=0):
-    """ mock HTTP server (server, port)"""
-    server = HTTPServer(("127.0.0.1", port), handler_class)
-    actual_port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, actual_port
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mock_server():
-    """ mock OCR """
-    server, port = start_mock_server(MockOCRHandler)
-    yield port
-    server.shutdown()
-
-
-@pytest.fixture
-def error_server():
-    """ 500  mock OCR """
-    server, port = start_mock_server(ErrorOCRHandler)
-    yield port
-    server.shutdown()
-
-
-@pytest.fixture
-def empty_code_server():
-    """ mock OCR """
-    server, port = start_mock_server(EmptyCodeHandler)
-    yield port
-    server.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
 class TestCaptchaServiceInit:
-    """"""
+    """初始化测试"""
 
     def test_default_config(self):
         svc = CaptchaService()
@@ -132,111 +34,73 @@ class TestCaptchaServiceInit:
         svc.shutdown()
 
     def test_custom_config(self):
-        svc = CaptchaService(
-            service_url="http://custom:1234",
-            max_workers=5,
-            queue_limit=50,
-            timeout=3.0,
-        )
-        assert svc.service_url == "http://custom:1234"
-        assert svc.max_workers == 5
+        svc = CaptchaService(max_workers=2, queue_limit=50)
+        assert svc.max_workers == 2
         assert svc.queue_limit == 50
-        assert svc.timeout == 3.0
         svc.shutdown()
 
 
 class TestCaptchaServiceRecognize:
-    """"""
+    """识别功能测试（mock ddddocr）"""
 
     @pytest.mark.asyncio
-    async def test_normal_recognition(self, mock_server):
-        """  """
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{mock_server}",
-            max_workers=2,
-            queue_limit=10,
-        )
+    async def test_normal_recognition(self):
+        """正常识别返回结果"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.return_value = "AB12"
+        svc._ocr = mock_ocr
+
         try:
             result = await svc.recognize(b"fake-image-data")
             assert result == "AB12"
-            assert svc.pending_count == 0  # 
+            assert svc.pending_count == 0
+            mock_ocr.classification.assert_called_once_with(b"fake-image-data")
         finally:
             svc.shutdown()
 
     @pytest.mark.asyncio
-    async def test_multiple_sequential_calls(self, mock_server):
-        """"""
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{mock_server}",
-            max_workers=2,
-            queue_limit=10,
-        )
+    async def test_multiple_sequential_calls(self):
+        """连续多次识别"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.return_value = "1234"
+        svc._ocr = mock_ocr
+
         try:
             for _ in range(3):
                 result = await svc.recognize(b"img")
-                assert result == "AB12"
+                assert result == "1234"
         finally:
             svc.shutdown()
 
-
-class TestQueueLimit:
-    """"""
-
     @pytest.mark.asyncio
-    async def test_queue_limit_rejects_101st_request(self):
-        """ 101  100"""
-        svc = CaptchaService(
-            service_url="http://127.0.0.1:19999",  # 
-            max_workers=2,
-            queue_limit=100,
-        )
-
-        # 
-        with svc._lock:
-            svc._pending_count = 100
+    async def test_strips_whitespace(self):
+        """结果去除空格"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.return_value = "  AB12  "
+        svc._ocr = mock_ocr
 
         try:
-            with pytest.raises(CaptchaServiceBusyError, match=""):
-                await svc.recognize(b"img")
-        finally:
-            #  shutdown 
-            with svc._lock:
-                svc._pending_count = 0
-            svc.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_queue_limit_allows_at_99(self, mock_server):
-        """pending=99 """
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{mock_server}",
-            max_workers=2,
-            queue_limit=100,
-        )
-
-        with svc._lock:
-            svc._pending_count = 99
-
-        try:
-            # pending=99 < 100
             result = await svc.recognize(b"img")
             assert result == "AB12"
         finally:
             svc.shutdown()
 
-    @pytest.mark.asyncio
-    async def test_queue_limit_boundary(self):
-        """pending  queue_limit """
-        svc = CaptchaService(
-            service_url="http://127.0.0.1:19999",
-            max_workers=2,
-            queue_limit=5,
-        )
 
+class TestQueueLimit:
+    """队列限制测试"""
+
+    @pytest.mark.asyncio
+    async def test_queue_limit_rejects_when_full(self):
+        """队列满时拒绝新请求"""
+        svc = CaptchaService(max_workers=2, queue_limit=100)
         with svc._lock:
-            svc._pending_count = 5
+            svc._pending_count = 100
 
         try:
-            with pytest.raises(CaptchaServiceBusyError):
+            with pytest.raises(CaptchaServiceBusyError, match="队列已满"):
                 await svc.recognize(b"img")
         finally:
             with svc._lock:
@@ -244,13 +108,30 @@ class TestQueueLimit:
             svc.shutdown()
 
     @pytest.mark.asyncio
-    async def test_pending_count_decrements_after_completion(self, mock_server):
-        """ pending_count """
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{mock_server}",
-            max_workers=2,
-            queue_limit=10,
-        )
+    async def test_queue_limit_allows_below_limit(self):
+        """未满时允许请求"""
+        svc = CaptchaService(max_workers=2, queue_limit=100)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.return_value = "OK"
+        svc._ocr = mock_ocr
+
+        with svc._lock:
+            svc._pending_count = 99
+
+        try:
+            result = await svc.recognize(b"img")
+            assert result == "OK"
+        finally:
+            svc.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_pending_count_decrements_after_completion(self):
+        """完成后 pending_count 归零"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.return_value = "X"
+        svc._ocr = mock_ocr
+
         try:
             assert svc.pending_count == 0
             await svc.recognize(b"img")
@@ -260,15 +141,14 @@ class TestQueueLimit:
 
     @pytest.mark.asyncio
     async def test_pending_count_decrements_on_error(self):
-        """ pending_count """
-        svc = CaptchaService(
-            service_url="http://127.0.0.1:1",  # 
-            max_workers=2,
-            queue_limit=10,
-            timeout=1,
-        )
+        """异常后 pending_count 也归零"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.side_effect = RuntimeError("boom")
+        svc._ocr = mock_ocr
+
         try:
-            with pytest.raises(CaptchaError):  #  CaptchaError 
+            with pytest.raises(CaptchaError):
                 await svc.recognize(b"img")
             assert svc.pending_count == 0
         finally:
@@ -276,121 +156,86 @@ class TestQueueLimit:
 
 
 class TestErrorHandling:
-    """"""
+    """异常处理测试"""
 
     @pytest.mark.asyncio
-    async def test_service_unavailable(self):
-        """  CaptchaServiceUnavailableError"""
-        #  server 
-        server = HTTPServer(("127.0.0.1", 0), MockOCRHandler)
-        port = server.server_address[1]
-        server.server_close()  # 
+    async def test_empty_result_raises_error(self):
+        """OCR 返回空结果"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.return_value = ""
+        svc._ocr = mock_ocr
 
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{port}",
-            max_workers=2,
-            queue_limit=10,
-            timeout=2,
-        )
         try:
-            with pytest.raises((CaptchaServiceUnavailableError, CaptchaTimeoutError)):
+            with pytest.raises(CaptchaError, match="空结果"):
                 await svc.recognize(b"img")
         finally:
             svc.shutdown()
 
     @pytest.mark.asyncio
-    async def test_timeout_handling(self):
-        """  CaptchaTimeoutError"""
-        server, port = start_mock_server(SlowOCRHandler)
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{port}",
-            max_workers=2,
-            queue_limit=10,
-            timeout=0.5,  # 
-        )
-        try:
-            with pytest.raises(CaptchaTimeoutError):
-                await svc.recognize(b"img")
-        finally:
-            svc.shutdown()
-            server.shutdown()
+    async def test_ocr_exception_wrapped(self):
+        """OCR 内部异常被包装为 CaptchaError"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.side_effect = ValueError("bad image")
+        svc._ocr = mock_ocr
 
-    @pytest.mark.asyncio
-    async def test_server_error_500(self, error_server):
-        """ 500  CaptchaServiceUnavailableError"""
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{error_server}",
-            max_workers=2,
-            queue_limit=10,
-        )
         try:
-            with pytest.raises(CaptchaServiceUnavailableError, match="500"):
+            with pytest.raises(CaptchaError, match="识别失败"):
                 await svc.recognize(b"img")
         finally:
             svc.shutdown()
 
-    @pytest.mark.asyncio
-    async def test_empty_code_response(self, empty_code_server):
-        """OCR   CaptchaError"""
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{empty_code_server}",
-            max_workers=2,
-            queue_limit=10,
-        )
-        try:
-            with pytest.raises(CaptchaError, match=""):
-                await svc.recognize(b"img")
-        finally:
-            svc.shutdown()
+    def test_ddddocr_not_installed(self):
+        """ddddocr 未安装时抛出 Unavailable"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        svc._ocr = None  # 确保未初始化
+
+        with patch.dict("sys.modules", {"ddddocr": None}):
+            with patch("builtins.__import__", side_effect=ImportError("no ddddocr")):
+                with pytest.raises(CaptchaServiceUnavailableError, match="ddddocr"):
+                    svc._get_ocr()
+        svc.shutdown()
 
 
 class TestThreadPoolIsolation:
-    """ThreadPoolExecutor """
+    """线程池隔离测试"""
 
     def test_dedicated_executor(self):
-        """CaptchaService """
-        svc = CaptchaService(max_workers=10)
-        #  ThreadPoolExecutor 
+        svc = CaptchaService(max_workers=4)
         assert isinstance(svc.executor, ThreadPoolExecutor)
-        assert svc.executor._max_workers == 10
+        assert svc.executor._max_workers == 4
         svc.shutdown()
 
     def test_two_instances_have_separate_pools(self):
-        """ CaptchaService """
-        svc1 = CaptchaService(max_workers=5)
-        svc2 = CaptchaService(max_workers=3)
+        svc1 = CaptchaService(max_workers=3)
+        svc2 = CaptchaService(max_workers=2)
         assert svc1.executor is not svc2.executor
-        assert svc1.executor._max_workers == 5
-        assert svc2.executor._max_workers == 3
         svc1.shutdown()
         svc2.shutdown()
 
     def test_thread_name_prefix(self):
-        """ captcha-ocr """
         svc = CaptchaService(max_workers=2)
         assert svc.executor._thread_name_prefix == "captcha-ocr"
         svc.shutdown()
 
     @pytest.mark.asyncio
-    async def test_ocr_runs_in_captcha_thread(self, mock_server):
-        """OCR  captcha-ocr """
+    async def test_ocr_runs_in_captcha_thread(self):
+        """OCR 在 captcha-ocr 线程中执行"""
         captured_thread_name = []
 
-        original_call = CaptchaService._call_ocr_service
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
 
-        def patched_call(self_inner, image_data):
+        def fake_classify(img):
             captured_thread_name.append(threading.current_thread().name)
-            return original_call(self_inner, image_data)
+            return "TEST"
 
-        svc = CaptchaService(
-            service_url=f"http://127.0.0.1:{mock_server}",
-            max_workers=2,
-            queue_limit=10,
-        )
+        mock_ocr.classification = fake_classify
+        svc._ocr = mock_ocr
+
         try:
-            with patch.object(CaptchaService, "_call_ocr_service", patched_call):
-                await svc.recognize(b"img")
-
+            await svc.recognize(b"img")
             assert len(captured_thread_name) == 1
             assert "captcha-ocr" in captured_thread_name[0]
         finally:
@@ -398,7 +243,7 @@ class TestThreadPoolIsolation:
 
 
 class TestExceptionHierarchy:
-    """"""
+    """异常继承关系"""
 
     def test_busy_is_captcha_error(self):
         assert issubclass(CaptchaServiceBusyError, CaptchaError)
@@ -406,11 +251,34 @@ class TestExceptionHierarchy:
     def test_unavailable_is_captcha_error(self):
         assert issubclass(CaptchaServiceUnavailableError, CaptchaError)
 
-    def test_timeout_is_captcha_error(self):
-        assert issubclass(CaptchaTimeoutError, CaptchaError)
-
     def test_catch_all_with_base(self):
-        """ CaptchaError """
-        for exc_cls in [CaptchaServiceBusyError, CaptchaServiceUnavailableError, CaptchaTimeoutError]:
+        for exc_cls in [CaptchaServiceBusyError, CaptchaServiceUnavailableError]:
             with pytest.raises(CaptchaError):
                 raise exc_cls("test")
+
+
+class TestBackwardCompatibility:
+    """向后兼容测试"""
+
+    def test_old_params_accepted(self):
+        """旧参数 service_url/timeout 仍可传入不报错"""
+        svc = CaptchaService(
+            service_url="http://old:9000",
+            timeout=5.0,
+            max_workers=2,
+            queue_limit=10,
+        )
+        assert svc.service_url == "http://old:9000"
+        assert svc.timeout == 5.0
+        svc.shutdown()
+
+    def test_call_ocr_service_compat(self):
+        """旧接口 _call_ocr_service 仍可用"""
+        svc = CaptchaService(max_workers=2, queue_limit=10)
+        mock_ocr = MagicMock()
+        mock_ocr.classification.return_value = "COMPAT"
+        svc._ocr = mock_ocr
+
+        result = svc._call_ocr_service(b"img")
+        assert result == "COMPAT"
+        svc.shutdown()

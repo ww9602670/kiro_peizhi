@@ -17,10 +17,15 @@ import {
 import type { StrategyInfo } from '@/types/api/strategy';
 import StrategyStatusTag from '@/components/StrategyStatusTag';
 import { CountdownDisplay } from '@/components/CountdownDisplay';
+import ConfirmDialog from '@/components/ConfirmDialog';
+import Toast from '@/components/Toast';
+import { useConfirm } from '@/hooks/useConfirm';
+import { useToast } from '@/hooks/useToast';
 import StrategyForm from './StrategyForm';
 import './Strategies.css';
 
 function getTypeBadge(type: string): { label: string; className: string } {
+  if (type === 'red_wave_double_martin') return { label: '红波追双', className: 'type-badge-martin' };
   if (type === 'martin') return { label: '马丁', className: 'type-badge-martin' };
   return { label: '平注', className: 'type-badge-flat' };
 }
@@ -32,6 +37,8 @@ export default function Strategies() {
   const [showForm, setShowForm] = useState(false);
   const [editingStrategy, setEditingStrategy] = useState<StrategyInfo | null>(null);
   const [actionLoading, setActionLoading] = useState<Record<number, string>>({});
+  const { confirmState, confirm, handleConfirm, handleCancel } = useConfirm();
+  const { messages, showToast, removeToast } = useToast();
 
   const fetchStrategies = useCallback(async () => {
     try {
@@ -56,7 +63,7 @@ export default function Strategies() {
       await fn();
       await fetchStrategies();
     } catch (err) {
-      alert(isApiError(err) ? err.message : '操作失败');
+      showToast(isApiError(err) ? err.message : '操作失败');
     } finally {
       setActionLoading((prev) => {
         const next = { ...prev };
@@ -70,14 +77,14 @@ export default function Strategies() {
   const handlePause = (id: number) => withActionLoading(id, 'pause', () => pauseStrategy(id).then(() => {}));
   const handleStop = (id: number) => withActionLoading(id, 'stop', () => stopStrategy(id).then(() => {}));
 
-  const handleDelete = (id: number, name: string) => {
-    if (!confirm(`确定删除策略「${name}」？`)) return;
+  const handleDelete = async (id: number, name: string) => {
+    if (!(await confirm(`确定删除策略「${name}」？`))) return;
     withActionLoading(id, 'delete', async () => {
       try {
         await deleteStrategy(id);
       } catch (err) {
         if (isApiError(err) && err.message.includes('投注记录')) {
-          if (confirm(`${err.message}\n\n是否强制删除（同时删除关联的投注记录）？`)) {
+          if (await confirm(`${err.message}\n\n是否强制删除（同时删除关联的投注记录）？`)) {
             await deleteStrategy(id, true);
             return;
           }
@@ -121,6 +128,14 @@ export default function Strategies() {
 
   return (
     <div className="strategies-page">
+      <Toast messages={messages} onRemove={removeToast} />
+      <ConfirmDialog
+        open={confirmState.open}
+        message={confirmState.message}
+        title={confirmState.title}
+        onConfirm={handleConfirm}
+        onCancel={handleCancel}
+      />
       <div className="strategies-header">
         <h1 className="strategies-title">投注策略</h1>
       </div>
@@ -205,8 +220,12 @@ function StrategyCard({
 
       <div className="strategy-info">
         <div className="strategy-info-item">
+          <span className="strategy-info-label">盘口类型</span>
+          <span className="strategy-info-value">{strategy.platform_type || 'JND28WEB'}</span>
+        </div>
+        <div className="strategy-info-item">
           <span className="strategy-info-label">玩法</span>
-          <span className="strategy-info-value">{strategy.play_code}</span>
+          <span className="strategy-info-value">{strategy.play_code_name || strategy.play_code}</span>
         </div>
         <div className="strategy-info-item">
           <span className="strategy-info-label">基础金额</span>

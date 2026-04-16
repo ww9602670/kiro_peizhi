@@ -36,6 +36,17 @@ backend/_*.py
 
 # Backend log files
 backend/*.log
+backend/logs/
+backend/screenshots/
+backend/test_*.txt
+backend/_*.log
 
 # Frontend screenshots
 frontend/screenshots/
+frontend/*.log
+
+# Runtime artifacts
+screenshots/
+test-report/
+jnd28.sqlite3
+_codex_child_probe.txt

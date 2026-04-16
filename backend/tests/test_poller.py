@@ -692,4 +692,4 @@ class TestEdgeCases:
 
         await poller.poll()  # 
         assert poller._in_slow_mode is True
-        assert poller._slow_mode_reason == ""
+        assert poller._slow_mode_reason == "random_downtime"

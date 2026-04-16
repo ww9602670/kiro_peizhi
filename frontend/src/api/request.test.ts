@@ -115,7 +115,6 @@ describe('request', () => {
       href: '/',
     });
     // 使用 Object.defineProperty 来 mock href setter
-    let capturedHref = '';
     Object.defineProperty(window, 'location', {
       value: { ...window.location, href: '/' },
       writable: true,

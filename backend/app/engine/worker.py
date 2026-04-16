@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -28,13 +29,15 @@ import aiosqlite
 
 from app.engine.adapters.base import InstallInfo, PlatformAdapter
 from app.engine.alert import AlertService
-from app.engine.executor import BetExecutor
+from app.engine.executor import BetExecutor, ExecutionReport
 from app.engine.poller import IssuePoller
 from app.engine.reconciler import Reconciler
 from app.engine.risk import RiskController
 from app.engine.session import SessionManager
 from app.engine.settlement import SettlementProcessor
+from app.engine.strategies.base import StrategyStopRequest
 from app.engine.strategy_runner import BetSignal, StrategyRunner
+from app.models.db_ops import strategy_update_status
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +142,11 @@ class AccountWorker:
         self._restart_count: int = 0
         self._lock_token: Optional[str] = None
 
+        # 结算模式
+        self.settling_only: bool = False
+        self._settling_deadline: float | None = None
+        self._on_settle_complete: Optional[asyncio.coroutines] = None  # 结算完成回调
+
     # ------------------------------------------------------------------
     # 
     # ------------------------------------------------------------------
@@ -150,6 +158,56 @@ class AccountWorker:
     def remove_strategy(self, strategy_id: int) -> None:
         """"""
         self.strategies.pop(strategy_id, None)
+
+    async def _has_unsettled_orders(self) -> bool:
+        """检查是否有未结算订单（bet_success 或 pending_match）"""
+        row = await (
+            await self.db.execute(
+                "SELECT COUNT(*) as cnt FROM bet_orders "
+                "WHERE account_id=? AND operator_id=? "
+                "AND status IN ('bet_success', 'pending_match')",
+                (self.account_id, self.operator_id),
+            )
+        ).fetchone()
+        return (row["cnt"] if row else 0) > 0
+
+    async def enter_settling_mode(self) -> None:
+        """进入结算模式：停止投注，继续结算
+
+        设置 settling_only 标志，清空策略列表，设置 10 分钟超时。
+        主循环将跳过投注阶段，仅执行结算和对账。
+        """
+        self.settling_only = True
+        self.status = "settling"
+        self._settling_deadline = time.time() + 600  # 10 分钟超时
+
+        # 清空策略，防止产生投注信号
+        self.strategies.clear()
+
+        # 记录日志：待结算期号和订单数量
+        try:
+            rows = await (
+                await self.db.execute(
+                    "SELECT issue, COUNT(*) as cnt FROM bet_orders "
+                    "WHERE account_id=? AND operator_id=? "
+                    "AND status IN ('bet_success', 'pending_match') "
+                    "GROUP BY issue",
+                    (self.account_id, self.operator_id),
+                )
+            ).fetchall()
+            issues_info = {r["issue"]: r["cnt"] for r in rows}
+            total = sum(issues_info.values())
+            logger.info(
+                "Worker 进入结算模式 account_id=%d 待结算期号=%s 总订单数=%d 超时=%ds",
+                self.account_id,
+                issues_info,
+                total,
+                600,
+            )
+        except Exception:
+            logger.exception(
+                "结算模式日志记录异常 account_id=%d", self.account_id,
+            )
 
     # ------------------------------------------------------------------
     # 
@@ -188,19 +246,23 @@ class AccountWorker:
         )
 
     async def stop(self) -> None:
-        """ Worker （含释放锁）"""
+        """强制停止 Worker（cancel task + 释放锁）
+
+        结算逻辑由结算模式的主循环处理，stop() 不再调用 _settle_before_stop()。
+        """
         self.running = False
-        await self._release_lock()
         if self._task and not self._task.done():
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        self.status = "stopped"
         self._task = None
+
+        await self._release_lock()
+        self.status = "stopped"
         logger.info(
-            "Worker operator_id=%d account_id=%d",
+            "Worker 已停止 operator_id=%d account_id=%d",
             self.operator_id,
             self.account_id,
         )
@@ -294,18 +356,20 @@ class AccountWorker:
             # 2. 记录当前期号（投注的是 install.issue，结算时需要验证该期号的开奖结果）
             pre_issue = install.issue
 
-            # 3. 投注阶段
-            if install.state == 1 and self._should_bet(install):
-                signals = self._collect_signals(install)
-                if signals:
-                    try:
-                        await self.executor.execute(install, signals)
-                    except Exception:
-                        logger.exception(
-                            "投注异常 issue=%s account_id=%d",
-                            install.issue,
-                            self.account_id,
-                        )
+            # 3. 投注阶段（结算模式下跳过）
+            if not self.settling_only:
+                if install.state == 1 and self._should_bet(install):
+                    signals = self._collect_signals(install)
+                    if signals:
+                        try:
+                            report = await self.executor.execute(install, signals)
+                            await self._apply_execution_report(report)
+                        except Exception:
+                            logger.exception(
+                                "投注异常 issue=%s account_id=%d",
+                                install.issue,
+                                self.account_id,
+                            )
 
             # 4. 等待开奖倒计时归零
             if install.open_countdown_sec > 0:
@@ -343,6 +407,9 @@ class AccountWorker:
                     self.account_id,
                 )
 
+            # 8.5 结算结果反馈给策略（驱动马丁倍增）
+            await self._feedback_settlement_results(new_install.pre_issue)
+
             # 9. 对账
             try:
                 await self.reconciler.reconcile(
@@ -355,6 +422,28 @@ class AccountWorker:
                     new_install.pre_issue,
                     self.account_id,
                 )
+
+            # 10. 结算模式检查
+            if self.settling_only:
+                # 超时检查
+                if self._settling_deadline and time.time() > self._settling_deadline:
+                    logger.warning(
+                        "结算模式超时 account_id=%d", self.account_id,
+                    )
+                    await self._handle_settling_timeout()
+                    await self._cleanup_after_settling()
+                    break
+
+                # 检查是否还有未结算订单
+                if not await self._has_unsettled_orders():
+                    logger.info(
+                        "结算模式完成：所有订单已结算 account_id=%d",
+                        self.account_id,
+                    )
+                    self.running = False
+                    self.status = "stopped"
+                    await self._cleanup_after_settling()
+                    break
 
     # ------------------------------------------------------------------
     # 7.2 _fetch_install_with_retry
@@ -503,7 +592,8 @@ class AccountWorker:
     async def _recover_unsettled_orders(self) -> None:
         """重启时补结算：扫描未结算订单，按 issue 分组，获取历史开奖结果
 
-        有结果则 settle(is_recovery=True)；无结果则标记 settle_failed + 发告警。
+        有结果则 settle(is_recovery=True)；无结果且订单距今超过3分钟则标记 settle_failed；
+        距今不超过3分钟的新订单跳过，留给正常结算周期处理。
         """
         rows = await (
             await self.db.execute(
@@ -548,21 +638,339 @@ class AccountWorker:
                         adapter=self.adapter,
                         is_recovery=True,
                     )
+                    await self._feedback_settlement_results(issue)
                     logger.info("补结算完成 issue=%s account_id=%d", issue, self.account_id)
                 except Exception:
                     logger.exception(
                         "补结算异常 issue=%s account_id=%d", issue, self.account_id,
                     )
             else:
-                # 无开奖结果 → 全部标记 settle_failed + 发告警
+                # 无开奖结果 → 检查订单年龄，新订单跳过
+                if await self._has_recent_orders(issue, max_age_seconds=180):
+                    logger.info(
+                        "补结算跳过：期号 %s 有近3分钟内的新订单，留给正常周期 account_id=%d",
+                        issue, self.account_id,
+                    )
+                    continue
+
+                # 老订单 → 标记 settle_failed + 发告警
                 await self._mark_issue_orders_settle_failed(issue)
                 await self.alert_service.send(
                     operator_id=self.operator_id,
                     alert_type="settle_data_expired",
                     title=f"补结算数据过期 期号 {issue}",
-                    detail=f"历史开奖结果中无 issue={issue} 的记录",
+                    detail=f"历史开奖结果中无 issue={issue} 的记录，且订单已超过3分钟",
                     account_id=self.account_id,
                 )
+
+    async def _has_recent_orders(self, issue: str, max_age_seconds: int = 180) -> bool:
+        """检查指定期号是否有距今不超过 max_age_seconds 的订单
+
+        用于补结算时区分"刚下注还没开奖"和"真正过期"的订单。
+        """
+        from datetime import datetime, timezone, timedelta
+        _bjt = timezone(timedelta(hours=8))
+
+        rows = await (
+            await self.db.execute(
+                "SELECT bet_at, created_at FROM bet_orders "
+                "WHERE issue=? AND account_id=? AND operator_id=? "
+                "AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
+                "ORDER BY bet_at DESC LIMIT 1",
+                (issue, self.account_id, self.operator_id),
+            )
+        ).fetchall()
+
+        if not rows:
+            return False
+
+        row = rows[0]
+        # 优先用 bet_at，其次 created_at
+        bet_at_str = None
+        try:
+            bet_at_str = row["bet_at"]
+        except (KeyError, TypeError):
+            pass
+        if not bet_at_str:
+            try:
+                bet_at_str = row["created_at"]
+            except (KeyError, TypeError):
+                pass
+        if not bet_at_str:
+            return False
+
+        try:
+            bet_at = datetime.strptime(bet_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_bjt)
+            now = datetime.now(_bjt)
+            elapsed = (now - bet_at).total_seconds()
+            return elapsed < max_age_seconds
+        except (ValueError, TypeError):
+            return False
+
+    async def _handle_settling_timeout(self) -> None:
+        """结算模式超时处理
+
+        将所有未结算订单标记为 settle_failed，发送告警，停止 Worker。
+        """
+        rows = await (
+            await self.db.execute(
+                "SELECT * FROM bet_orders WHERE account_id=? AND operator_id=? "
+                "AND status IN ('bet_success', 'pending_match')",
+                (self.account_id, self.operator_id),
+            )
+        ).fetchall()
+        orders = [dict(r) for r in rows]
+
+        if orders:
+            await self.settler._mark_orders_settle_failed(orders)
+            logger.warning(
+                "结算模式超时：%d 笔订单标记为 settle_failed account_id=%d",
+                len(orders),
+                self.account_id,
+            )
+
+        # 发送超时告警
+        elapsed = int(time.time() - (self._settling_deadline - 600)) if self._settling_deadline else 0
+        await self.alert_service.send(
+            operator_id=self.operator_id,
+            alert_type="settling_mode_timeout",
+            title=f"结算模式超时 account_id={self.account_id}",
+            detail=f"等待 {elapsed}s 后超时，{len(orders)} 笔订单标记为 settle_failed",
+            account_id=self.account_id,
+        )
+
+        self.running = False
+        self.status = "stopped"
+
+    async def _cleanup_after_settling(self) -> None:
+        """结算模式退出后的清理：释放锁、从 registry 注销"""
+        await self._release_lock()
+        if self._on_settle_complete:
+            try:
+                await self._on_settle_complete(self.account_id)
+            except Exception:
+                logger.exception(
+                    "结算完成回调异常 account_id=%d", self.account_id,
+                )
+
+    async def _settle_before_stop(self) -> None:
+        """停止前补结算：扫描所有已下注但未结算的订单，尝试结算
+
+        与 _recover_unsettled_orders 类似，但在停止时调用。
+        先尝试获取开奖结果进行正常结算，如果获取不到（还没开奖），
+        则标记为 pending_match 等待下次启动时补结算。
+        """
+        rows = await (
+            await self.db.execute(
+                "SELECT DISTINCT issue FROM bet_orders "
+                "WHERE account_id=? AND operator_id=? "
+                "AND status IN ('bet_success', 'pending_match')",
+                (self.account_id, self.operator_id),
+            )
+        ).fetchall()
+        issues = [r["issue"] for r in rows]
+        if not issues:
+            logger.info(
+                "停止前补结算：无待结算订单 account_id=%d",
+                self.account_id,
+            )
+            return
+
+        logger.info(
+            "停止前补结算：%d 个期号待处理 account_id=%d",
+            len(issues),
+            self.account_id,
+        )
+
+        # 获取历史开奖结果
+        try:
+            results = await self.adapter.get_lottery_results(count=50)
+        except Exception:
+            logger.exception(
+                "停止前补结算：获取历史开奖结果失败 account_id=%d",
+                self.account_id,
+            )
+            results = []
+
+        result_map = {
+            str(r.get("Installments", "")): r.get("OpenResult", "")
+            for r in results
+        }
+
+        # 也尝试从 GetCurrentInstall 获取上期结果
+        try:
+            install = await self.poller.poll()
+            if install and install.pre_issue and install.pre_result:
+                result_map[str(install.pre_issue)] = install.pre_result
+        except Exception:
+            logger.warning(
+                "停止前补结算：获取当前期号失败 account_id=%d",
+                self.account_id,
+            )
+
+        settled_count = 0
+        pending_count = 0
+        for issue in issues:
+            open_result = result_map.get(issue)
+            if open_result and open_result.strip():
+                # 有开奖结果 → 执行结算
+                balls, sum_value = _parse_result(open_result)
+                try:
+                    await self.settler.settle(
+                        issue=issue,
+                        balls=balls,
+                        sum_value=sum_value,
+                        platform_type=self._platform_type,
+                        adapter=self.adapter,
+                        is_recovery=True,
+                    )
+                    settled_count += 1
+                    logger.info(
+                        "停止前补结算完成 issue=%s account_id=%d",
+                        issue,
+                        self.account_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "停止前补结算异常 issue=%s account_id=%d",
+                        issue,
+                        self.account_id,
+                    )
+            else:
+                # 还没开奖 → 标记为 pending_match，下次启动时补结算
+                pending_count += 1
+                logger.info(
+                    "停止前补结算：期号 %s 尚未开奖，保持待结算状态 account_id=%d",
+                    issue,
+                    self.account_id,
+                )
+
+        logger.info(
+            "停止前补结算完成：已结算=%d 待下次补结算=%d account_id=%d",
+            settled_count,
+            pending_count,
+            self.account_id,
+        )
+
+    async def _feedback_settlement_results(self, issue: str) -> None:
+        """结算后将结果反馈给对应的 StrategyRunner
+
+        查询该期号已结算订单，按 strategy_id 分发 on_result。
+        用于驱动马丁策略的 level 推进。
+        """
+        rows = await (
+            await self.db.execute(
+                "SELECT strategy_id, key_code, is_win, pnl, martin_level FROM bet_orders "
+                "WHERE issue=? AND account_id=? AND operator_id=? "
+                "AND status='settled'",
+                (issue, self.account_id, self.operator_id),
+            )
+        ).fetchall()
+
+        for row in rows:
+            sid = row["strategy_id"]
+            runner = self.strategies.get(sid)
+            if runner is None:
+                logger.debug(
+                    "结算反馈跳过：strategy_id=%d 无对应 runner account_id=%d",
+                    sid, self.account_id,
+                )
+                continue
+            try:
+                try:
+                    order_martin_level = row["martin_level"]
+                except (KeyError, IndexError):
+                    order_martin_level = None
+                feedback_kwargs = {"key_code": row["key_code"]}
+                if order_martin_level is not None:
+                    feedback_kwargs["martin_level"] = order_martin_level
+                stop_request = await runner.on_result(
+                    row["is_win"],
+                    row["pnl"],
+                    **feedback_kwargs,
+                )
+                if (
+                    isinstance(stop_request, StrategyStopRequest)
+                    and stop_request.should_stop
+                ):
+                    if not self._should_apply_settlement_stop_request(
+                        runner, stop_request
+                    ):
+                        logger.info(
+                            "settlement stop request ignored strategy_id=%d "
+                            "account_id=%d reason=%s",
+                            sid,
+                            self.account_id,
+                            stop_request.reason,
+                        )
+                        continue
+                    await self._stop_strategy_runner(
+                        sid, stop_request.reason or "strategy_requested_stop"
+                    )
+            except Exception:
+                logger.exception(
+                    "结算反馈异常 strategy_id=%d issue=%s account_id=%d",
+                    sid, issue, self.account_id,
+                )
+
+    def _should_apply_settlement_stop_request(
+        self, runner: StrategyRunner, stop_request: StrategyStopRequest
+    ) -> bool:
+        """Return whether a strategy-origin settlement stop should be applied."""
+        runner_attrs = getattr(runner, "__dict__", {})
+        strategy = (
+            runner_attrs.get("strategy")
+            if isinstance(runner_attrs, dict)
+            else None
+        )
+        try:
+            strategy_name = strategy.name() if strategy is not None else ""
+        except Exception:
+            strategy_name = ""
+
+        # Red-wave double is a long-running monitor. Settlement outcomes such as
+        # target hit, refund, no result, or Martin sequence cycling must never
+        # stop it; risk stops are applied through ExecutionReport instead.
+        if strategy_name == "red_wave_double_martin":
+            return False
+
+        return True
+
+    async def _apply_execution_report(self, report: ExecutionReport | None) -> None:
+        """Apply executor risk-stop report for this account worker."""
+        if not report or not report.stop_strategy_ids:
+            return
+        for sid, reason in report.stop_strategy_ids.items():
+            await self._stop_strategy_runner(sid, reason or "risk_stop")
+
+    async def _stop_strategy_runner(self, strategy_id: int, reason: str) -> None:
+        """Stop one strategy runner and persist strategy status to stopped."""
+        runner = self.strategies.pop(strategy_id, None)
+        if runner is not None:
+            runner.stop()
+
+        try:
+            await strategy_update_status(
+                self.db,
+                strategy_id=strategy_id,
+                operator_id=self.operator_id,
+                status="stopped",
+            )
+        except Exception:
+            logger.exception(
+                "strategy stop persist failed strategy_id=%d account_id=%d reason=%s",
+                strategy_id,
+                self.account_id,
+                reason,
+            )
+            return
+
+        logger.info(
+            "strategy stopped strategy_id=%d account_id=%d reason=%s",
+            strategy_id,
+            self.account_id,
+            reason,
+        )
 
     async def _mark_issue_orders_settle_failed(self, issue: str) -> None:
         """将指定期号下所有未结算订单标记为 settle_failed"""
@@ -592,9 +1000,9 @@ class AccountWorker:
         token = str(uuid.uuid4())
         cursor = await self.db.execute(
             "UPDATE gambling_accounts "
-            "SET worker_lock_token=?, worker_lock_ts=datetime('now') "
+            "SET worker_lock_token=?, worker_lock_ts=datetime('now', '+8 hours') "
             "WHERE id=? AND (worker_lock_token IS NULL "
-            "OR worker_lock_ts < datetime('now', '-5 minutes'))",
+            "OR worker_lock_ts < datetime('now', '+8 hours', '-5 minutes'))",
             (token, self.account_id),
         )
         await self.db.commit()
@@ -622,7 +1030,7 @@ class AccountWorker:
             return False
         cursor = await self.db.execute(
             "UPDATE gambling_accounts "
-            "SET worker_lock_ts=datetime('now') "
+            "SET worker_lock_ts=datetime('now', '+8 hours') "
             "WHERE id=? AND worker_lock_token=?",
             (self.account_id, self._lock_token),
         )
@@ -722,9 +1130,29 @@ class AccountWorker:
         from app.engine.strategies.base import StrategyContext, LotteryResult
 
         signals: list[BetSignal] = []
+        history: list[LotteryResult] = []
+        if install.pre_issue and install.pre_result:
+            try:
+                balls, sum_value = _parse_result(install.pre_result)
+                if balls:
+                    history = [
+                        LotteryResult(
+                            issue=str(install.pre_issue),
+                            balls=balls,
+                            sum_value=sum_value,
+                        )
+                    ]
+            except Exception:
+                logger.warning(
+                    "invalid pre_result ignored account_id=%d pre_issue=%s pre_result=%r",
+                    self.account_id,
+                    install.pre_issue,
+                    install.pre_result,
+                )
+
         context = StrategyContext(
             current_issue=install.issue,
-            history=[],
+            history=history,
             balance=0,
             strategy_state={},
         )

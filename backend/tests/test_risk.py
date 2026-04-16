@@ -141,6 +141,16 @@ class TestRiskCheckResult:
         assert r.passed is False
         assert r.reason == ""
 
+    def test_failed_with_strategy_stop(self):
+        r = RiskCheckResult(
+            passed=False,
+            reason="balance",
+            stop_strategy=True,
+            stop_reason="balance_insufficient",
+        )
+        assert r.stop_strategy is True
+        assert r.stop_reason == "balance_insufficient"
+
 
 # 
 # 2. 

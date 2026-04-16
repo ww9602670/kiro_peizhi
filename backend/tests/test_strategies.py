@@ -10,6 +10,7 @@
 - 
 """
 import uuid
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -45,7 +46,23 @@ async def _create_operator_with_account(
         password="accpass",
         platform_type="JND28WEB",
     )
+    # Set account to online so strategy start works
+    await db.execute(
+        "UPDATE gambling_accounts SET status='online' WHERE id=?", (acc["id"],)
+    )
+    await db.commit()
     return token, op["id"], acc["id"]
+
+
+@pytest.fixture(autouse=True)
+def mock_engine():
+    """Mock app.state.engine for strategy state transition tests."""
+    engine = MagicMock()
+    engine.start_worker = AsyncMock()
+    engine.stop_worker = AsyncMock()
+    app.state.engine = engine
+    yield engine
+    app.state.engine = None
 
 
 @pytest.fixture
@@ -196,6 +213,43 @@ class TestSchemaValidation:
         )
         assert s.martin_sequence == [1, 2, 4, 8, 16]
 
+    def test_red_wave_double_requires_sequence(self):
+        from app.schemas.strategy import StrategyCreate
+        with pytest.raises(Exception):
+            StrategyCreate(
+                account_id=1, name="red", type="red_wave_double_martin",
+                play_code="DS4", base_amount=10.0,
+                martin_sequence=None,
+            )
+
+    def test_red_wave_double_valid(self):
+        from app.schemas.strategy import StrategyCreate
+        s = StrategyCreate(
+            account_id=1, name="red", type="red_wave_double_martin",
+            play_code="DS4,B1LM_S,DS4", base_amount=10.0,
+            martin_sequence=[1, 2, 4],
+        )
+        assert s.martin_sequence == [1, 2, 4]
+        assert s.play_code == "B1LM_S,DS4"
+
+    def test_red_wave_double_invalid_play_code(self):
+        from app.schemas.strategy import StrategyCreate
+        with pytest.raises(Exception):
+            StrategyCreate(
+                account_id=1, name="red", type="red_wave_double_martin",
+                play_code="DX1", base_amount=10.0,
+                martin_sequence=[1, 2, 4],
+            )
+
+    def test_red_wave_double_empty_play_code(self):
+        from app.schemas.strategy import StrategyCreate
+        with pytest.raises(Exception):
+            StrategyCreate(
+                account_id=1, name="red", type="red_wave_double_martin",
+                play_code=" , ", base_amount=10.0,
+                martin_sequence=[1, 2, 4],
+            )
+
 
 # 
 # 5.  API
@@ -266,9 +320,60 @@ async def test_create_martin_strategy(client):
     assert data["martin_sequence"] == [1, 2, 4, 8]
     assert data["base_amount"] == 5.0
     assert data["bet_timing"] == 45
+
+
+@pytest.mark.asyncio
+async def test_create_red_wave_double_multi_directions(client):
+    uid = _uid()
+    token, op_id, acc_id = await _create_operator_with_account(f"red_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "red_double",
+            "type": "red_wave_double_martin",
+            "play_code": "DS4,B1LM_S,DS4",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+            "simulation": True,
+            "stop_loss": 100.0,
+            "take_profit": 50.0,
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["type"] == "red_wave_double_martin"
+    assert data["play_code"] == "B1LM_S,DS4"
+    assert data["martin_sequence"] == [1, 2, 4]
     assert data["simulation"] is True
     assert data["stop_loss"] == 100.0
     assert data["take_profit"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_create_red_wave_double_rejects_invalid_direction(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"red_bad_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "red_double_bad",
+            "type": "red_wave_double_martin",
+            "play_code": "DX1",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == 1001
 
 
 @pytest.mark.asyncio
@@ -379,6 +484,63 @@ async def test_update_strategy(client):
     data = resp.json()["data"]
     assert data["name"] == "upd_new"
     assert data["base_amount"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_update_red_wave_strategy_play_code(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"updred_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "upd_red_orig",
+            "type": "red_wave_double_martin",
+            "play_code": "DS4",
+            "base_amount": 10.0,
+            "martin_sequence": [1, 2, 4],
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    resp = await client.put(
+        f"/api/v1/strategies/{sid}",
+        headers=headers,
+        json={"play_code": "B2LM_S,DS4"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["play_code"] == "B2LM_S,DS4"
+
+
+@pytest.mark.asyncio
+async def test_update_non_red_wave_play_code_rejected(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"updflatpc_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "flat_orig",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    resp = await client.put(
+        f"/api/v1/strategies/{sid}",
+        headers=headers,
+        json={"play_code": "DX2"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1002
 
 
 @pytest.mark.asyncio

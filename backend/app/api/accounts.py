@@ -9,9 +9,11 @@ POST   /accounts/{id}/kill-switch
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends
+_BJT = timezone(timedelta(hours=8))
+
+from fastapi import APIRouter, Depends, Request
 
 from app.api.dependencies import get_current_operator, get_db_conn
 from app.models.db_ops import (
@@ -44,6 +46,7 @@ def _to_account_info(row: dict) -> AccountInfo:
         account_name=row["account_name"],
         password_masked=mask_password(row["password"]),
         platform_type=row["platform_type"],
+        platform_url=row.get("platform_url"),
         status=row["status"],
         balance=row["balance"] / 100,  #   
         kill_switch=bool(row["kill_switch"]),
@@ -150,6 +153,7 @@ async def bind_account(
             account_name=body.account_name,
             password=body.password,
             platform_type=body.platform_type,
+            platform_url=body.platform_url,
         )
     except Exception as e:
         if "UNIQUE constraint failed" in str(e):
@@ -165,10 +169,14 @@ async def unbind_account(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """"""
-    deleted = await account_delete(db, account_id=account_id, operator_id=operator["id"])
+    """解绑账号（级联删除关联策略和投注记录）"""
+    try:
+        deleted = await account_delete(db, account_id=account_id, operator_id=operator["id"])
+    except Exception as e:
+        logger.error("解绑账号失败 account_id=%d: %s", account_id, e)
+        raise BizError(5001, f"解绑失败: {e}", status_code=500)
     if not deleted:
-        raise BizError(4001, "", status_code=404)
+        raise BizError(4001, "账号不存在", status_code=404)
     return ApiResponse(data=None)
 
 
@@ -188,7 +196,10 @@ async def manual_login(
 
     # 
     from app.engine.adapters.jnd import JNDAdapter
-    adapter = JNDAdapter(platform_type=account.get("platform_type", "JND28WEB"))
+    adapter = JNDAdapter(
+        base_url=account.get("platform_url") or None,
+        platform_type=account.get("platform_type", "JND28WEB"),
+    )
     
     try:
         # 
@@ -214,7 +225,7 @@ async def manual_login(
         )
         
         # 
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now(_BJT).strftime("%Y-%m-%d %H:%M:%S")
         row = await account_update(
             db,
             account_id=account_id,
@@ -274,6 +285,41 @@ async def manual_login(
     finally:
         #  adapter session
         await adapter.close()
+
+
+@router.post("/accounts/{account_id}/logout")
+async def manual_logout(
+    account_id: int,
+    request: Request,
+    operator: dict = Depends(get_current_operator),
+    db=Depends(get_db_conn),
+):
+    """手动退出登录：将账号状态改为 inactive，停止关联 Worker"""
+    account = await account_get_by_id(db, account_id=account_id, operator_id=operator["id"])
+    if not account:
+        raise BizError(4001, "账号不存在", status_code=404)
+
+    if account["status"] != "online":
+        raise BizError(4003, "账号未登录", status_code=400)
+
+    # 停止关联的 Worker（如果有）
+    try:
+        engine = getattr(request.app.state, "engine", None)
+        if engine:
+            await engine.stop_worker(account_id=account_id)
+            logger.info("退出登录：已停止 Worker account_id=%d", account_id)
+    except Exception as e:
+        logger.warning("退出登录：停止 Worker 异常 account_id=%d: %s", account_id, e)
+
+    row = await account_update(
+        db,
+        account_id=account_id,
+        operator_id=operator["id"],
+        status="inactive",
+        session_token=None,
+    )
+    logger.info("退出登录成功 account_id=%d", account_id)
+    return ApiResponse[AccountInfo](data=_to_account_info(row))
 
 
 @router.post("/accounts/{account_id}/kill-switch")

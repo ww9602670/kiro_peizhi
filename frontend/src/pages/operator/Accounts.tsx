@@ -14,17 +14,17 @@ import {
   createAccount,
   deleteAccount,
   loginAccount,
+  logoutAccount,
   updateKillSwitch,
 } from '@/api/accounts';
 import { getAccountOdds, confirmAccountOdds, refreshAccountOdds } from '@/api/odds';
 import type { AccountCreate, AccountInfo } from '@/types/api/account';
 import type { OddsItem, OddsRefreshResponse, PeriodInfo } from '@/types/api/odds';
+import ConfirmDialog from '@/components/ConfirmDialog';
+import Toast from '@/components/Toast';
+import { useConfirm } from '@/hooks/useConfirm';
+import { useToast } from '@/hooks/useToast';
 import './Accounts.css';
-
-const PLATFORM_OPTIONS: { value: AccountCreate['platform_type']; label: string }[] = [
-  { value: 'JND28WEB', label: 'JND网盘' },
-  { value: 'JND282', label: 'JND2.0' },
-];
 
 function getStatusBadgeClass(status: string): string {
   switch (status) {
@@ -65,12 +65,16 @@ export default function Accounts() {
   // Bind form state
   const [formName, setFormName] = useState('');
   const [formPassword, setFormPassword] = useState('');
-  const [formPlatform, setFormPlatform] = useState<AccountCreate['platform_type']>('JND28WEB');
+  const [formPlatformUrl, setFormPlatformUrl] = useState('');
   const [formError, setFormError] = useState('');
   const [formLoading, setFormLoading] = useState(false);
 
   // Per-account action loading
   const [actionLoading, setActionLoading] = useState<Record<number, string>>({});
+
+  // Dialog & Toast hooks
+  const { confirmState, confirm, handleConfirm, handleCancel } = useConfirm();
+  const { messages, showToast, removeToast } = useToast();
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -106,13 +110,15 @@ export default function Accounts() {
       const data: AccountCreate = {
         account_name: formName.trim(),
         password: formPassword,
-        platform_type: formPlatform,
       };
+      if (formPlatformUrl.trim()) {
+        data.platform_url = formPlatformUrl.trim();
+      }
       await createAccount(data);
       // Reset form & refresh list
       setFormName('');
       setFormPassword('');
-      setFormPlatform('JND28WEB');
+      setFormPlatformUrl('');
       setShowForm(false);
       await fetchAccounts();
     } catch (err) {
@@ -132,11 +138,24 @@ export default function Accounts() {
       await loginAccount(id);
       await fetchAccounts();
     } catch (err) {
-      if (isApiError(err)) {
-        alert(err.message);
-      } else {
-        alert('登录失败');
-      }
+      showToast(isApiError(err) ? err.message : '登录失败');
+    } finally {
+      setActionLoading((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }
+  };
+
+  const handleLogout = async (id: number) => {
+    setActionLoading((prev) => ({ ...prev, [id]: 'logout' }));
+    try {
+      await logoutAccount(id);
+      await fetchAccounts();
+      showToast('已退出登录');
+    } catch (err) {
+      showToast(isApiError(err) ? err.message : '退出失败');
     } finally {
       setActionLoading((prev) => {
         const next = { ...prev };
@@ -147,17 +166,13 @@ export default function Accounts() {
   };
 
   const handleDelete = async (id: number, name: string) => {
-    if (!confirm(`确定解绑账号「${name}」？`)) return;
+    if (!(await confirm(`确定解绑账号「${name}」？`))) return;
     setActionLoading((prev) => ({ ...prev, [id]: 'delete' }));
     try {
       await deleteAccount(id);
       await fetchAccounts();
     } catch (err) {
-      if (isApiError(err)) {
-        alert(err.message);
-      } else {
-        alert('解绑失败');
-      }
+      showToast(isApiError(err) ? err.message : '解绑失败');
     } finally {
       setActionLoading((prev) => {
         const next = { ...prev };
@@ -173,11 +188,7 @@ export default function Accounts() {
       await updateKillSwitch(id, { enabled: !currentEnabled });
       await fetchAccounts();
     } catch (err) {
-      if (isApiError(err)) {
-        alert(err.message);
-      } else {
-        alert('操作失败');
-      }
+      showToast(isApiError(err) ? err.message : '操作失败');
     } finally {
       setActionLoading((prev) => {
         const next = { ...prev };
@@ -189,6 +200,14 @@ export default function Accounts() {
 
   return (
     <div className="accounts-page">
+      <Toast messages={messages} onRemove={removeToast} />
+      <ConfirmDialog
+        open={confirmState.open}
+        message={confirmState.message}
+        title={confirmState.title}
+        onConfirm={handleConfirm}
+        onCancel={handleCancel}
+      />
       <div className="accounts-header">
         <h1 className="accounts-title">博彩账号</h1>
       </div>
@@ -246,24 +265,21 @@ export default function Accounts() {
             </div>
 
             <div className="bind-field">
-              <label htmlFor="bind-platform" className="bind-label">
-                盘口类型
+              <label htmlFor="bind-platform-url" className="bind-label">
+                平台地址
+                <span style={{ fontSize: 11, color: '#999', fontWeight: 400, marginLeft: 4 }}>
+                  留空使用默认
+                </span>
               </label>
-              <select
-                id="bind-platform"
-                className="bind-select"
-                value={formPlatform}
-                onChange={(e) =>
-                  setFormPlatform(e.target.value as AccountCreate['platform_type'])
-                }
+              <input
+                id="bind-platform-url"
+                type="text"
+                className="bind-input"
+                value={formPlatformUrl}
+                onChange={(e) => setFormPlatformUrl(e.target.value)}
+                placeholder="https://example.com"
                 disabled={formLoading}
-              >
-                {PLATFORM_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
+              />
             </div>
 
             <div className="bind-actions">
@@ -311,8 +327,10 @@ export default function Accounts() {
               account={account}
               actionLoading={actionLoading[account.id]}
               onLogin={handleLogin}
+              onLogout={handleLogout}
               onDelete={handleDelete}
               onKillSwitch={handleKillSwitch}
+              showToast={showToast}
             />
           ))}
         </div>
@@ -384,16 +402,20 @@ interface AccountCardProps {
   account: AccountInfo;
   actionLoading?: string;
   onLogin: (id: number) => void;
+  onLogout: (id: number) => void;
   onDelete: (id: number, name: string) => void;
   onKillSwitch: (id: number, currentEnabled: boolean) => void;
+  showToast: (text: string) => void;
 }
 
 function AccountCard({
   account,
   actionLoading,
   onLogin,
+  onLogout,
   onDelete,
   onKillSwitch,
+  showToast,
 }: AccountCardProps) {
   const isActioning = !!actionLoading;
   const [oddsStatus, setOddsStatus] = useState<OddsStatus>('none');
@@ -440,11 +462,7 @@ function AccountCard({
       await fetchOddsStatus();
       setRefreshMsg({ text: '赔率已确认', type: 'success' });
     } catch (err) {
-      if (isApiError(err)) {
-        alert(err.message);
-      } else {
-        alert('确认赔率失败');
-      }
+      showToast(isApiError(err) ? err.message : '确认赔率失败');
     } finally {
       setOddsLoading(false);
     }
@@ -501,6 +519,14 @@ function AccountCard({
           <span className="account-info-label">密码</span>
           <span className="account-info-value">{account.password_masked}</span>
         </div>
+        {account.platform_url && (
+          <div className="account-info-item">
+            <span className="account-info-label">平台地址</span>
+            <span className="account-info-value" style={{ fontSize: 11, wordBreak: 'break-all' }}>
+              {account.platform_url}
+            </span>
+          </div>
+        )}
         <div className="account-info-item">
           <span className="account-info-label">赔率状态</span>
           <span className={`badge ${getOddsBadgeClass(oddsStatus)}`}>
@@ -664,14 +690,25 @@ function AccountCard({
       </div>
 
       <div className="account-actions">
-        <button
-          type="button"
-          className="action-btn action-btn-login"
-          onClick={() => onLogin(account.id)}
-          disabled={isActioning}
-        >
-          {actionLoading === 'login' ? '登录中...' : '登录'}
-        </button>
+        {account.status === 'online' ? (
+          <button
+            type="button"
+            className="action-btn action-btn-delete"
+            onClick={() => onLogout(account.id)}
+            disabled={isActioning}
+          >
+            {actionLoading === 'logout' ? '退出中...' : '退出登录'}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="action-btn action-btn-login"
+            onClick={() => onLogin(account.id)}
+            disabled={isActioning}
+          >
+            {actionLoading === 'login' ? '登录中...' : '登录'}
+          </button>
+        )}
         <button
           type="button"
           className="action-btn action-btn-delete"

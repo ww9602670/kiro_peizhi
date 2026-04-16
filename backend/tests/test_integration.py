@@ -24,9 +24,11 @@ def _uid() -> str:
 
 @pytest.fixture
 async def client():
-    #  DB 
+    #  DB  — reinitialize to ensure clean state
+    from app.database import init_db
     if _db_module._shared_db is not None:
         await close_shared_db()
+    await init_db(":memory:")
 
     with patch("app.main.EngineManager") as MockEngine:
         mock_engine = AsyncMock()
@@ -38,8 +40,6 @@ async def client():
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
             yield c
-
-    await close_shared_db()
 
 
 async def _admin_login(client: AsyncClient) -> str:

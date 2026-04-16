@@ -172,16 +172,16 @@ class SessionManager:
         return False
 
     async def _attempt_login(self) -> LoginResult:
-        """+"""
-        # 
+        """+验证码识别+登录"""
+        # 如果 adapter 支持获取验证码，先获取并识别
         captcha_code: Optional[str] = None
         if hasattr(self.adapter, "get_captcha"):
             captcha_image = await self.adapter.get_captcha()
             if captcha_image:
                 captcha_code = await self.captcha_service.recognize(captcha_image)
 
-        # 
-        result = await self.adapter.login(self.account_name, self.password)
+        # 登录（传入验证码，不需要的平台会忽略）
+        result = await self.adapter.login(self.account_name, self.password, captcha_code=captcha_code)
         return result
 
     async def _update_session_token_to_db(self) -> None:

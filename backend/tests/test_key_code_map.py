@@ -20,53 +20,53 @@ class TestGetKeyCodeName:
     """KeyCode  """
 
     def test_dx(self):
-        assert get_key_code_name("DX1") == ""
-        assert get_key_code_name("DX2") == ""
+        assert get_key_code_name("DX1") == "大"
+        assert get_key_code_name("DX2") == "小"
 
     def test_ds(self):
-        assert get_key_code_name("DS3") == ""
-        assert get_key_code_name("DS4") == ""
+        assert get_key_code_name("DS3") == "单"
+        assert get_key_code_name("DS4") == "双"
 
     def test_jdx(self):
-        assert get_key_code_name("JDX5") == ""
-        assert get_key_code_name("JDX6") == ""
+        assert get_key_code_name("JDX5") == "极大"
+        assert get_key_code_name("JDX6") == "极小"
 
     def test_zh(self):
-        assert get_key_code_name("ZH7") == ""
-        assert get_key_code_name("ZH8") == ""
-        assert get_key_code_name("ZH9") == ""
-        assert get_key_code_name("ZH10") == ""
+        assert get_key_code_name("ZH7") == "大单"
+        assert get_key_code_name("ZH8") == "大双"
+        assert get_key_code_name("ZH9") == "小单"
+        assert get_key_code_name("ZH10") == "小双"
 
     def test_sb(self):
-        assert get_key_code_name("SB1") == ""
-        assert get_key_code_name("SB2") == ""
-        assert get_key_code_name("SB3") == ""
+        assert get_key_code_name("SB1") == "红波"
+        assert get_key_code_name("SB2") == "绿波"
+        assert get_key_code_name("SB3") == "蓝波"
 
     def test_bz(self):
-        assert get_key_code_name("BZ4") == ""
+        assert get_key_code_name("BZ4") == "豹子"
 
     def test_lhh(self):
-        assert get_key_code_name("LHH_L") == ""
-        assert get_key_code_name("LHH_H") == ""
-        assert get_key_code_name("LHH_HE") == ""
+        assert get_key_code_name("LHH_L") == "龙"
+        assert get_key_code_name("LHH_H") == "虎"
+        assert get_key_code_name("LHH_HE") == "和"
 
     def test_hz_range(self):
-        """HZ1~HZ28  0~27"""
+        """HZ1~HZ28 对应 和值0~和值27"""
         for i in range(1, 29):
-            assert get_key_code_name(f"HZ{i}") == f"{i - 1}"
+            assert get_key_code_name(f"HZ{i}") == f"和值{i - 1}"
 
     def test_single_ball_number(self):
-        """B{n}QH{d} """
-        assert get_key_code_name("B1QH0") == "0"
-        assert get_key_code_name("B2QH5") == "5"
-        assert get_key_code_name("B3QH9") == "9"
+        """B{n}QH{d} 返回 第n球d"""
+        assert get_key_code_name("B1QH0") == "第一球0"
+        assert get_key_code_name("B2QH5") == "第二球5"
+        assert get_key_code_name("B3QH9") == "第三球9"
 
     def test_single_ball_lm(self):
-        """B{n}LM_{suffix} """
-        assert get_key_code_name("B1LM_DA") == ""
-        assert get_key_code_name("B1LM_X") == ""
-        assert get_key_code_name("B2LM_D") == ""
-        assert get_key_code_name("B3LM_S") == ""
+        """B{n}LM_{suffix} 返回 第n球大/小/单/双"""
+        assert get_key_code_name("B1LM_DA") == "第一球大"
+        assert get_key_code_name("B1LM_X") == "第一球小"
+        assert get_key_code_name("B2LM_D") == "第二球单"
+        assert get_key_code_name("B3LM_S") == "第三球双"
 
     def test_unknown_returns_original(self):
         """ KeyCode """
@@ -329,3 +329,125 @@ class TestCheckWinUnknown:
 
     def test_empty_returns_false(self):
         assert check_win("", [1, 2, 3], 6) is False
+
+
+# =========================================================================
+# PLAY_CODE_GROUPS / COMMON_GROUPS 分组常量验证
+# =========================================================================
+
+from app.utils.key_code_map import PLAY_CODE_GROUPS, COMMON_GROUPS
+
+
+class TestPlayCodeGroups:
+    """验证分组常量的完整性和一致性"""
+
+    def test_group_count(self):
+        """应包含 10 个分组"""
+        assert len(PLAY_CODE_GROUPS) == 10
+
+    def test_group_order(self):
+        """分组顺序：大小、单双、极值、组合、色波、豹子、龙虎和、和值、单球猜号、单球大小单双"""
+        expected = ["大小", "单双", "极值", "组合", "色波", "豹子", "龙虎和", "和值", "单球猜号", "单球大小单双"]
+        actual = [g["group_name"] for g in PLAY_CODE_GROUPS]
+        assert actual == expected
+
+    def test_total_items_87(self):
+        """全部分组合计 87 种玩法"""
+        total = sum(len(g["items"]) for g in PLAY_CODE_GROUPS)
+        assert total == 87
+
+    def test_all_key_codes_in_map(self):
+        """每个 item 的 key_code 必须在 KEY_CODE_MAP 中存在"""
+        for group in PLAY_CODE_GROUPS:
+            for item in group["items"]:
+                assert item["key_code"] in KEY_CODE_MAP, (
+                    f"{group['group_name']} 中 {item['key_code']} 不在 KEY_CODE_MAP"
+                )
+
+    def test_names_match_map(self):
+        """每个 item 的 name 必须与 KEY_CODE_MAP 中的值一致"""
+        for group in PLAY_CODE_GROUPS:
+            for item in group["items"]:
+                assert item["name"] == KEY_CODE_MAP[item["key_code"]], (
+                    f"{item['key_code']}: 分组中 '{item['name']}' != MAP 中 '{KEY_CODE_MAP[item['key_code']]}'"
+                )
+
+    def test_no_duplicate_key_codes(self):
+        """分组中不应有重复的 key_code"""
+        all_codes = [item["key_code"] for g in PLAY_CODE_GROUPS for item in g["items"]]
+        assert len(all_codes) == len(set(all_codes))
+
+    def test_common_groups_count(self):
+        """常用分组应包含 7 个"""
+        assert len(COMMON_GROUPS) == 7
+
+    def test_common_groups_are_valid(self):
+        """常用分组名称必须在 PLAY_CODE_GROUPS 中存在"""
+        all_group_names = {g["group_name"] for g in PLAY_CODE_GROUPS}
+        assert COMMON_GROUPS.issubset(all_group_names)
+
+    def test_common_groups_content(self):
+        """常用分组应为前 7 个分组"""
+        expected = {"大小", "单双", "极值", "组合", "色波", "豹子", "龙虎和"}
+        assert COMMON_GROUPS == expected
+
+
+# =========================================================================
+# 属性测试：PLAY_CODE_GROUPS 一致性
+# =========================================================================
+
+from hypothesis import given, strategies as st
+from app.utils.key_code_map import PLAY_CODE_GROUPS, COMMON_GROUPS
+
+
+# 构建所有 (group_index, item_index) 对的策略
+_all_group_item_pairs = [
+    (gi, ii)
+    for gi, group in enumerate(PLAY_CODE_GROUPS)
+    for ii in range(len(group["items"]))
+]
+
+
+class TestPlayCodeGroupsProperties:
+    """PLAY_CODE_GROUPS 属性测试
+
+    **Validates: Requirements 6.1, 8.3**
+    """
+
+    @given(pair=st.sampled_from(_all_group_item_pairs))
+    def test_all_group_items_exist_in_key_code_map(self, pair):
+        """属性：PLAY_CODE_GROUPS 中每个 item 的 key_code 必须在 KEY_CODE_MAP 中存在，
+        且 name 与 get_key_code_name 返回值一致。"""
+        gi, ii = pair
+        item = PLAY_CODE_GROUPS[gi]["items"][ii]
+        key_code = item["key_code"]
+        name = item["name"]
+        assert key_code in KEY_CODE_MAP, f"{key_code} 不在 KEY_CODE_MAP 中"
+        assert get_key_code_name(key_code) == name, (
+            f"{key_code}: 分组中 name={name}, get_key_code_name 返回 {get_key_code_name(key_code)}"
+        )
+
+    def test_groups_count(self):
+        """PLAY_CODE_GROUPS 包含 10 个分组"""
+        assert len(PLAY_CODE_GROUPS) == 10
+
+    def test_total_items_count(self):
+        """所有分组合计 87 种玩法"""
+        total = sum(len(g["items"]) for g in PLAY_CODE_GROUPS)
+        assert total == 87
+
+    def test_common_groups_count(self):
+        """COMMON_GROUPS 包含 7 个常用分组"""
+        assert len(COMMON_GROUPS) == 7
+
+    def test_common_groups_are_valid(self):
+        """COMMON_GROUPS 中的名称都在 PLAY_CODE_GROUPS 的 group_name 中"""
+        group_names = {g["group_name"] for g in PLAY_CODE_GROUPS}
+        for name in COMMON_GROUPS:
+            assert name in group_names, f"常用分组 '{name}' 不在 PLAY_CODE_GROUPS 中"
+
+    def test_group_order(self):
+        """分组顺序：大小、单双、极值、组合、色波、豹子、龙虎和、和值、单球猜号、单球大小单双"""
+        expected = ["大小", "单双", "极值", "组合", "色波", "豹子", "龙虎和", "和值", "单球猜号", "单球大小单双"]
+        actual = [g["group_name"] for g in PLAY_CODE_GROUPS]
+        assert actual == expected

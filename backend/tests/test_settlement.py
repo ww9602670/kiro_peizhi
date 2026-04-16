@@ -2489,7 +2489,7 @@ class TestTopbetlistAllFail:
             )
         ).fetchall()
         assert len(alerts) == 1
-        assert "Topbetlist" in alerts[0]["title"]
+        assert "getBetChecked" in alerts[0]["title"]
 
 
 # ──────────────────────────────────────────────

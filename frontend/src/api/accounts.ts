@@ -33,6 +33,12 @@ export async function loginAccount(id: number) {
   });
 }
 
+export async function logoutAccount(id: number) {
+  return request<AccountInfo>(`/accounts/${id}/logout`, {
+    method: 'POST',
+  });
+}
+
 export async function updateKillSwitch(id: number, data: KillSwitchUpdate) {
   return request<AccountInfo>(`/accounts/${id}/kill-switch`, {
     method: 'POST',

@@ -10,6 +10,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { listOperators, createOperator, updateOperatorStatus } from '@/api/admin';
 import { isApiError } from '@/api/request';
 import type { OperatorInfo } from '@/types/api/operator';
+import Toast from '@/components/Toast';
+import { useToast } from '@/hooks/useToast';
 import './Operators.css';
 
 export default function Operators() {
@@ -25,6 +27,7 @@ export default function Operators() {
   const [createForm, setCreateForm] = useState({ username: '', password: '', max_accounts: 1, expire_date: '' });
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState('');
+  const { messages, showToast, removeToast } = useToast();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -72,7 +75,7 @@ export default function Operators() {
       await updateOperatorStatus(op.id, { status: newStatus });
       await load();
     } catch (err) {
-      if (isApiError(err)) alert(err.message);
+      if (isApiError(err)) showToast(err.message);
     }
   };
 
@@ -80,6 +83,7 @@ export default function Operators() {
 
   return (
     <div className="operators-page">
+      <Toast messages={messages} onRemove={removeToast} />
       <div className="operators-header">
         <h1 className="operators-title">操作者管理</h1>
         <button type="button" className="create-btn" onClick={() => setShowCreate(true)}>
@@ -139,17 +143,17 @@ export default function Operators() {
               <tbody>
                 {operators.map((op) => (
                   <tr key={op.id}>
-                    <td>{op.id}</td>
-                    <td>{op.username}</td>
-                    <td>{op.role === 'admin' ? '管理员' : '操作者'}</td>
-                    <td>
+                    <td data-label="ID">{op.id}</td>
+                    <td data-label="用户名">{op.username}</td>
+                    <td data-label="角色">{op.role === 'admin' ? '管理员' : '操作者'}</td>
+                    <td data-label="状态">
                       <span className={`op-status op-status-${op.status}`}>
                         {op.status === 'active' ? '活跃' : op.status === 'disabled' ? '禁用' : op.status}
                       </span>
                     </td>
-                    <td>{op.max_accounts}</td>
-                    <td>{op.expire_date ?? '-'}</td>
-                    <td>
+                    <td data-label="最大账号">{op.max_accounts}</td>
+                    <td data-label="到期日期">{op.expire_date ?? '-'}</td>
+                    <td data-label="操作">
                       {op.role !== 'admin' && (
                         <button
                           type="button"

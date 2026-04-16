@@ -27,7 +27,9 @@ def _rows_to_list(rows: list[aiosqlite.Row]) -> list[dict[str, Any]]:
 
 
 def _now() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    """返回北京时间（UTC+8）字符串"""
+    from datetime import timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # 
@@ -131,13 +133,14 @@ async def account_create(
     account_name: str,
     password: str,
     platform_type: str,
+    platform_url: str | None = None,
 ) -> dict[str, Any]:
     now = _now()
     cursor = await db.execute(
         """INSERT INTO gambling_accounts
-           (operator_id, account_name, password, platform_type, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (operator_id, account_name, password, platform_type, now, now),
+           (operator_id, account_name, password, platform_type, platform_url, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (operator_id, account_name, password, platform_type, platform_url, now, now),
     )
     await db.commit()
     row = await (await db.execute("SELECT * FROM gambling_accounts WHERE id=?", (cursor.lastrowid,))).fetchone()
@@ -195,6 +198,32 @@ async def account_update(
 async def account_delete(
     db: aiosqlite.Connection, *, account_id: int, operator_id: int
 ) -> bool:
+    """删除账号，级联清理所有关联数据。
+
+    删除顺序（按外键依赖）：
+    bet_orders → strategies → reconcile_records → account_odds → gambling_accounts
+    """
+    # 1. 删除该账号下所有投注记录
+    await db.execute(
+        "DELETE FROM bet_orders WHERE account_id=? AND operator_id=?",
+        (account_id, operator_id),
+    )
+    # 2. 删除该账号下所有策略
+    await db.execute(
+        "DELETE FROM strategies WHERE account_id=? AND operator_id=?",
+        (account_id, operator_id),
+    )
+    # 3. 删除对账记录（reconcile_records 引用 gambling_accounts 但无 CASCADE）
+    await db.execute(
+        "DELETE FROM reconcile_records WHERE account_id=?",
+        (account_id,),
+    )
+    # 4. 删除赔率记录（account_odds 有 ON DELETE CASCADE，但显式删除更安全）
+    await db.execute(
+        "DELETE FROM account_odds WHERE account_id=?",
+        (account_id,),
+    )
+    # 5. 删除账号本身
     cursor = await db.execute(
         "DELETE FROM gambling_accounts WHERE id=? AND operator_id=?",
         (account_id, operator_id),
@@ -221,16 +250,18 @@ async def strategy_create(
     simulation: int = 0,
     stop_loss: int | None = None,
     take_profit: int | None = None,
+    platform_type: str = "JND28WEB",
 ) -> dict[str, Any]:
     now = _now()
     cursor = await db.execute(
         """INSERT INTO strategies
            (operator_id, account_id, name, type, play_code, base_amount,
             martin_sequence, bet_timing, simulation, stop_loss, take_profit,
-            created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            platform_type, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (operator_id, account_id, name, type, play_code, base_amount,
-         martin_sequence, bet_timing, simulation, stop_loss, take_profit, now, now),
+         martin_sequence, bet_timing, simulation, stop_loss, take_profit,
+         platform_type, now, now),
     )
     await db.commit()
     row = await (await db.execute("SELECT * FROM strategies WHERE id=?", (cursor.lastrowid,))).fetchone()
@@ -270,6 +301,7 @@ async def strategy_update(
         "name", "play_code", "base_amount", "martin_sequence",
         "bet_timing", "simulation", "status", "martin_level",
         "stop_loss", "take_profit", "daily_pnl", "total_pnl", "daily_pnl_date",
+        "platform_type",
     }
     filtered = {k: v for k, v in fields.items() if k in allowed}
     if not filtered:
@@ -395,6 +427,8 @@ async def bet_order_list_by_operator(
     date_from: str | None = None,
     date_to: str | None = None,
     strategy_id: int | None = None,
+    status: str | None = None,
+    account_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """ (items, total)"""
     conditions = ["operator_id=?"]
@@ -405,10 +439,17 @@ async def bet_order_list_by_operator(
         params.append(date_from)
     if date_to:
         conditions.append("created_at <= ?")
-        params.append(date_to)
+        params.append(date_to + " 23:59:59")
     if strategy_id is not None:
         conditions.append("strategy_id=?")
         params.append(strategy_id)
+    if status == "settled":
+        conditions.append("status='settled'")
+    elif status == "pending":
+        conditions.append("status IN ('bet_success','settling','pending_match')")
+    if account_id is not None:
+        conditions.append("account_id=?")
+        params.append(account_id)
 
     where = " AND ".join(conditions)
 
@@ -426,6 +467,74 @@ async def bet_order_list_by_operator(
     )).fetchall()
 
     return _rows_to_list(rows), total
+
+
+async def bet_order_summary_by_operator(
+    db: aiosqlite.Connection,
+    *,
+    operator_id: int,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    strategy_id: int | None = None,
+    status: str | None = None,
+    account_id: int | None = None,
+) -> dict[str, Any]:
+    """返回筛选条件下的汇总统计：total_amount, total_payout"""
+    conditions = ["operator_id=?"]
+    params: list[Any] = [operator_id]
+
+    if date_from:
+        conditions.append("created_at >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("created_at <= ?")
+        params.append(date_to + " 23:59:59")
+    if strategy_id is not None:
+        conditions.append("strategy_id=?")
+        params.append(strategy_id)
+    if status == "settled":
+        conditions.append("status='settled'")
+    elif status == "pending":
+        conditions.append("status IN ('bet_success','settling','pending_match')")
+    if account_id is not None:
+        conditions.append("account_id=?")
+        params.append(account_id)
+
+    where = " AND ".join(conditions)
+
+    row = await (await db.execute(
+        f"""SELECT COALESCE(SUM(amount), 0) as total_amount,
+                   COALESCE(SUM(CASE WHEN status='settled' AND pnl IS NOT NULL
+                                     THEN amount + pnl ELSE 0 END), 0) as total_payout
+            FROM bet_orders WHERE {where}""",
+        tuple(params),
+    )).fetchone()
+
+    return {
+        "total_amount": (row["total_amount"] if row else 0) / 100,
+        "total_payout": (row["total_payout"] if row else 0) / 100,
+    }
+
+
+async def bet_order_list_pending_by_operator(
+    db: aiosqlite.Connection,
+    *,
+    operator_id: int,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """查询待结算投注（JOIN 策略名+账户名），最多 limit 条"""
+    rows = await (await db.execute(
+        """SELECT b.*, s.name AS strategy_name, a.account_name AS account_name
+           FROM bet_orders b
+           JOIN strategies s ON b.strategy_id = s.id
+           JOIN gambling_accounts a ON b.account_id = a.id
+           WHERE b.operator_id=?
+             AND b.status IN ('bet_success','settling','pending_match')
+           ORDER BY b.created_at DESC
+           LIMIT ?""",
+        (operator_id, limit),
+    )).fetchall()
+    return _rows_to_list(rows)
 
 
 async def bet_order_update_status(
@@ -719,13 +828,13 @@ async def odds_batch_upsert(
         return
 
     confirmed_int = 1 if confirmed else 0
-    confirmed_at_expr = "datetime('now')" if confirmed else "NULL"
+    confirmed_at_expr = "datetime('now', '+8 hours')" if confirmed else "NULL"
 
     for key_code, odds_value in odds_map.items():
         await db.execute(
             f"""INSERT OR REPLACE INTO account_odds
                (account_id, key_code, odds_value, confirmed, fetched_at, confirmed_at)
-               VALUES (?, ?, ?, ?, datetime('now'), {confirmed_at_expr})""",
+               VALUES (?, ?, ?, ?, datetime('now', '+8 hours'), {confirmed_at_expr})""",
             (account_id, key_code, odds_value, confirmed_int),
         )
     await db.commit()
@@ -773,7 +882,7 @@ async def odds_confirm_all(
 ) -> int:
     """确认该账号所有未确认赔率，返回更新行数。幂等。"""
     cursor = await db.execute(
-        """UPDATE account_odds SET confirmed=1, confirmed_at=datetime('now')
+        """UPDATE account_odds SET confirmed=1, confirmed_at=datetime('now', '+8 hours')
            WHERE account_id=? AND confirmed=0""",
         (account_id,),
     )

@@ -90,7 +90,7 @@ class PlatformAdapter(ABC):
     """
 
     @abstractmethod
-    async def login(self, account_name: str, password: str) -> LoginResult:
+    async def login(self, account_name: str, password: str, captcha_code: Optional[str] = None) -> LoginResult:
         """"""
         ...
 

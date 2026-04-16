@@ -75,12 +75,15 @@ export async function request<T>(
     body = undefined;
   }
 
-  // 401 → 自动跳转登录页
+  // 401 → 清除本地凭证（登录请求自身的 401 不跳转，由调用方处理错误提示）
   if (res.status === 401) {
-    localStorage.removeItem('token');
-    localStorage.removeItem('expire_at');
-    localStorage.removeItem('role');
-    window.location.href = '/login';
+    const isLoginRequest = path === '/auth/login';
+    if (!isLoginRequest) {
+      localStorage.removeItem('token');
+      localStorage.removeItem('expire_at');
+      localStorage.removeItem('role');
+      window.dispatchEvent(new Event('auth-change'));
+    }
     const envelope = isEnvelope(body) ? body : null;
     throw {
       code: envelope?.code ?? 2001,

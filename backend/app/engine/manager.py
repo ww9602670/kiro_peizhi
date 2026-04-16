@@ -436,12 +436,14 @@ class EngineManager:
                     continue
 
                 try:
+                    # 优先使用策略的 platform_type，回退到账号的 platform_type
+                    strategy_platform_type = running_strategies[0].get("platform_type") or acc.get("platform_type", "JND28WEB")
                     await self.start_worker(
                         operator_id=operator_id,
                         account_id=acc["id"],
                         account_name=acc["account_name"],
                         password=acc["password"],
-                        platform_type=acc.get("platform_type", "JND28WEB"),
+                        platform_type=strategy_platform_type,
                         platform_url=acc.get("platform_url"),
                         strategies=running_strategies,
                     )
@@ -549,6 +551,7 @@ class EngineManager:
 
     def _build_strategy_runner(self, strategy_data: dict[str, Any]) -> Optional[StrategyRunner]:
         """ StrategyRunner"""
+        import app.engine.strategies  # noqa: F401
         from app.engine.strategies.registry import get_strategy_class
 
         strategy_type = strategy_data.get("type", "flat")
@@ -561,34 +564,45 @@ class EngineManager:
         # 
         play_code = strategy_data.get("play_code", "DX1")
         base_amount = strategy_data.get("base_amount", 100)
-        
+        key_codes = [c.strip() for c in play_code.split(",") if c.strip()]
+        seq_values: list[float] | None = None
+        if strategy_data.get("martin_sequence"):
+            seq_str = strategy_data["martin_sequence"]
+            if isinstance(seq_str, str):
+                import json as _json
+
+                try:
+                    parsed = _json.loads(seq_str)
+                    seq_values = [float(x) for x in parsed]
+                except (ValueError, TypeError):
+                    seq_values = [float(x.strip()) for x in seq_str.split(",")]
+            elif isinstance(seq_str, list):
+                seq_values = [float(x) for x in seq_str]
+
         if strategy_type == "flat":
             # key_codes 
             kwargs: dict[str, Any] = {
-                "key_codes": [play_code],
+                "key_codes": key_codes,
                 "base_amount": base_amount,
             }
-        elif strategy_type == "martin":
+        elif strategy_type in ("martin", "red_wave_double_martin"):
             # key_codes  sequence
-            kwargs: dict[str, Any] = {
-                "key_codes": [play_code],
-                "base_amount": base_amount,
-            }
-            if strategy_data.get("martin_sequence"):
-                seq_str = strategy_data["martin_sequence"]
-                if isinstance(seq_str, str):
-                    import json as _json
-                    try:
-                        parsed = _json.loads(seq_str)
-                        kwargs["sequence"] = [float(x) for x in parsed]
-                    except (ValueError, TypeError):
-                        kwargs["sequence"] = [float(x.strip()) for x in seq_str.split(",")]
-                elif isinstance(seq_str, list):
-                    kwargs["sequence"] = [float(x) for x in seq_str]
-            else:
+            if not seq_values:
                 # 
                 logger.warning(" martin_sequencestrategy_id=%s", strategy_data.get("id"))
                 return None
+            if strategy_type == "martin":
+                kwargs = {
+                    "key_codes": key_codes,
+                    "base_amount": base_amount,
+                    "sequence": seq_values,
+                }
+            else:
+                kwargs = {
+                    "base_amount": base_amount,
+                    "sequence": seq_values,
+                    "direction_codes": key_codes,
+                }
         else:
             logger.warning("type=%s", strategy_type)
             return None

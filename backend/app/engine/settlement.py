@@ -17,7 +17,19 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
+
+_BJT = timezone(timedelta(hours=8))
+
+
+def _now_bj() -> str:
+    """返回北京时间字符串"""
+    return datetime.now(_BJT).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _today_bj() -> str:
+    """返回北京时间日期字符串"""
+    return datetime.now(_BJT).strftime("%Y-%m-%d")
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -116,10 +128,11 @@ class SettleResult:
 class SettlementProcessor:
     """"""
 
-    def __init__(self, db: aiosqlite.Connection, operator_id: int, alert_service=None) -> None:
+    def __init__(self, db: aiosqlite.Connection, operator_id: int, alert_service=None, account_id: int | None = None) -> None:
         self.db = db
         self.operator_id = operator_id
         self.alert_service = alert_service
+        self.account_id = account_id  # 按账户隔离结算，避免跨账户误匹配
 
     # ==================================================================
     # 
@@ -246,19 +259,30 @@ class SettlementProcessor:
         恢复模式（补结算）：额外包含 settle_timeout, settle_failed（可被高优先级覆盖）
 
         已在不可覆盖终态（settled, bet_failed, reconcile_error）的订单不会被查出。
+        当 self.account_id 不为 None 时，按 account_id 过滤，避免跨账户误匹配。
         """
         statuses = ['bet_success', 'pending_match']
         if include_recoverable:
             statuses.extend(['settle_timeout', 'settle_failed'])
 
         placeholders = ','.join('?' * len(statuses))
-        rows = await (
-            await self.db.execute(
-                f"SELECT * FROM bet_orders WHERE issue=? AND operator_id=? "
-                f"AND status IN ({placeholders})",
-                (issue, self.operator_id, *statuses),
-            )
-        ).fetchall()
+
+        if self.account_id is not None:
+            rows = await (
+                await self.db.execute(
+                    f"SELECT * FROM bet_orders WHERE issue=? AND operator_id=? "
+                    f"AND account_id=? AND status IN ({placeholders})",
+                    (issue, self.operator_id, self.account_id, *statuses),
+                )
+            ).fetchall()
+        else:
+            rows = await (
+                await self.db.execute(
+                    f"SELECT * FROM bet_orders WHERE issue=? AND operator_id=? "
+                    f"AND status IN ({placeholders})",
+                    (issue, self.operator_id, *statuses),
+                )
+            ).fetchall()
         return [dict(r) for r in rows]
 
     async def _settle_order(
@@ -276,7 +300,7 @@ class SettlementProcessor:
             order = dict(order, status="settling")
         self._transition_status(order, "settled")
 
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _now_bj()
         await bet_order_update_status(
             self.db,
             order_id=order["id"],
@@ -406,7 +430,7 @@ class SettlementProcessor:
             logger.warning("strategy_id=%d", strategy_id)
             return
 
-        today_str = date.today().strftime("%Y-%m-%d")
+        today_str = _today_bj()
         current_daily = strategy["daily_pnl"]
         current_total = strategy["total_pnl"]
         current_date = strategy.get("daily_pnl_date")
@@ -470,7 +494,7 @@ class SettlementProcessor:
             new_balance = old_balance + delta
             await self.db.execute(
                 "UPDATE gambling_accounts SET balance=?, updated_at=? WHERE id=?",
-                (new_balance, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), account_id),
+                (new_balance, _now_bj(), account_id),
             )
             await self.db.commit()
             logger.info(
@@ -531,7 +555,7 @@ class SettlementProcessor:
             old_balance = row["balance"]
             await self.db.execute(
                 "UPDATE gambling_accounts SET balance=?, updated_at=? WHERE id=?",
-                (platform_balance, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), account_id),
+                (platform_balance, _now_bj(), account_id),
             )
             await self.db.commit()
             logger.info(
@@ -588,20 +612,22 @@ class SettlementProcessor:
         except Exception:
             logger.exception("QueryResult 失败，余额未更新")
 
-        # 2. 获取平台投注记录（Topbetlist）
+        # 2. 获取平台已结算投注记录（getBetChecked）
+        # count 需要大于本期订单数，至少取 100 条以覆盖多策略并发投注
+        fetch_count = max(len(orders) * 2, 100)
         try:
             platform_bets = await self._retry_api(
-                lambda: adapter.get_bet_history(count=15)
+                lambda: adapter.get_bet_history(count=fetch_count)
             )
         except Exception:
             # 3 次重试全部失败 → settle_failed + 告警
-            logger.exception("Topbetlist 3 次重试全部失败 期号 %s", issue)
+            logger.exception("getBetChecked 3 次重试全部失败 期号 %s", issue)
             await self._mark_orders_settle_failed(orders)
             if self.alert_service:
                 await self.alert_service.send(
                     operator_id=self.operator_id,
                     alert_type="settle_api_failed",
-                    title=f"Topbetlist 调用失败 期号 {issue}",
+                    title=f"getBetChecked 调用失败 期号 {issue}",
                     detail=f"3 次重试全部失败，{len(orders)} 笔订单标记 settle_failed",
                 )
             return
@@ -636,11 +662,15 @@ class SettlementProcessor:
         await self._persist_platform_records(platform_bets)
 
         # 构建平台记录索引：(issue, key_code, amount_fen) -> [records]
+        # getBetChecked 返回字段: Installments, KeyCode, BettingAmount(元), Result(盈亏元)
+        # Topbetlist 返回字段: Amount(元), 无 Installments/KeyCode
         platform_index: dict[tuple, list[dict]] = {}
         for bet in platform_bets:
             bet_issue = str(bet.get("Installments", ""))
             key_code = str(bet.get("KeyCode", ""))
-            amount_fen = int(float(bet.get("Amount", 0)) * 100)
+            # getBetChecked 用 BettingAmount(元)，Topbetlist 用 Amount(元)
+            raw_amount = bet.get("BettingAmount", bet.get("Amount", 0))
+            amount_fen = int(float(raw_amount) * 100)
             key = (bet_issue, key_code, amount_fen)
             platform_index.setdefault(key, []).append(bet)
 
@@ -649,7 +679,7 @@ class SettlementProcessor:
             orders, key=lambda o: (o.get("bet_at") or "", o.get("id", 0))
         )
 
-        # 3.3 Topbetlist 覆盖检测
+        # 3.3 getBetChecked 覆盖检测
         platform_issue_count = sum(
             len(recs)
             for (bi, _, _), recs in platform_index.items()
@@ -661,7 +691,7 @@ class SettlementProcessor:
                 await self.alert_service.send(
                     operator_id=self.operator_id,
                     alert_type="topbetlist_coverage_warning",
-                    title=f"Topbetlist 覆盖不足 期号 {issue}",
+                    title=f"getBetChecked 覆盖不足 期号 {issue}",
                     detail=json.dumps({
                         "issue": issue,
                         "local_count": local_issue_count,
@@ -740,7 +770,7 @@ class SettlementProcessor:
             if bet_at_str:
                 try:
                     bet_at_time = datetime.strptime(bet_at_str, "%Y-%m-%d %H:%M:%S")
-                    elapsed = (datetime.utcnow() - bet_at_time).total_seconds()
+                    elapsed = (datetime.now(_BJT) - bet_at_time.replace(tzinfo=_BJT)).total_seconds()
                     if elapsed > PENDING_MATCH_WALL_CLOCK_TIMEOUT:
                         await self._transition_to_settle_timeout(order)
                         return
@@ -802,20 +832,33 @@ class SettlementProcessor:
     ) -> int:
         """从平台数据结算单个订单，返回 pnl
 
-        pnl = int(float(WinAmount) * 100) - amount
-        is_win = 1 if WinAmount > 0 else 0
-        match_source = "platform"
+        getBetChecked 字段:
+          Result: 盈亏金额(元)，正=赢，负=输（已扣除本金）
+          BettingAmount: 下注金额(元)
+        Topbetlist 字段 (兼容):
+          WinAmount: 赢取金额(元)
+
+        pnl 计算:
+          getBetChecked: pnl = int(Result * 100)
+          Topbetlist:    pnl = int(WinAmount * 100) - amount
         """
-        win_amount_yuan = float(platform_record.get("WinAmount", 0))
-        win_amount_fen = int(win_amount_yuan * 100)
         amount = order["amount"]
 
-        is_win = 1 if win_amount_yuan > 0 else 0
-        pnl = win_amount_fen - amount
+        if "Result" in platform_record:
+            # getBetChecked 格式: Result 就是盈亏（已扣本金）
+            result_yuan = float(platform_record["Result"])
+            pnl = int(result_yuan * 100)
+            is_win = 1 if result_yuan > 0 else 0
+        else:
+            # Topbetlist 兼容: WinAmount 是赢取金额
+            win_amount_yuan = float(platform_record.get("WinAmount", 0))
+            win_amount_fen = int(win_amount_yuan * 100)
+            pnl = win_amount_fen - amount
+            is_win = 1 if win_amount_yuan > 0 else 0
 
         order_id = order["id"]
         current_status = order["status"]
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _now_bj()
 
         # 两步状态转换: current → settling → settled
         ok = await self._atomic_transition(
@@ -854,12 +897,19 @@ class SettlementProcessor:
     # ==================================================================
 
     async def _persist_platform_records(self, platform_bets: list[dict]) -> None:
-        """将 Topbetlist 返回的原始记录写入 bet_order_platform_records 表"""
+        """将平台返回的原始记录写入 bet_order_platform_records 表
+
+        兼容 getBetChecked (BettingAmount/Result) 和 Topbetlist (Amount/WinAmount)。
+        """
         for bet in platform_bets:
             issue = str(bet.get("Installments", ""))
             key_code = str(bet.get("KeyCode", ""))
-            amount_fen = int(float(bet.get("Amount", 0)) * 100)
-            win_amount_fen = int(float(bet.get("WinAmount", 0)) * 100)
+            # getBetChecked 用 BettingAmount，Topbetlist 用 Amount
+            raw_amount = bet.get("BettingAmount", bet.get("Amount", 0))
+            amount_fen = int(float(raw_amount) * 100)
+            # getBetChecked 用 Result(盈亏)，Topbetlist 用 WinAmount
+            raw_win = bet.get("Result", bet.get("WinAmount", 0))
+            win_amount_fen = int(float(raw_win) * 100)
             raw = json.dumps(bet, ensure_ascii=False)
             await self.db.execute(
                 "INSERT INTO bet_order_platform_records "

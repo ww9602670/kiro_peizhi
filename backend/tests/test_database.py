@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "reconcile_records",
     "account_odds",
     "bet_order_platform_records",
+    "backtest_tasks",
 }
 
 

@@ -40,31 +40,57 @@
 }
 
 /* Lottery result balls */
-.result-balls {
+.wave-result {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
-.ball {
+.wave-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.wave-label {
+  font-size: 12px;
+  color: #666;
+}
+
+.wave-value {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
+  min-width: 28px;
+  height: 24px;
+  border-radius: 8px;
+  padding: 0 6px;
   color: #fff;
   font-size: 14px;
   font-weight: 600;
   font-family: 'SF Mono', 'Menlo', monospace;
 }
 
-.ball-sum {
-  font-size: 14px;
-  font-weight: 600;
-  color: #333;
-  margin-left: 2px;
-  font-family: 'SF Mono', 'Menlo', monospace;
+.wave-red {
+  background: #ff4d4f;
+}
+
+.wave-green {
+  background: #52c41a;
+}
+
+.wave-blue {
+  background: #1677ff;
+}
+
+.wave-special {
+  background: #faad14;
+  color: #1a1a1a;
+}
+
+.wave-unknown {
+  background: #999;
 }
 
 .no-result {

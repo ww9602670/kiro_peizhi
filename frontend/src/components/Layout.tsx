@@ -55,6 +55,22 @@ export default function Layout({
         </div>
       </aside>
       <main className="layout-main">{children}</main>
+      {/* 移动端底部导航栏 */}
+      <nav className="layout-bottom-nav" role="navigation">
+        {navItems.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            className={`bottom-nav-item ${activeKey === item.key ? 'bottom-nav-active' : ''}`}
+            onClick={() => onNavChange(item.key)}
+          >
+            {item.label}
+            {item.key === 'alerts' && unreadAlerts > 0 && (
+              <span className="bottom-nav-badge">{unreadAlerts > 99 ? '99+' : unreadAlerts}</span>
+            )}
+          </button>
+        ))}
+      </nav>
     </div>
   );
 }

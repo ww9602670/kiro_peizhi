@@ -89,8 +89,8 @@ async def _create_operator(username: str) -> tuple[str, int]:
 class TestAlertLevelMap:
     """ 12 """
 
-    def test_all_12_types_present(self):
-        assert len(ALERT_LEVEL_MAP) == 12
+    def test_all_types_present(self):
+        assert len(ALERT_LEVEL_MAP) == 22
 
     @pytest.mark.parametrize(
         "alert_type,expected_level",

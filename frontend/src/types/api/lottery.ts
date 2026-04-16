@@ -5,12 +5,15 @@
 /**
  * Lottery state enum
  */
-export enum LotteryStateEnum {
-  UNKNOWN = 0,  // Unknown state
-  OPEN = 1,     // Open for betting
-  CLOSED = 2,   // Closed for betting
-  DRAWING = 3   // Drawing in progress
-}
+export const LotteryStateEnum = {
+  UNKNOWN: 0,  // Unknown state
+  OPEN: 1,     // Open for betting
+  CLOSED: 2,   // Closed for betting
+  DRAWING: 3,  // Drawing in progress
+} as const;
+
+export type LotteryStateEnum =
+  (typeof LotteryStateEnum)[keyof typeof LotteryStateEnum];
 
 /**
  * Current install information

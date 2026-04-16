@@ -307,10 +307,81 @@ POST {base_url}/PlaceBet/QueryResult?lotteryType=JND28WEB
 
 ---
 
-## 7. 最新注单
+## 7. 已结算注单 (settlement_api)
+
+**API ID:** `settlement_api`  
+**用途:** 查询已结算的投注记录（含完整字段）
+
+```
+POST {base_url}/BettingList/getBetChecked
+```
+
+**请求头:**
+```json
+{
+  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+  "X-Requested-With": "XMLHttpRequest"
+}
+```
+
+**请求体:**
+```
+startIndex=0&rows=20
+```
+
+**参数说明:**
+- `startIndex`: 起始索引 (从0开始，注意：不是从1开始！startIndex=1会跳过第一条记录)
+- `rows`: 返回条数
+
+**响应示例:**
+```json
+{
+  "betList": [
+    {
+      "KeyCode": "DX1",
+      "Id": "260314...",
+      "LotteryType": "JND28WEB",
+      "OddNo": "N3877003651498",
+      "MidType": "大小",
+      "DisplayName": "大",
+      "Odds": 1.9834,
+      "Result": -99.28,
+      "BettingAmount": 100,
+      "ReturnValue": 0.72,
+      "ReturnAmount": 0.72,
+      "Finished": 1,
+      "Installments": "3407892",
+      "WinType": 0,
+      "CreateDate": "2026-03-14 15:24:02",
+      "LotteryDate": "2026-03-14 15:26:30"
+    }
+  ],
+  "sum": { "BettingAmount": 1400, "Result": -78.92, "totalCount": 14 },
+  "total": 14,
+  "startIndex": 1,
+  "rows": 15
+}
+```
+
+**关键字段:**
+| 字段 | 说明 |
+|------|------|
+| `KeyCode` | 玩法代码 (DX1, HZ14 等) |
+| `Installments` | 期号 |
+| `OddNo` | 注单号 |
+| `BettingAmount` | 下注金额 (元) |
+| `Result` | 盈亏金额 (元，正=赢，负=输，已扣本金) |
+| `Finished` | 是否已结算 (1=已结算) |
+| `WinType` | 中奖类型 (0=未中奖) |
+
+---
+
+## 7b. 最新注单 (history_api, 已弃用)
+
+> 注意: 此接口返回字段不完整（缺少 KeyCode、Installments），已被 getBetChecked 替代用于结算。
 
 **API ID:** `history_api`  
-**用途:** 查询最近投注记录
+**用途:** 查询最近投注记录（未结算/简要信息）
 
 ```
 POST {base_url}/PlaceBet/Topbetlist

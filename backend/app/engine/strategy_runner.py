@@ -14,9 +14,15 @@ idempotent_id {issue}-{strategy_id}-{key_code}key_code
 from __future__ import annotations
 
 import logging
+import inspect
 from dataclasses import dataclass
 
-from app.engine.strategies.base import BaseStrategy, BetInstruction, StrategyContext
+from app.engine.strategies.base import (
+    BaseStrategy,
+    BetInstruction,
+    StrategyContext,
+    StrategyStopRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +105,39 @@ class StrategyRunner:
     # 
     # ------------------------------------------------------------------
 
-    async def on_result(self, is_win: int | None, pnl: int) -> None:
+    async def on_result(
+        self,
+        is_win: int | None,
+        pnl: int,
+        key_code: str | None = None,
+        martin_level: int | None = None,
+    ) -> StrategyStopRequest | None:
         """ flush_alerts"""
-        self.strategy.on_result(is_win, pnl)
+        kwargs = {"key_code": key_code}
+        try:
+            params = inspect.signature(self.strategy.on_result).parameters
+            accepts_martin_level = "martin_level" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
+            )
+        except (TypeError, ValueError):
+            accepts_martin_level = True
+        if accepts_martin_level and martin_level is not None:
+            kwargs["martin_level"] = martin_level
+
+        stop_request = self.strategy.on_result(
+            is_win,
+            pnl,
+            **kwargs,
+        )
 
         #  flush_alerts
         if hasattr(self.strategy, "flush_alerts"):
             await self.strategy.flush_alerts()
+
+        if isinstance(stop_request, StrategyStopRequest):
+            return stop_request
+        return None
 
     # ------------------------------------------------------------------
     # 
@@ -114,11 +146,16 @@ class StrategyRunner:
     def _to_signal(self, inst: BetInstruction, issue: str) -> BetSignal:
         """ BetInstruction  BetSignal"""
         key_code_upper = inst.key_code.upper()
+        martin_level = (
+            inst.martin_level
+            if inst.martin_level is not None
+            else getattr(self.strategy, "level", 0)
+        )
         return BetSignal(
             strategy_id=self.strategy_id,
             key_code=key_code_upper,
             amount=inst.amount,
             idempotent_id=f"{issue}-{self.strategy_id}-{key_code_upper}",
-            martin_level=getattr(self.strategy, "level", 0),
+            martin_level=martin_level,
             simulation=self.simulation,
         )

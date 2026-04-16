@@ -22,7 +22,7 @@ class OperatorDashboard(BaseModel):
                 "daily_pnl": 5.50,
                 "total_pnl": 120.00,
                 "running_strategies": [],
-                "recent_bets": [],
+                "pending_bets": [],
                 "unread_alerts": 3,
             }
         }
@@ -32,7 +32,7 @@ class OperatorDashboard(BaseModel):
     daily_pnl: float
     total_pnl: float
     running_strategies: list[StrategyInfo]
-    recent_bets: list[BetOrderInfo]
+    pending_bets: list[BetOrderInfo]
     unread_alerts: int
 
 

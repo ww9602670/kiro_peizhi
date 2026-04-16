@@ -31,8 +31,8 @@ DDL_STATEMENTS = [
         expire_date     TEXT,
         current_jti     TEXT,
         created_by      INTEGER REFERENCES operators(id),
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
 
@@ -44,6 +44,7 @@ DDL_STATEMENTS = [
         account_name    TEXT NOT NULL,
         password        TEXT NOT NULL,
         platform_type   TEXT NOT NULL,
+        platform_url    TEXT,
         status          TEXT NOT NULL DEFAULT 'inactive',
         session_token   TEXT,
         balance         INTEGER DEFAULT 0,
@@ -55,8 +56,8 @@ DDL_STATEMENTS = [
         period_limit    INTEGER,
         worker_lock_token TEXT DEFAULT NULL,
         worker_lock_ts  TEXT DEFAULT NULL,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         UNIQUE(operator_id, account_name, platform_type)
     );
     """,
@@ -81,8 +82,9 @@ DDL_STATEMENTS = [
         daily_pnl       INTEGER NOT NULL DEFAULT 0,
         total_pnl       INTEGER NOT NULL DEFAULT 0,
         daily_pnl_date  TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        platform_type   TEXT NOT NULL DEFAULT 'JND28WEB',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
 
@@ -111,7 +113,7 @@ DDL_STATEMENTS = [
         fail_reason     TEXT,
         match_source    TEXT DEFAULT NULL,
         pending_match_count INTEGER DEFAULT 0,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_bet_orders_issue ON bet_orders(issue);",
@@ -138,7 +140,7 @@ DDL_STATEMENTS = [
         title           TEXT NOT NULL,
         detail          TEXT,
         is_read         INTEGER NOT NULL DEFAULT 0,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_alerts_operator ON alerts(operator_id, is_read, created_at);",
@@ -153,7 +155,7 @@ DDL_STATEMENTS = [
         target_id       INTEGER,
         detail          TEXT,
         ip_address      TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_audit_logs_operator ON audit_logs(operator_id, created_at);",
@@ -166,7 +168,7 @@ DDL_STATEMENTS = [
         open_result     TEXT NOT NULL,
         sum_value       INTEGER NOT NULL,
         open_time       TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
 
@@ -184,7 +186,7 @@ DDL_STATEMENTS = [
         status          TEXT NOT NULL DEFAULT 'pending',
         detail          TEXT,
         resolved_by     TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_reconcile_account ON reconcile_records(account_id, issue);",
@@ -198,7 +200,7 @@ DDL_STATEMENTS = [
         amount          INTEGER NOT NULL,
         win_amount      INTEGER NOT NULL,
         raw_json        TEXT,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_platform_records_issue ON bet_order_platform_records(issue);",
@@ -211,12 +213,35 @@ DDL_STATEMENTS = [
         key_code        TEXT NOT NULL,
         odds_value      INTEGER NOT NULL,
         confirmed       INTEGER NOT NULL DEFAULT 0,
-        fetched_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        fetched_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         confirmed_at    TEXT,
         UNIQUE(account_id, key_code)
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_account_odds_account ON account_odds(account_id, confirmed);",
+
+    # 11. backtest_tasks (回测任务)
+    """
+    CREATE TABLE IF NOT EXISTS backtest_tasks (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator_id     INTEGER NOT NULL REFERENCES operators(id),
+        strategy_type   TEXT NOT NULL,
+        key_codes       TEXT NOT NULL,
+        base_amount     INTEGER NOT NULL,
+        martin_sequence TEXT,
+        odds_map        TEXT NOT NULL,
+        start_issue     TEXT NOT NULL,
+        end_issue       TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        error_message   TEXT,
+        result_json     TEXT,
+        total_issues    INTEGER DEFAULT 0,
+        processed_issues INTEGER DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        completed_at    TEXT
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_backtest_tasks_operator ON backtest_tasks(operator_id, created_at);",
 ]
 
 

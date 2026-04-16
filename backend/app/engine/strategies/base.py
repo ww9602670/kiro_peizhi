@@ -31,6 +31,14 @@ class BetInstruction:
     """"""
     key_code: str
     amount: int  # 
+    martin_level: int | None = None
+
+
+@dataclass
+class StrategyStopRequest:
+    """Settlement feedback stop request from strategy."""
+    should_stop: bool = False
+    reason: str = ""
 
 
 class BaseStrategy(ABC):
@@ -46,11 +54,17 @@ class BaseStrategy(ABC):
         """"""
         ...
 
-    def on_result(self, is_win: Optional[int], pnl: int) -> None:
+    def on_result(
+        self,
+        is_win: Optional[int],
+        pnl: int,
+        key_code: str | None = None,
+        martin_level: int | None = None,
+    ) -> Optional[StrategyStopRequest]:
         """
         
         is_win: 1=, 0=, -1=
         pnl: 
         
         """
-        pass
+        return None

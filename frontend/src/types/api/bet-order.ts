@@ -23,4 +23,8 @@ export interface BetOrderInfo {
   bet_at: string | null;
   settled_at: string | null;
   fail_reason: string | null;
+  // 新增可选字段
+  strategy_name?: string | null;
+  account_name?: string | null;
+  payout?: number | null;
 }

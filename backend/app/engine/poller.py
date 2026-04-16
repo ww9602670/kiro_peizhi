@@ -138,8 +138,8 @@ class IssuePoller:
         """
         # 1. 
         if self.is_known_downtime():
-            self._enter_slow_mode("")
-        elif self._slow_mode_reason == "":
+            self._enter_slow_mode("known_downtime")
+        elif self._slow_mode_reason == "known_downtime":
             # 
             # 
             pass
@@ -158,13 +158,13 @@ class IssuePoller:
             self._last_non_open_issue = install.issue
 
             if self.non_open_count >= RANDOM_DOWNTIME_THRESHOLD:
-                self._enter_slow_mode("")
+                self._enter_slow_mode("random_downtime")
         else:
             # State=1 
             if self._in_slow_mode and install.issue != self.last_issue:
                 # State=1 
                 self._exit_slow_mode()
-            elif self._in_slow_mode and self._slow_mode_reason == "" and not self.is_known_downtime():
+            elif self._in_slow_mode and self._slow_mode_reason == "known_downtime" and not self.is_known_downtime():
                 #  State=1
                 self._exit_slow_mode()
 

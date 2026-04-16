@@ -115,7 +115,7 @@ async def test_list_bet_orders_with_data(client):
     assert body["data"]["total"] == 1
     item = body["data"]["items"][0]
     assert item["key_code"] == "DX1"
-    assert item["key_code_name"] == ""
+    assert item["key_code_name"] == "大"
     assert item["amount"] == 50.0  # 5000  50
 
 
@@ -188,7 +188,7 @@ async def test_get_bet_order_by_id(client):
     body = resp.json()
     assert body["code"] == 0
     assert body["data"]["key_code"] == "ZH7"
-    assert body["data"]["key_code_name"] == ""
+    assert body["data"]["key_code_name"] == "大单"
     assert body["data"]["amount"] == 20.0  # 2000  20
 
 
@@ -294,5 +294,5 @@ async def test_unit_conversion(client):
     assert item["amount"] == 100.0
     assert item["odds"] == 1.98
     assert item["pnl"] == 98.0
-    assert item["key_code_name"] == ""
+    assert item["key_code_name"] == "小"
     assert item["is_win"] == 1

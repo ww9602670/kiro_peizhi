@@ -3,7 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+
+_BJT = timezone(timedelta(hours=8))
+
+
+def _now_bj() -> str:
+    """返回北京时间字符串"""
+    return datetime.now(_BJT).strftime("%Y-%m-%d %H:%M:%S")
 
 import aiosqlite
 
@@ -20,6 +28,13 @@ from app.models.db_ops import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExecutionReport:
+    """Execution side effects that should be handled by worker."""
+
+    stop_strategy_ids: dict[int, str] = field(default_factory=dict)
 
 
 class BetExecutor:
@@ -43,10 +58,11 @@ class BetExecutor:
 
     async def execute(
         self, install: InstallInfo, signals: list[BetSignal]
-    ) -> None:
+    ) -> ExecutionReport:
         """Execute signals with deadline protection."""
+        report = ExecutionReport()
         if not signals:
-            return
+            return report
 
         deadline_seconds = install.close_countdown_sec - 10
         if deadline_seconds <= 0:
@@ -54,10 +70,10 @@ class BetExecutor:
                 "issue=%sclose_timestamp=%d",
                 install.issue, install.close_countdown_sec,
             )
-            return
+            return report
 
         try:
-            await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self._execute_inner(install, signals),
                 timeout=deadline_seconds,
             )
@@ -67,11 +83,13 @@ class BetExecutor:
                 install.issue,
             )
             # ?pending?
+            return report
 
     async def _execute_inner(
         self, install: InstallInfo, signals: list[BetSignal]
-    ) -> None:
+    ) -> ExecutionReport:
         """Inner execution logic."""
+        report = ExecutionReport()
         # 1. 
         new_signals = []
         for s in signals:
@@ -79,7 +97,7 @@ class BetExecutor:
                 new_signals.append(s)
 
         if not new_signals:
-            return
+            return report
 
         # 2. ?
         approved: list[BetSignal] = []
@@ -92,9 +110,18 @@ class BetExecutor:
                     "idempotent_id=%sreason=%s",
                     signal.idempotent_id, check.reason,
                 )
+                if check.stop_strategy:
+                    stop_reason = check.stop_reason or check.reason
+                    report.stop_strategy_ids[signal.strategy_id] = stop_reason
 
         if not approved:
-            return
+            return report
+
+        approved = await self._apply_red_wave_atomic_balance_guard(
+            approved, report
+        )
+        if not approved:
+            return report
 
         # 3. 从本地数据库读取已确认赔率（替代原 adapter.load_odds）
         odds = await odds_get_confirmed_map(self.db, account_id=self.account_id)
@@ -117,7 +144,7 @@ class BetExecutor:
                     detail="该账号存在未确认的赔率变动，请先确认后再下注",
                     account_id=self.account_id,
                 )
-            return
+            return report
 
         # 4.  betdata KeyCode ? 
         betdata: list[dict] = []
@@ -159,7 +186,7 @@ class BetExecutor:
                         order_id=order["id"],
                         operator_id=self.operator_id,
                         status="bet_success",
-                        bet_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        bet_at=_now_bj(),
                     )
                     logger.info(
                         "idempotent_id=%s",
@@ -171,6 +198,67 @@ class BetExecutor:
             await self._place_and_process(
                 install, betdata, orders_created,
             )
+        return report
+
+    async def _apply_red_wave_atomic_balance_guard(
+        self,
+        approved: list[BetSignal],
+        report: ExecutionReport,
+    ) -> list[BetSignal]:
+        """Prevent partial placement for one red-wave strategy in one issue."""
+        if not approved:
+            return approved
+
+        strategy_ids = {s.strategy_id for s in approved}
+        strategy_types = await self._get_strategy_types(strategy_ids)
+        red_strategy_ids = {
+            sid
+            for sid, stype in strategy_types.items()
+            if stype == "red_wave_double_martin"
+        }
+        if not red_strategy_ids:
+            return approved
+
+        balance = await self._get_account_balance()
+        blocked: set[int] = set()
+
+        for sid in red_strategy_ids:
+            total_amount = sum(
+                s.amount
+                for s in approved
+                if s.strategy_id == sid and not s.simulation
+            )
+            if total_amount > balance:
+                blocked.add(sid)
+                report.stop_strategy_ids[sid] = "balance_insufficient"
+
+        if not blocked:
+            return approved
+
+        return [s for s in approved if s.strategy_id not in blocked]
+
+    async def _get_strategy_types(self, strategy_ids: set[int]) -> dict[int, str]:
+        if not strategy_ids:
+            return {}
+        placeholders = ",".join("?" for _ in strategy_ids)
+        rows = await (
+            await self.db.execute(
+                f"SELECT id, type FROM strategies WHERE id IN ({placeholders})",
+                tuple(strategy_ids),
+            )
+        ).fetchall()
+        return {int(row["id"]): str(row["type"]) for row in rows}
+
+    async def _get_account_balance(self) -> int:
+        row = await (
+            await self.db.execute(
+                "SELECT balance FROM gambling_accounts WHERE id=?",
+                (self.account_id,),
+            )
+        ).fetchone()
+        if row is None:
+            return 0
+        return int(row["balance"])
 
     # ------------------------------------------------------------------
     # ?
@@ -239,7 +327,7 @@ class BetExecutor:
 
         当平台返回 succeed=5（赔率已变）时，自动从平台获取实时赔率并重试一次。
         """
-        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _now_bj()
 
         try:
             result: BetResult = await self.adapter.place_bet(
