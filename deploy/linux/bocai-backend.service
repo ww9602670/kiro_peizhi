@@ -1,0 +1,16 @@
+[Unit]
+Description=Bocai FastAPI backend
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/bocai_web/backend
+EnvironmentFile=/opt/bocai_web/deploy/linux/backend.env
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8888
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

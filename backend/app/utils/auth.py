@@ -23,6 +23,9 @@ ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 24
 REFRESH_WINDOW_MINUTES = 30
 
+if os.environ.get("BOCAI_ENV") == "production" and SECRET_KEY == "bocai-dev-secret-key-change-in-prod":
+    raise RuntimeError("BOCAI_JWT_SECRET must be set in production")
+
 #   
 # operator_id  active jti
 ACTIVE_SESSIONS: dict[int, str] = {}

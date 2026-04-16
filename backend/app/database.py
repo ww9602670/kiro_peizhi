@@ -5,13 +5,17 @@
 - 8  DDL +  + 
 - 
 """
-import os
+import logging
 from pathlib import Path
 
 import aiosqlite
 
+from app.config import BOCAI_DB_PATH, BOCAI_DEFAULT_ADMIN_ENABLED
+
+logger = logging.getLogger(__name__)
+
 #  :memory:
-DB_PATH = os.environ.get("BOCAI_DB_PATH", str(Path(__file__).parent.parent / "data" / "bocai.db"))
+DB_PATH = BOCAI_DB_PATH
 
 # 
 # DDL8  +  + 
@@ -362,7 +366,10 @@ async def init_db(db_path: str | None = None) -> None:
         # 自动迁移：检测并添加缺失列
         await _auto_migrate(db)
         # 
-        await db.execute(INSERT_DEFAULT_ADMIN)
+        if BOCAI_DEFAULT_ADMIN_ENABLED:
+            await db.execute(INSERT_DEFAULT_ADMIN)
+        else:
+            logger.info("Skip default admin bootstrap in current environment")
         await db.commit()
     except Exception:
         await db.close()

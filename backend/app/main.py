@@ -1,8 +1,10 @@
-"""FastAPI """
+"""FastAPI app entrypoint."""
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.accounts import router as accounts_router
 from app.api.admin import router as admin_router
@@ -16,8 +18,16 @@ from app.api.lottery import router as lottery_router
 from app.api.odds import router as odds_router
 from app.api.play_codes import router as play_codes_router
 from app.api.strategies import router as strategies_router
+from app.config import (
+    BOCAI_CORS_ORIGINS,
+    BOCAI_DB_PATH,
+    BOCAI_HISTORY_DB_PATH,
+    BOCAI_RESTORE_WORKERS_ON_STARTUP,
+    BOCAI_TRUSTED_HOSTS,
+)
 from app.database import close_shared_db, get_shared_db, init_db
 from app.engine.alert import AlertService
+from app.engine.history_sync import init_sync_service
 from app.engine.manager import EngineManager
 from app.utils.auth import restore_sessions
 from app.utils.response import register_exception_handlers
@@ -45,14 +55,9 @@ async def lifespan(app: FastAPI):
     app.state.engine = engine
 
     # 初始化历史数据同步服务
-    import os
-    from app.engine.history_sync import init_sync_service
-    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    _jnd28_path = os.path.join(_project_root, "jnd28.sqlite3")
-    _bocai_path = os.path.join(os.path.dirname(__file__), "..", "data", "bocai.db")
     init_sync_service(
-        jnd28_db_path=os.path.abspath(_jnd28_path),
-        bocai_db_path=os.path.abspath(_bocai_path),
+        jnd28_db_path=BOCAI_HISTORY_DB_PATH,
+        bocai_db_path=BOCAI_DB_PATH,
     )
     
     logger.info("  Workers...")
@@ -63,8 +68,11 @@ async def lifespan(app: FastAPI):
     )
     await db.commit()
     logger.info("已清理旧 Worker 锁")
-    restored = await engine.restore_workers_on_startup()
-    logger.info(f"  {restored}  Workers")
+    if BOCAI_RESTORE_WORKERS_ON_STARTUP:
+        restored = await engine.restore_workers_on_startup()
+        logger.info(f"  {restored}  Workers")
+    else:
+        logger.info("Worker restore on startup is disabled")
     
     await engine.start_health_check(admin_operator_id=1)
     logger.info(" ")
@@ -79,6 +87,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Bocai Backend", lifespan=lifespan)
+
+if BOCAI_CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=BOCAI_CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+if BOCAI_TRUSTED_HOSTS:
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=BOCAI_TRUSTED_HOSTS,
+    )
 
 # 
 register_exception_handlers(app)

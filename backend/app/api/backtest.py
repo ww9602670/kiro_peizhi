@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_current_operator, get_db_conn
+from app.config import BOCAI_HISTORY_DB_PATH
 from app.engine.backtest import BacktestConfig, BacktestEngine
 from app.schemas.backtest import (
     BacktestCreate,
@@ -34,7 +35,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # jnd28.sqlite3 路径（项目根目录）
-_JND28_DB = os.path.join(os.path.dirname(__file__), "..", "..", "..", "jnd28.sqlite3")
+_JND28_DB = BOCAI_HISTORY_DB_PATH
 
 # 已知不可补全的缺失期号（平台未开奖 + 8828 无历史数据）
 _KNOWN_MISSING_ISSUES = 181

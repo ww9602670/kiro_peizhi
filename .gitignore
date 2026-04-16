@@ -50,3 +50,4 @@ screenshots/
 test-report/
 jnd28.sqlite3
 _codex_child_probe.txt
+deploy/linux/backend.env

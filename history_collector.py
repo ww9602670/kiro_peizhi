@@ -17,8 +17,8 @@ BASE_URL = "https://166test.com"
 LOTTERY_TYPE = "JND28WEB"
 REQUEST_TIMEOUT = 15
 _HERE = os.path.dirname(os.path.abspath(__file__))
-JND28_DB_PATH = os.path.join(_HERE, "jnd28.sqlite3")
-BACKEND_DB_PATH = os.path.join(_HERE, "backend", "data", "bocai.db")
+JND28_DB_PATH = os.environ.get("BOCAI_HISTORY_DB_PATH", os.path.join(_HERE, "jnd28.sqlite3"))
+BACKEND_DB_PATH = os.environ.get("BOCAI_DB_PATH", os.path.join(_HERE, "backend", "data", "bocai.db"))
 
 def jnd28_connect(db_path=None):
     path = db_path or JND28_DB_PATH
