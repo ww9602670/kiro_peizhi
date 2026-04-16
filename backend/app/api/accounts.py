@@ -16,6 +16,8 @@ _BJT = timezone(timedelta(hours=8))
 from fastapi import APIRouter, Depends, Request
 
 from app.api.dependencies import get_current_operator, get_db_conn
+from app.engine.adapters.base import LoginResult, PlatformAdapter
+from app.engine.adapters.jnd import JNDAdapter
 from app.models.db_ops import (
     account_create,
     account_delete,
@@ -33,10 +35,12 @@ from app.schemas.account import (
     mask_password,
 )
 from app.schemas.common import ApiResponse
+from app.utils.captcha import CaptchaError, CaptchaService
 from app.utils.response import BizError
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+CAPTCHA_LOGIN_ATTEMPTS = 3
 
 
 def _to_account_info(row: dict) -> AccountInfo:
@@ -54,14 +58,62 @@ def _to_account_info(row: dict) -> AccountInfo:
     )
 
 
-async def _stub_platform_login(account_name: str, password: str, platform_type: str) -> bool:
-    """
+def _should_retry_captcha_login(result: LoginResult) -> bool:
+    """Retry OCR login only for captcha-like or token bootstrap failures."""
+    if result.success:
+        return False
 
-    TODO: Phase 5 
-     2  + 
-    """
-    # 
-    return True
+    message = (result.message or "").lower()
+    retry_markers = ("captcha", "verify", "vcode", "token")
+    return result.captcha_required or any(marker in message for marker in retry_markers) or not message
+
+
+async def _login_platform_account(
+    adapter: PlatformAdapter,
+    account_name: str,
+    password: str,
+    *,
+    captcha_service: CaptchaService | None = None,
+    max_captcha_attempts: int = CAPTCHA_LOGIN_ATTEMPTS,
+) -> LoginResult:
+    """Attempt direct login first, then fall back to OCR captcha retries."""
+    result = await adapter.login(account_name, password)
+    if result.success:
+        return result
+
+    get_captcha = getattr(adapter, "get_captcha", None)
+    if not callable(get_captcha):
+        return result
+
+    own_captcha_service = captcha_service is None
+    captcha_service = captcha_service or CaptchaService()
+    try:
+        last_result = result
+        for attempt in range(max_captcha_attempts):
+            captcha_image = await get_captcha()
+            captcha_code = (await captcha_service.recognize(captcha_image)).strip()
+            if not captcha_code:
+                raise CaptchaError("OCR returned empty captcha result")
+
+            logger.info(
+                "platform login using captcha attempt=%d account=%s",
+                attempt + 1,
+                account_name,
+            )
+            last_result = await adapter.login(
+                account_name,
+                password,
+                captcha_code=captcha_code,
+            )
+            if last_result.success:
+                return last_result
+            if not _should_retry_captcha_login(last_result):
+                break
+
+        return last_result
+    finally:
+        if own_captcha_service:
+            captcha_service.shutdown()
 
 
 async def _sync_odds(
@@ -139,11 +191,27 @@ async def bind_account(
         raise BizError(4002, "", status_code=409)
 
     # 2. 
-    login_ok = await _stub_platform_login(
-        body.account_name, body.password, body.platform_type
+    adapter = JNDAdapter(
+        base_url=body.platform_url or None,
+        platform_type=body.platform_type,
     )
-    if not login_ok:
-        raise BizError(4003, "", status_code=400)
+    try:
+        login_result = await _login_platform_account(
+            adapter,
+            body.account_name,
+            body.password,
+        )
+    except CaptchaError as e:
+        raise BizError(4003, f"账号登录失败: {e}", status_code=400)
+    finally:
+        await adapter.close()
+
+    if not login_result.success:
+        raise BizError(
+            4003,
+            f"账号登录失败: {login_result.message}",
+            status_code=400,
+        )
 
     # 3. UNIQUE 
     try:
@@ -194,8 +262,6 @@ async def manual_login(
     if not account:
         raise BizError(4001, "", status_code=404)
 
-    # 
-    from app.engine.adapters.jnd import JNDAdapter
     adapter = JNDAdapter(
         base_url=account.get("platform_url") or None,
         platform_type=account.get("platform_type", "JND28WEB"),
@@ -203,7 +269,11 @@ async def manual_login(
     
     try:
         # 
-        login_result = await adapter.login(account["account_name"], account["password"])
+        login_result = await _login_platform_account(
+            adapter,
+            account["account_name"],
+            account["password"],
+        )
         logger.info(
             "account_id=%d success=%s message=%s",
             account_id,
@@ -231,6 +301,7 @@ async def manual_login(
             account_id=account_id,
             operator_id=operator["id"],
             status="online",
+            session_token=login_result.token,
             balance=balance_cents,
             last_login_at=now,
             login_fail_count=0,
@@ -277,6 +348,8 @@ async def manual_login(
         
         return ApiResponse[AccountInfo](data=_to_account_info(row))
         
+    except CaptchaError as e:
+        raise BizError(4003, f"验证码识别失败: {e}", status_code=400)
     except BizError:
         raise
     except Exception as e:

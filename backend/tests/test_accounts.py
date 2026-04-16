@@ -8,10 +8,13 @@
 - 
 """
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.api import accounts as accounts_api
+from app.engine.adapters.base import BalanceInfo, InstallInfo, LoginResult
 from app.main import app
 from app.schemas.account import mask_password
 from app.utils.auth import create_token, register_session, persist_jti
@@ -49,6 +52,37 @@ async def client():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def mock_platform_adapter(monkeypatch):
+    async def fake_login(self, account_name, password, captcha_code=None):
+        return LoginResult(success=True, token="platform-token")
+
+    async def fake_query_balance(self):
+        return BalanceInfo(balance=123.45)
+
+    async def fake_get_current_install(self):
+        return InstallInfo(
+            issue="3403606",
+            state=1,
+            close_countdown_sec=30,
+            pre_issue="3403605",
+            pre_result="1,2,3",
+            open_countdown_sec=40,
+        )
+
+    async def fake_load_odds(self, issue):
+        return {"DX1": 20530, "DS3": 19840}
+
+    async def fake_close(self):
+        return None
+
+    monkeypatch.setattr(accounts_api.JNDAdapter, "login", fake_login)
+    monkeypatch.setattr(accounts_api.JNDAdapter, "query_balance", fake_query_balance)
+    monkeypatch.setattr(accounts_api.JNDAdapter, "get_current_install", fake_get_current_install)
+    monkeypatch.setattr(accounts_api.JNDAdapter, "load_odds", fake_load_odds)
+    monkeypatch.setattr(accounts_api.JNDAdapter, "close", fake_close)
 
 
 # 
@@ -265,6 +299,65 @@ async def test_manual_login(client):
     assert body["code"] == 0
     assert body["data"]["status"] == "online"
     assert body["data"]["last_login_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_bind_account_rejects_platform_login_failure(client, monkeypatch):
+    """Bind should fail when remote platform validation fails."""
+    uid = _uid()
+    token, _ = await _create_operator(f"bindfail_{uid}", max_accounts=3)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    monkeypatch.setattr(
+        accounts_api,
+        "_login_platform_account",
+        AsyncMock(return_value=LoginResult(success=False, message="bad credentials")),
+    )
+
+    resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"bad_{uid}",
+            "password": "badpass123",
+            "platform_type": "JND28WEB",
+            "platform_url": "https://merchant.example.com",
+        },
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == 4003
+    assert "bad credentials" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_login_platform_account_retries_with_captcha():
+    """Manual and bind flows should fall back to OCR captcha login."""
+    adapter = AsyncMock()
+    adapter.login = AsyncMock(
+        side_effect=[
+            LoginResult(success=False, message="missing token cookie"),
+            LoginResult(success=True, token="captcha-token"),
+        ]
+    )
+    adapter.get_captcha = AsyncMock(return_value=b"captcha-image")
+
+    captcha_service = AsyncMock()
+    captcha_service.recognize = AsyncMock(return_value="1234")
+    captcha_service.shutdown = AsyncMock()
+
+    result = await accounts_api._login_platform_account(
+        adapter,
+        "demo",
+        "secret",
+        captcha_service=captcha_service,
+    )
+
+    assert result.success is True
+    assert result.token == "captcha-token"
+    assert adapter.get_captcha.await_count == 1
+    assert adapter.login.await_args_list[1].kwargs["captcha_code"] == "1234"
 
 
 @pytest.mark.asyncio
