@@ -83,6 +83,48 @@ DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_account_platform_sessions_account ON account_platform_sessions(account_id, platform_type);",
 
+    # 2.2 account_verification_runs
+    """
+    CREATE TABLE IF NOT EXISTS account_verification_runs (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id              INTEGER NOT NULL REFERENCES gambling_accounts(id) ON DELETE CASCADE,
+        run_status              TEXT NOT NULL DEFAULT 'running',
+        snapshot_game_type      TEXT NOT NULL,
+        snapshot_platform_url   TEXT,
+        snapshot_password_hash  TEXT NOT NULL,
+        stale                   INTEGER NOT NULL DEFAULT 0,
+        stale_reason            TEXT,
+        started_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        finished_at             TEXT,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_account_started ON account_verification_runs(account_id, started_at DESC);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_verification_runs_running ON account_verification_runs(account_id) WHERE run_status='running';",
+    "CREATE INDEX IF NOT EXISTS idx_verification_runs_account_status_stale ON account_verification_runs(account_id, run_status, stale);",
+
+    # 2.3 account_platform_capabilities
+    """
+    CREATE TABLE IF NOT EXISTS account_platform_capabilities (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        verification_run_id     INTEGER NOT NULL REFERENCES account_verification_runs(id) ON DELETE CASCADE,
+        platform_type           TEXT NOT NULL,
+        verify_status           TEXT NOT NULL DEFAULT 'unknown',
+        market_state            TEXT NOT NULL DEFAULT 'unknown',
+        detected_issue          TEXT,
+        last_verified_at        TEXT,
+        odds_synced             INTEGER NOT NULL DEFAULT 0,
+        odds_count              INTEGER NOT NULL DEFAULT 0,
+        odds_message            TEXT,
+        last_error              TEXT,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        UNIQUE(verification_run_id, platform_type)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_capabilities_run ON account_platform_capabilities(verification_run_id, platform_type);",
+
     # 3. strategies
     """
     CREATE TABLE IF NOT EXISTS strategies (
@@ -331,6 +373,8 @@ async def _reset_legacy_platform_binding_schema(db: aiosqlite.Connection) -> Non
         "bet_orders",
         "strategies",
         "reconcile_records",
+        "account_platform_capabilities",
+        "account_verification_runs",
         "account_odds",
         "gambling_accounts",
     ):

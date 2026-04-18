@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -38,6 +39,63 @@ def _is_dw3_group_token(token: str) -> bool:
 
 def make_runtime_key(account_id: int, platform_type: str) -> RuntimeKey:
     return account_id, (platform_type or "JND28WEB").upper()
+
+
+def _is_truthy_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _parse_effective_verification_run_id(account: dict[str, Any]) -> int | None:
+    raw = account.get("effective_verification_run_id")
+    if raw is None:
+        return None
+    try:
+        run_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return run_id if run_id > 0 else None
+
+
+def _parse_allowed_platform_types(value: object) -> set[str]:
+    if value is None:
+        return set()
+    raw_items: list[object]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return set()
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            raw_items = [item.strip() for item in stripped.split(",")]
+        else:
+            raw_items = decoded if isinstance(decoded, list) else [decoded]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    return {
+        str(raw or "").strip().upper()
+        for raw in raw_items
+        if str(raw or "").strip().upper() in {"JND28WEB", "JND282", "LUCKYSB"}
+    }
+
+
+def _is_platform_verified_for_restore(account: dict[str, Any], platform_type: str) -> bool:
+    effective_run_id = _parse_effective_verification_run_id(account)
+    if effective_run_id is None:
+        return False
+    if _is_truthy_flag(account.get("verification_stale")):
+        return False
+    allowed_platforms = _parse_allowed_platform_types(account.get("allowed_strategy_platform_types"))
+    return (platform_type or "").upper() in allowed_platforms
 
 
 def _runtime_key_matches_account(runtime_key: RuntimeKeyLike, account_id: int) -> bool:
@@ -330,9 +388,6 @@ class EngineManager:
             accounts = await db_ops.account_list_by_operator(self.db, operator_id=operator_id)
             strategies = await db_ops.strategy_list_by_operator(self.db, operator_id=operator_id)
             for account in accounts:
-                if account.get("status") != "online":
-                    continue
-
                 grouped: dict[str, list[dict[str, Any]]] = {}
                 for strategy in strategies:
                     if strategy.get("account_id") != account["id"] or strategy.get("status") != "running":
@@ -340,13 +395,22 @@ class EngineManager:
                     grouped.setdefault(strategy.get("platform_type") or "JND28WEB", []).append(strategy)
 
                 for platform_type, running_strategies in grouped.items():
+                    normalized_platform_type = (platform_type or "JND28WEB").upper()
+                    if not _is_platform_verified_for_restore(account, normalized_platform_type):
+                        logger.info(
+                            "skip restore worker operator_id=%d account_id=%d platform=%s gate=verification",
+                            operator_id,
+                            account["id"],
+                            normalized_platform_type,
+                        )
+                        continue
                     try:
                         await self.start_worker(
                             operator_id=operator_id,
                             account_id=account["id"],
                             account_name=account["account_name"],
                             password=account["password"],
-                            platform_type=platform_type,
+                            platform_type=normalized_platform_type,
                             platform_url=account.get("platform_url"),
                             strategies=running_strategies,
                         )

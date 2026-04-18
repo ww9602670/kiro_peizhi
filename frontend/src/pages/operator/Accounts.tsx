@@ -13,7 +13,7 @@ import {
   listAccounts,
   createAccount,
   deleteAccount,
-  loginAccount,
+  verifyAccount,
   logoutAccount,
   updateKillSwitch,
 } from '@/api/accounts';
@@ -26,21 +26,6 @@ import { useConfirm } from '@/hooks/useConfirm';
 import { useToast } from '@/hooks/useToast';
 import { getPlatformLabel } from '@/utils/platformLabels';
 import './Accounts.css';
-
-function getStatusBadgeClass(status: string): string {
-  switch (status) {
-    case 'online':
-      return 'badge-status-online';
-    case 'inactive':
-      return 'badge-status-inactive';
-    case 'login_error':
-      return 'badge-status-error';
-    case 'disabled':
-      return 'badge-status-disabled';
-    default:
-      return 'badge-status-inactive';
-  }
-}
 
 function getStatusLabel(status: string): string {
   switch (status) {
@@ -62,30 +47,127 @@ const ACCOUNT_GAME_OPTIONS: { value: AccountGameType; label: string }[] = [
   { value: 'LUCKYSB', label: getPlatformLabel('LUCKYSB') },
 ];
 
-function resolveAccountGameType(account: Pick<AccountInfo, 'game_type' | 'platform_type'>): string {
-  if (account.game_type) return account.game_type;
-  if (account.platform_type === 'LUCKYSB') return 'LUCKYSB';
-  if (account.platform_type === 'JND28WEB' || account.platform_type === 'JND282') return 'JND28';
-  return 'JND28';
-}
-
 function getGameTypeLabel(gameType: string): string {
   if (gameType === 'JND28') return '加拿大28';
   if (gameType === 'LUCKYSB') return getPlatformLabel('LUCKYSB');
   return gameType;
 }
 
-function resolveAccountPlatformOptions(
-  account: Pick<AccountInfo, 'allowed_strategy_platform_types' | 'game_type' | 'platform_type'>
-): string[] {
-  const explicit = Array.from(
-    new Set((account.allowed_strategy_platform_types ?? []).map((item) => `${item}`.toUpperCase()))
-  );
-  if (explicit.length > 0) return explicit;
+type AccountSummaryState =
+  | 'not_verified'
+  | 'verified'
+  | 'partially_available'
+  | 'failed'
+  | 'stale'
+  | 'verifying';
 
-  const gameType = resolveAccountGameType(account);
-  if (gameType === 'LUCKYSB') return ['LUCKYSB'];
-  return ['JND28WEB', 'JND282'];
+function normalizePlatformType(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toUpperCase();
+  if (!normalized) return null;
+  return normalized;
+}
+
+function resolveAccountGameTypeNoFallback(account: Pick<AccountInfo, 'game_type'>): string {
+  if (!account.game_type) return '';
+  return `${account.game_type}`.toUpperCase();
+}
+
+function resolveVerifiedPlatformOptions(
+  account: Pick<AccountInfo, 'allowed_strategy_platform_types' | 'platform_capabilities'>
+): string[] {
+  const fromAllowed = Array.from(
+    new Set((account.allowed_strategy_platform_types ?? []).map(normalizePlatformType).filter(Boolean))
+  ) as string[];
+  if (fromAllowed.length > 0) return fromAllowed;
+
+  return Array.from(
+    new Set(
+      (account.platform_capabilities ?? [])
+        .filter((item) => `${item.verify_status}`.toLowerCase() === 'supported')
+        .map((item) => normalizePlatformType(item.platform_type))
+        .filter(Boolean)
+    )
+  ) as string[];
+}
+
+function resolveSummaryState(account: AccountInfo): AccountSummaryState {
+  if (account.verification_in_progress) return 'verifying';
+  if (account.verification_stale) return 'stale';
+
+  switch (account.summary_status_reason) {
+    case 'not_verified':
+      return 'not_verified';
+    case 'probe_partial_failure':
+      return 'partially_available';
+    case 'unsupported_only':
+    case 'probe_failed_only':
+    case 'unsupported_with_probe_failed':
+      return 'failed';
+    default:
+      break;
+  }
+
+  if (typeof account.effective_verification_run_id === 'number' && account.effective_verification_run_id > 0) {
+    return 'verified';
+  }
+
+  return 'not_verified';
+}
+
+function getSummaryBadgeClass(summaryState: AccountSummaryState): string {
+  switch (summaryState) {
+    case 'verified':
+      return 'badge-status-online';
+    case 'partially_available':
+      return 'badge-status-inactive';
+    case 'failed':
+    case 'stale':
+      return 'badge-status-error';
+    case 'verifying':
+      return 'badge-status-disabled';
+    default:
+      return 'badge-status-inactive';
+  }
+}
+
+function getSummaryLabel(summaryState: AccountSummaryState): string {
+  switch (summaryState) {
+    case 'verified':
+      return '已验证';
+    case 'partially_available':
+      return '部分可用';
+    case 'failed':
+      return '验证失败';
+    case 'stale':
+      return '需重验';
+    case 'verifying':
+      return '验证中';
+    default:
+      return '未验证';
+  }
+}
+
+function getSummaryStatusReasonLabel(
+  reason: AccountInfo['summary_status_reason'],
+  verificationStale: boolean | undefined
+): string | null {
+  if (verificationStale) return '验证结果已失效，请重新验证';
+
+  switch (reason) {
+    case 'not_verified':
+      return '尚未完成验证';
+    case 'probe_partial_failure':
+      return '部分平台探测失败';
+    case 'unsupported_only':
+      return '平台不支持';
+    case 'probe_failed_only':
+      return '平台探测异常';
+    case 'unsupported_with_probe_failed':
+      return '平台不支持且存在探测异常';
+    default:
+      return null;
+  }
 }
 
 interface AccountsProps {
@@ -174,10 +256,10 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
     }
   };
 
-  const handleLogin = async (id: number) => {
-    setActionLoading((prev) => ({ ...prev, [id]: 'login' }));
+  const handleVerify = async (id: number) => {
+    setActionLoading((prev) => ({ ...prev, [id]: 'verify' }));
     try {
-      await loginAccount(id);
+      await verifyAccount(id);
       await fetchAccounts();
     } catch (err) {
       showToast(isApiError(err) ? err.message : '验证失败');
@@ -390,7 +472,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
               key={account.id}
               account={account}
               actionLoading={actionLoading[account.id]}
-              onLogin={handleLogin}
+              onVerify={handleVerify}
               onLogout={handleLogout}
               onDelete={handleDelete}
               onKillSwitch={handleKillSwitch}
@@ -528,7 +610,7 @@ function groupOdds(items: OddsItem[]): { label: string; items: OddsItem[] }[] {
 interface AccountCardProps {
   account: AccountInfo;
   actionLoading?: string;
-  onLogin: (id: number) => void;
+  onVerify: (id: number) => void;
   onLogout: (id: number) => void;
   onDelete: (id: number, name: string) => void;
   onKillSwitch: (id: number, currentEnabled: boolean) => void;
@@ -539,7 +621,7 @@ interface AccountCardProps {
 function AccountCard({
   account,
   actionLoading,
-  onLogin,
+  onVerify,
   onLogout,
   onDelete,
   onKillSwitch,
@@ -554,24 +636,34 @@ function AccountCard({
   const [refreshLoading, setRefreshLoading] = useState(false);
   const [refreshMsg, setRefreshMsg] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
   const [periodInfo, setPeriodInfo] = useState<PeriodInfo | null>(null);
-  const oddsPlatformOptions = resolveAccountPlatformOptions(account);
+  const oddsPlatformOptions = resolveVerifiedPlatformOptions(account);
   const oddsPlatformKey = oddsPlatformOptions.join('|');
-  const [selectedOddsPlatform, setSelectedOddsPlatform] = useState<string>(oddsPlatformOptions[0] ?? 'JND28WEB');
+  const [selectedOddsPlatform, setSelectedOddsPlatform] = useState<string>(oddsPlatformOptions[0] ?? '');
   const structuredOddsSync = resolveAccountOddsSyncStatus(account);
-  const selectedPlatformLabel = getPlatformLabel(selectedOddsPlatform);
+  const selectedPlatformLabel = selectedOddsPlatform ? getPlatformLabel(selectedOddsPlatform) : '--';
   const useStructuredOddsStatus = oddsPlatformOptions.length === 1;
   const displayOddsStatus = (useStructuredOddsStatus ? structuredOddsSync?.status : null) ?? oddsStatus;
   const displayOddsLabel = (useStructuredOddsStatus ? structuredOddsSync?.label : null) ?? getOddsLabel(oddsStatus);
-  const accountGameType = resolveAccountGameType(account);
+  const accountGameType = resolveAccountGameTypeNoFallback(account);
+  const summaryState = resolveSummaryState(account);
+  const summaryReason = getSummaryStatusReasonLabel(account.summary_status_reason, account.verification_stale);
+  const hasEffectiveVerification =
+    typeof account.effective_verification_run_id === 'number' && account.effective_verification_run_id > 0;
+  const platformBadgeText =
+    oddsPlatformOptions.length > 0 ? oddsPlatformOptions.map((item) => getPlatformLabel(item)).join(' / ') : '未验证平台';
+  const canRunOddsPanel = account.status === 'online' && selectedOddsPlatform.length > 0;
+  const verifyButtonLabel = hasEffectiveVerification ? '重新验证账号' : '验证账号';
+  const isVerifying = account.verification_in_progress || actionLoading === 'verify';
+  const canCreateStrategy = oddsPlatformOptions.length > 0;
 
   useEffect(() => {
     setSelectedOddsPlatform((current) =>
-      oddsPlatformOptions.includes(current) ? current : (oddsPlatformOptions[0] ?? 'JND28WEB')
+      oddsPlatformOptions.includes(current) ? current : (oddsPlatformOptions[0] ?? '')
     );
   }, [oddsPlatformKey]);
 
   const fetchOddsStatus = useCallback(async () => {
-    if (account.status !== 'online') {
+    if (account.status !== 'online' || !selectedOddsPlatform) {
       setOddsStatus('none');
       setOddsItems([]);
       return;
@@ -650,9 +742,9 @@ function AccountCard({
       <div className="account-card-header">
         <h3 className="account-name">{account.account_name}</h3>
         <div className="account-badges">
-          <span className="badge badge-platform">{getGameTypeLabel(accountGameType)}</span>
-          <span className={`badge ${getStatusBadgeClass(account.status)}`}>
-            {getStatusLabel(account.status)}
+          <span className="badge badge-platform">{platformBadgeText}</span>
+          <span className={`badge ${getSummaryBadgeClass(summaryState)}`}>
+            {getSummaryLabel(summaryState)}
           </span>
         </div>
       </div>
@@ -665,6 +757,10 @@ function AccountCard({
         <div className="account-info-item">
           <span className="account-info-label">密码</span>
           <span className="account-info-value">{account.password_masked}</span>
+        </div>
+        <div className="account-info-item">
+          <span className="account-info-label">游戏类型</span>
+          <span className="account-info-value">{getGameTypeLabel(accountGameType)}</span>
         </div>
         {account.platform_url && (
           <div className="account-info-item">
@@ -684,6 +780,12 @@ function AccountCard({
             {displayOddsLabel}
           </span>
         </div>
+        {summaryReason && (
+          <div className="account-info-item">
+            <span className="account-info-label">验证说明</span>
+            <span className="account-info-value">{summaryReason}</span>
+          </div>
+        )}
         {oddsItems.length > 0 && (
           <div className="account-info-item">
             <span className="account-info-label">赔率数量</span>
@@ -693,7 +795,7 @@ function AccountCard({
       </div>
 
       {/* Odds Detail Panel */}
-      {account.status === 'online' && (
+      {canRunOddsPanel && (
         <div className="odds-panel">
           <div
             className="odds-panel-header"
@@ -861,7 +963,7 @@ function AccountCard({
       </div>
 
       <div className="account-actions">
-        {account.status === 'online' ? (
+        {summaryState === 'verified' ? (
           <button
             type="button"
             className="action-btn action-btn-delete"
@@ -874,10 +976,10 @@ function AccountCard({
           <button
             type="button"
             className="action-btn action-btn-login"
-            onClick={() => onLogin(account.id)}
-            disabled={isActioning}
+            onClick={() => onVerify(account.id)}
+            disabled={isActioning || isVerifying}
           >
-            {actionLoading === 'login' ? '验证中...' : '验证账号'}
+            {isVerifying ? '验证中...' : verifyButtonLabel}
           </button>
         )}
         <button
@@ -893,7 +995,7 @@ function AccountCard({
             type="button"
             className="action-btn action-btn-edit"
             onClick={() => onCreateStrategy(account.id)}
-            disabled={isActioning}
+            disabled={isActioning || isVerifying || !canCreateStrategy}
           >
             去创建策略
           </button>

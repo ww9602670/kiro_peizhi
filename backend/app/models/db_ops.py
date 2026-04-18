@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Any, Optional
 
@@ -30,6 +31,18 @@ def _now() -> str:
     """返回北京时间（UTC+8）字符串"""
     from datetime import timezone, timedelta
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_minus_minutes(minutes: int) -> str:
+    from datetime import timezone, timedelta
+
+    return (
+        datetime.now(timezone(timedelta(hours=8))) - timedelta(minutes=minutes)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _password_hash(password: str) -> str:
+    return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
 
 
 # 
@@ -158,7 +171,10 @@ async def account_get_by_id(
         "SELECT * FROM gambling_accounts WHERE id=? AND operator_id=?",
         (account_id, operator_id),
     )).fetchone()
-    return _row_to_dict(row)
+    record = _row_to_dict(row)
+    if not record:
+        return None
+    return await _attach_account_verification_view(db, record)
 
 
 async def account_list_by_operator(
@@ -168,7 +184,11 @@ async def account_list_by_operator(
         "SELECT * FROM gambling_accounts WHERE operator_id=? ORDER BY id",
         (operator_id,),
     )).fetchall()
-    return _rows_to_list(rows)
+    records = _rows_to_list(rows)
+    enriched: list[dict[str, Any]] = []
+    for record in records:
+        enriched.append(await _attach_account_verification_view(db, record))
+    return enriched
 
 
 async def account_update(
@@ -180,6 +200,9 @@ async def account_update(
 ) -> dict[str, Any] | None:
     if not fields:
         return await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
+    existing = await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
+    if not existing:
+        return None
     allowed = {
         "password", "status", "session_token", "balance",
         "login_fail_count", "last_login_at", "kill_switch",
@@ -189,6 +212,11 @@ async def account_update(
     filtered = {k: v for k, v in fields.items() if k in allowed}
     if not filtered:
         return await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
+    stale_watch_fields = {"password", "platform_url", "game_type"}
+    should_mark_stale = any(
+        key in filtered and filtered[key] != existing.get(key)
+        for key in stale_watch_fields
+    )
     filtered["updated_at"] = _now()
     set_clause = ", ".join(f"{k}=?" for k in filtered)
     values = list(filtered.values()) + [account_id, operator_id]
@@ -196,6 +224,12 @@ async def account_update(
         f"UPDATE gambling_accounts SET {set_clause} WHERE id=? AND operator_id=?",
         tuple(values),
     )
+    if should_mark_stale:
+        await account_verification_runs_mark_stale_by_account(
+            db,
+            account_id=account_id,
+            stale_reason="account_fields_changed",
+        )
     await db.commit()
     return await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
 
@@ -239,6 +273,470 @@ async def account_delete(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+# 
+# 2.1 account_verification_runs CRUD
+# 
+
+async def account_verification_run_create(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    snapshot_game_type: str,
+    snapshot_platform_url: str | None,
+    snapshot_password_hash: str,
+    run_status: str = "running",
+) -> dict[str, Any]:
+    now = _now()
+    cursor = await db.execute(
+        """INSERT INTO account_verification_runs
+           (account_id, run_status, snapshot_game_type, snapshot_platform_url,
+            snapshot_password_hash, stale, started_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+        (
+            account_id,
+            run_status,
+            snapshot_game_type,
+            snapshot_platform_url,
+            snapshot_password_hash,
+            now,
+            now,
+            now,
+        ),
+    )
+    await db.commit()
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_verification_runs WHERE id=?",
+            (cursor.lastrowid,),
+        )
+    ).fetchone()
+    return _row_to_dict(row)  # type: ignore
+
+
+async def account_verification_run_get_by_id(
+    db: aiosqlite.Connection,
+    *,
+    verification_run_id: int,
+) -> dict[str, Any] | None:
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_verification_runs WHERE id=?",
+            (verification_run_id,),
+        )
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+async def account_verification_run_get_latest(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+) -> dict[str, Any] | None:
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_verification_runs WHERE account_id=? ORDER BY id DESC LIMIT 1",
+            (account_id,),
+        )
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+async def account_verification_run_get_latest_completed(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+) -> dict[str, Any] | None:
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_verification_runs "
+            "WHERE account_id=? AND run_status='completed' ORDER BY id DESC LIMIT 1",
+            (account_id,),
+        )
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+async def account_verification_run_get_effective(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+) -> dict[str, Any] | None:
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_verification_runs "
+            "WHERE account_id=? AND run_status='completed' AND stale=0 "
+            "ORDER BY id DESC LIMIT 1",
+            (account_id,),
+        )
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+async def account_verification_run_get_running(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+) -> dict[str, Any] | None:
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_verification_runs "
+            "WHERE account_id=? AND run_status='running' ORDER BY id DESC LIMIT 1",
+            (account_id,),
+        )
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+async def account_verification_run_list_by_account(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+) -> list[dict[str, Any]]:
+    rows = await (
+        await db.execute(
+            "SELECT * FROM account_verification_runs WHERE account_id=? ORDER BY id DESC",
+            (account_id,),
+        )
+    ).fetchall()
+    return _rows_to_list(rows)
+
+
+async def account_verification_run_update(
+    db: aiosqlite.Connection,
+    *,
+    verification_run_id: int,
+    **fields: Any,
+) -> dict[str, Any] | None:
+    if not fields:
+        return await account_verification_run_get_by_id(
+            db, verification_run_id=verification_run_id
+        )
+    allowed = {
+        "run_status",
+        "stale",
+        "stale_reason",
+        "finished_at",
+        "started_at",
+    }
+    filtered = {k: v for k, v in fields.items() if k in allowed}
+    if not filtered:
+        return await account_verification_run_get_by_id(
+            db, verification_run_id=verification_run_id
+        )
+    filtered["updated_at"] = _now()
+    set_clause = ", ".join(f"{k}=?" for k in filtered)
+    values = list(filtered.values()) + [verification_run_id]
+    await db.execute(
+        f"UPDATE account_verification_runs SET {set_clause} WHERE id=?",
+        tuple(values),
+    )
+    await db.commit()
+    return await account_verification_run_get_by_id(
+        db, verification_run_id=verification_run_id
+    )
+
+
+async def account_verification_run_complete(
+    db: aiosqlite.Connection,
+    *,
+    verification_run_id: int,
+    capabilities: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    now = _now()
+    await db.execute(
+        "DELETE FROM account_platform_capabilities WHERE verification_run_id=?",
+        (verification_run_id,),
+    )
+    for capability in capabilities:
+        await db.execute(
+            """INSERT INTO account_platform_capabilities
+               (verification_run_id, platform_type, verify_status, market_state,
+                detected_issue, last_verified_at, odds_synced, odds_count, odds_message,
+                last_error, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                verification_run_id,
+                capability.get("platform_type"),
+                capability.get("verify_status", "unknown"),
+                capability.get("market_state", "unknown"),
+                capability.get("detected_issue"),
+                capability.get("last_verified_at"),
+                1 if capability.get("odds_synced") else 0,
+                int(capability.get("odds_count") or 0),
+                capability.get("odds_message"),
+                capability.get("last_error"),
+                now,
+                now,
+            ),
+        )
+    await db.execute(
+        """UPDATE account_verification_runs
+           SET run_status='completed', finished_at=?, updated_at=?
+           WHERE id=?""",
+        (now, now, verification_run_id),
+    )
+    await db.commit()
+    return await account_verification_run_get_by_id(
+        db, verification_run_id=verification_run_id
+    )
+
+
+async def account_verification_run_fail(
+    db: aiosqlite.Connection,
+    *,
+    verification_run_id: int,
+    run_status: str = "failed",
+    stale_reason: str | None = None,
+) -> dict[str, Any] | None:
+    now = _now()
+    update_fields: dict[str, Any] = {
+        "run_status": run_status,
+        "finished_at": now,
+        "updated_at": now,
+    }
+    if stale_reason is not None:
+        update_fields["stale_reason"] = stale_reason
+    set_clause = ", ".join(f"{k}=?" for k in update_fields)
+    values = list(update_fields.values()) + [verification_run_id]
+    await db.execute(
+        f"UPDATE account_verification_runs SET {set_clause} WHERE id=?",
+        tuple(values),
+    )
+    await db.commit()
+    return await account_verification_run_get_by_id(
+        db, verification_run_id=verification_run_id
+    )
+
+
+async def account_verification_runs_mark_stale_by_account(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    stale_reason: str,
+) -> int:
+    now = _now()
+    cursor = await db.execute(
+        """UPDATE account_verification_runs
+           SET stale=1, stale_reason=?, updated_at=?
+           WHERE account_id=? AND run_status='completed' AND stale=0""",
+        (stale_reason, now, account_id),
+    )
+    return cursor.rowcount
+
+
+async def account_verification_runs_refresh_stale(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    current_game_type: str,
+    current_platform_url: str | None,
+    current_password: str,
+    verification_ttl_minutes: int,
+) -> None:
+    now = _now()
+    ttl_cutoff = _now_minus_minutes(verification_ttl_minutes)
+    mutated = False
+
+    ttl_cursor = await db.execute(
+        """UPDATE account_verification_runs
+           SET stale=1, stale_reason='ttl_expired', updated_at=?
+           WHERE account_id=? AND run_status='completed' AND stale=0 AND started_at < ?""",
+        (now, account_id, ttl_cutoff),
+    )
+    if ttl_cursor.rowcount > 0:
+        mutated = True
+
+    rows = await (
+        await db.execute(
+            """SELECT id, snapshot_game_type, snapshot_platform_url, snapshot_password_hash
+               FROM account_verification_runs
+               WHERE account_id=? AND run_status='completed' AND stale=0""",
+            (account_id,),
+        )
+    ).fetchall()
+    expected_hash = _password_hash(current_password)
+    stale_ids: list[int] = []
+    current_url = current_platform_url or None
+    for row in rows:
+        if (
+            row["snapshot_game_type"] != current_game_type
+            or (row["snapshot_platform_url"] or None) != current_url
+            or row["snapshot_password_hash"] != expected_hash
+        ):
+            stale_ids.append(int(row["id"]))
+
+    if stale_ids:
+        placeholders = ", ".join("?" for _ in stale_ids)
+        await db.execute(
+            f"""UPDATE account_verification_runs
+                SET stale=1, stale_reason='account_fields_changed', updated_at=?
+                WHERE id IN ({placeholders})""",
+            (now, *stale_ids),
+        )
+        mutated = True
+
+    if mutated:
+        await db.commit()
+
+
+def _build_summary_status_reason(capabilities: list[dict[str, Any]]) -> str | None:
+    if not capabilities:
+        return "not_verified"
+
+    supported_count = sum(1 for item in capabilities if item.get("verify_status") == "supported")
+    unsupported_count = sum(1 for item in capabilities if item.get("verify_status") == "unsupported")
+    probe_failed_count = sum(1 for item in capabilities if item.get("verify_status") == "probe_failed")
+
+    if supported_count >= 1 and probe_failed_count == 0:
+        return None
+    if supported_count >= 1 and probe_failed_count >= 1:
+        return "probe_partial_failure"
+    if supported_count == 0 and unsupported_count >= 1 and probe_failed_count == 0:
+        return "unsupported_only"
+    if supported_count == 0 and probe_failed_count >= 1 and unsupported_count == 0:
+        return "probe_failed_only"
+    if supported_count == 0 and unsupported_count >= 1 and probe_failed_count >= 1:
+        return "unsupported_with_probe_failed"
+    return "not_verified"
+
+
+async def _attach_account_verification_view(
+    db: aiosqlite.Connection,
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    await account_verification_runs_refresh_stale(
+        db,
+        account_id=int(account["id"]),
+        current_game_type=str(account["game_type"]),
+        current_platform_url=account.get("platform_url"),
+        current_password=str(account.get("password") or ""),
+        verification_ttl_minutes=30,
+    )
+
+    latest_run = await account_verification_run_get_latest(db, account_id=int(account["id"]))
+    effective_run = await account_verification_run_get_effective(db, account_id=int(account["id"]))
+    running_run = await account_verification_run_get_running(db, account_id=int(account["id"]))
+    latest_completed_run = await account_verification_run_get_latest_completed(
+        db, account_id=int(account["id"])
+    )
+
+    capabilities: list[dict[str, Any]] = []
+    if effective_run:
+        raw_capabilities = await account_platform_capability_list_by_run(
+            db,
+            verification_run_id=int(effective_run["id"]),
+        )
+        capabilities = [
+            {
+                "platform_type": item.get("platform_type"),
+                "verify_status": item.get("verify_status"),
+                "market_state": item.get("market_state"),
+                "detected_issue": item.get("detected_issue"),
+                "last_verified_at": item.get("last_verified_at"),
+                "odds_synced": bool(item.get("odds_synced")),
+                "odds_count": int(item.get("odds_count") or 0),
+                "odds_message": item.get("odds_message"),
+                "last_error": item.get("last_error"),
+            }
+            for item in raw_capabilities
+        ]
+
+    verification_stale = bool(
+        latest_completed_run and int(latest_completed_run.get("stale") or 0) == 1
+    )
+    allowed_strategy_platform_types = [
+        str(item["platform_type"]).upper()
+        for item in capabilities
+        if item.get("verify_status") == "supported"
+    ]
+
+    account["latest_verification_run_id"] = latest_run["id"] if latest_run else None
+    account["effective_verification_run_id"] = effective_run["id"] if effective_run else None
+    account["verification_in_progress"] = running_run is not None
+    account["verification_stale"] = verification_stale
+    account["allowed_strategy_platform_types"] = allowed_strategy_platform_types
+    account["platform_capabilities"] = capabilities
+    account["summary_status_reason"] = _build_summary_status_reason(capabilities)
+    return account
+
+
+# 
+# 2.2 account_platform_capabilities CRUD
+# 
+
+async def account_platform_capability_create(
+    db: aiosqlite.Connection,
+    *,
+    verification_run_id: int,
+    platform_type: str,
+    verify_status: str,
+    market_state: str,
+    detected_issue: str | None = None,
+    last_verified_at: str | None = None,
+    odds_synced: bool = False,
+    odds_count: int = 0,
+    odds_message: str | None = None,
+    last_error: str | None = None,
+) -> dict[str, Any]:
+    now = _now()
+    cursor = await db.execute(
+        """INSERT INTO account_platform_capabilities
+           (verification_run_id, platform_type, verify_status, market_state, detected_issue,
+            last_verified_at, odds_synced, odds_count, odds_message, last_error, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            verification_run_id,
+            platform_type,
+            verify_status,
+            market_state,
+            detected_issue,
+            last_verified_at,
+            1 if odds_synced else 0,
+            odds_count,
+            odds_message,
+            last_error,
+            now,
+            now,
+        ),
+    )
+    await db.commit()
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_platform_capabilities WHERE id=?",
+            (cursor.lastrowid,),
+        )
+    ).fetchone()
+    return _row_to_dict(row)  # type: ignore
+
+
+async def account_platform_capability_list_by_run(
+    db: aiosqlite.Connection,
+    *,
+    verification_run_id: int,
+) -> list[dict[str, Any]]:
+    rows = await (
+        await db.execute(
+            "SELECT * FROM account_platform_capabilities "
+            "WHERE verification_run_id=? ORDER BY platform_type ASC",
+            (verification_run_id,),
+        )
+    ).fetchall()
+    return _rows_to_list(rows)
+
+
+async def account_platform_capability_delete_by_run(
+    db: aiosqlite.Connection,
+    *,
+    verification_run_id: int,
+) -> int:
+    cursor = await db.execute(
+        "DELETE FROM account_platform_capabilities WHERE verification_run_id=?",
+        (verification_run_id,),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 # 

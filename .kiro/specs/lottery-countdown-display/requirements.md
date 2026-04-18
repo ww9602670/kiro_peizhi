@@ -7,6 +7,23 @@
 2. SaaS 页面缺少实时的封盘倒计时和开奖倒计时显示
 3. 应该直接使用平台 API 返回的 `State` 字段来判断下注状态
 
+## 1.1 上游契约依赖
+
+- 本 spec 在账号绑定、账号验证、平台可用范围、策略平台门禁、账号摘要状态等共享语义上，必须以上游 `account-strategy-platform-decoupling` 为唯一事实源。
+- 当前发布窗口的冻结基线维护者为 `Codex`（本分支上游实现 owner）；若倒计时或下注时机优化与共享文件实现出现冲突，先回到上游契约对齐，不得在本 spec 内重开 `game_type -> platform`、`/accounts/{id}/login` 主契约、或静态平台推导。
+- 上游查阅入口：
+  - `.kiro/specs/account-strategy-platform-decoupling/requirements.md`
+  - `.kiro/specs/account-strategy-platform-decoupling/design.md`
+  - `.kiro/specs/account-strategy-platform-decoupling/tasks.md`
+  - `backend/app/api/accounts.py`
+  - `backend/app/api/strategies.py`
+  - `backend/app/engine/manager.py`
+  - `frontend/src/pages/operator/Accounts.tsx`
+  - `frontend/src/pages/operator/StrategyForm.tsx`
+  - `frontend/src/api/accounts.ts`
+  - `frontend/src/types/api/account.ts`
+- 若本 spec 发现契约缺口、执行语义漂移或共享写集冲突，必须先在上游 `account-strategy-platform-decoupling` 补决议或补实现，再由本 spec 跟随消费，不得本地分叉账号/平台语义。
+
 ## 2. 功能需求
 
 ### 2.1 后端 API 改进

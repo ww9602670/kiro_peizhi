@@ -195,7 +195,7 @@ class E2ETestContext:
         self._set_phase(E2EPhase.ACCOUNT_LOGIN)
         
         resp = await self.client.post(
-            f"/api/v1/accounts/{account_id}/login",
+            f"/api/v1/accounts/{account_id}/verify",
             headers=self._get_headers(),
         )
         

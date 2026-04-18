@@ -14,7 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from app.api import accounts as accounts_api
 import app.database as _db_module
 from app.database import close_shared_db, get_shared_db
-from app.engine.adapters.base import LoginResult
+from app.engine.adapters.base import BalanceInfo, InstallInfo, LoginResult
 from app.main import app
 
 
@@ -50,6 +50,38 @@ async def client():
 
 @pytest.fixture(autouse=True)
 def mock_account_bind_login(monkeypatch):
+    class FakeAdapter:
+        def __init__(self, platform_type="JND28WEB", platform_url=None):
+            self.platform_type = platform_type
+            self.platform_url = platform_url
+
+        async def login(self, account_name, password, captcha_code=None):
+            return LoginResult(success=True, token="platform-token")
+
+        async def query_balance(self):
+            return BalanceInfo(balance=123.45)
+
+        async def get_current_install(self):
+            return InstallInfo(
+                issue="3403606",
+                state=1,
+                close_countdown_sec=30,
+                pre_issue="3403605",
+                pre_result="1,2,3",
+                open_countdown_sec=40,
+            )
+
+        async def load_odds(self, issue):
+            return {"DX1": 20530, "DS3": 19840}
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        accounts_api,
+        "create_platform_adapter",
+        lambda platform_type, platform_url=None: FakeAdapter(platform_type, platform_url),
+    )
     monkeypatch.setattr(
         accounts_api,
         "_login_platform_account",
@@ -142,15 +174,24 @@ async def test_full_api_flow(client):
     account = resp.json()["data"]
     account_id = account["id"]
     assert account["game_type"] == "JND28"
-    assert "JND28WEB" in account["allowed_strategy_platform_types"]
+    assert account["allowed_strategy_platform_types"] == []
+    assert account["effective_verification_run_id"] is None
+    assert account["odds_message"] == "account bound, please verify account"
     assert account["password_masked"].endswith("****")
 
     # 5. 
+    resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=op_headers)
+    assert resp.json()["code"] == 0
+    verified_account = resp.json()["data"]
+    assert "JND28WEB" in verified_account["allowed_strategy_platform_types"]
+    assert verified_account["effective_verification_run_id"] is not None
+
+    # 6. 
     resp = await client.get("/api/v1/accounts", headers=op_headers)
     assert resp.json()["code"] == 0
     assert len(resp.json()["data"]) == 1
 
-    # 6. 
+    # 7. 
     resp = await client.post(
         "/api/v1/strategies",
         headers=op_headers,
@@ -168,17 +209,17 @@ async def test_full_api_flow(client):
     assert strategy["type"] == "flat"
     assert strategy["status"] == "stopped"
 
-    # 7. 
+    # 8. 
     resp = await client.get("/api/v1/strategies", headers=op_headers)
     assert resp.json()["code"] == 0
     assert len(resp.json()["data"]) == 1
 
-    # 8. 
+    # 9. 
     resp = await client.get("/api/v1/bet-orders", headers=op_headers)
     assert resp.json()["code"] == 0
     assert resp.json()["data"]["paged"]["total"] == 0
 
-    # 9. 
+    # 10. 
     resp = await client.get("/api/v1/dashboard", headers=op_headers)
     assert resp.json()["code"] == 0
     dash = resp.json()["data"]
@@ -189,16 +230,16 @@ async def test_full_api_flow(client):
     assert "recent_bets" in dash or "pending_bets" in dash
     assert "unread_alerts" in dash
 
-    # 10. 
+    # 11. 
     resp = await client.get("/api/v1/alerts", headers=op_headers)
     assert resp.json()["code"] == 0
 
-    # 11. 
+    # 12. 
     resp = await client.get("/api/v1/alerts/unread-count", headers=op_headers)
     assert resp.json()["code"] == 0
     assert resp.json()["data"]["count"] == 0
 
-    # 12. 
+    # 13. 
     resp = await client.get("/api/v1/admin/dashboard", headers=admin_headers)
     assert resp.json()["code"] == 0
     summaries = resp.json()["data"]["operator_summaries"]
@@ -293,7 +334,7 @@ async def test_accounts_cross_delete_404(two_operators):
 
 #  strategies  
 
-async def _create_account_for(client, headers) -> int:
+async def _create_account_for(client, headers, *, verify: bool = True) -> int:
     """ account_id"""
     uid = _uid()
     resp = await client.post(
@@ -305,7 +346,12 @@ async def _create_account_for(client, headers) -> int:
             "platform_url": _platform_url("JND28WEB"),
         },
     )
-    return resp.json()["data"]["id"]
+    assert resp.json()["code"] == 0
+    account_id = resp.json()["data"]["id"]
+    if verify:
+        verify_resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+        assert verify_resp.json()["code"] == 0
+    return account_id
 
 
 @pytest.mark.asyncio

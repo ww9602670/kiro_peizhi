@@ -139,7 +139,12 @@ async def test_bind_account(client):
     assert data["account_name"] == f"player_{uid}"
     assert data["password_masked"] == "te****"
     assert data["game_type"] == "JND28"
-    assert data["allowed_strategy_platform_types"] == ["JND28WEB", "JND282"]
+    assert data["allowed_strategy_platform_types"] == []
+    assert data["platform_capabilities"] == []
+    assert data["latest_verification_run_id"] is None
+    assert data["effective_verification_run_id"] is None
+    assert data["verification_stale"] is False
+    assert data["summary_status_reason"] == "not_verified"
     assert data["status"] == "inactive"
     assert data["balance"] == 0.0
     assert data["kill_switch"] is False
@@ -167,7 +172,8 @@ async def test_bind_luckysb_account_uses_factory(client):
     body = resp.json()
     assert body["code"] == 0
     assert body["data"]["game_type"] == "LUCKYSB"
-    assert body["data"]["allowed_strategy_platform_types"] == ["LUCKYSB"]
+    assert body["data"]["allowed_strategy_platform_types"] == []
+    assert body["data"]["summary_status_reason"] == "not_verified"
     assert body["data"]["platform_url"] == "https://member.example.com"
 
 
@@ -378,8 +384,8 @@ async def test_unbind_nonexistent_account(client):
 # 
 
 @pytest.mark.asyncio
-async def test_manual_login(client):
-    """ online"""
+async def test_account_verify(client):
+    """Verify endpoint should return effective verification capabilities."""
     uid = _uid()
     token, _ = await _create_operator(f"loginop_{uid}")
     headers = {"Authorization": f"Bearer {token}"}
@@ -396,17 +402,24 @@ async def test_manual_login(client):
     )
     account_id = create_resp.json()["data"]["id"]
 
-    resp = await client.post(f"/api/v1/accounts/{account_id}/login", headers=headers)
+    resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
     assert body["data"]["status"] == "online"
     assert body["data"]["last_login_at"] is not None
+    assert body["data"]["latest_verification_run_id"] is not None
+    assert body["data"]["effective_verification_run_id"] is not None
+    assert body["data"]["latest_verification_run_id"] == body["data"]["effective_verification_run_id"]
+    assert sorted(body["data"]["allowed_strategy_platform_types"]) == ["JND282", "JND28WEB"]
+    assert len(body["data"]["platform_capabilities"]) == 2
+    assert body["data"]["verification_stale"] is False
+    assert body["data"]["summary_status_reason"] is None
 
 
 @pytest.mark.asyncio
-async def test_bind_account_rejects_platform_login_failure(client, monkeypatch):
-    """Bind should fail when remote platform validation fails."""
+async def test_bind_account_does_not_require_platform_login(client, monkeypatch):
+    """Bind should persist static account info even when remote login would fail."""
     uid = _uid()
     token, _ = await _create_operator(f"bindfail_{uid}", max_accounts=3)
     headers = {"Authorization": f"Bearer {token}"}
@@ -428,10 +441,10 @@ async def test_bind_account_rejects_platform_login_failure(client, monkeypatch):
         },
     )
 
-    assert resp.status_code == 400
+    assert resp.status_code == 200
     body = resp.json()
-    assert body["code"] == 4003
-    assert "bad credentials" in body["message"]
+    assert body["code"] == 0
+    assert body["data"]["allowed_strategy_platform_types"] == []
 
 
 @pytest.mark.asyncio
@@ -464,14 +477,181 @@ async def test_login_platform_account_retries_with_captcha():
 
 
 @pytest.mark.asyncio
-async def test_manual_login_nonexistent(client):
+async def test_verify_account_nonexistent(client):
     """ 404"""
     uid = _uid()
     token, _ = await _create_operator(f"loginne_{uid}")
     headers = {"Authorization": f"Bearer {token}"}
 
-    resp = await client.post("/api/v1/accounts/99999/login", headers=headers)
+    resp = await client.post("/api/v1/accounts/99999/verify", headers=headers)
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_login_alias_reuses_verify_semantics(client):
+    uid = _uid()
+    token, _ = await _create_operator(f"aliasop_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"alias_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    resp = await client.post(
+        f"/api/v1/accounts/{account_id}/login?platform_type=JND282",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()["data"]
+    assert body["latest_verification_run_id"] == body["effective_verification_run_id"]
+    assert sorted(body["allowed_strategy_platform_types"]) == ["JND282", "JND28WEB"]
+
+
+@pytest.mark.asyncio
+async def test_verify_single_login_multi_platform_probe(client, monkeypatch):
+    uid = _uid()
+    token, _ = await _create_operator(f"singlelogin_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"single_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    class CountingAdapter:
+        def __init__(self):
+            self.lottery_type = "JND28WEB"
+            self.login_calls = 0
+            self.install_calls = 0
+
+        async def login(self, account_name, password, captcha_code=None):
+            self.login_calls += 1
+            return LoginResult(success=True, token="counting-token")
+
+        async def query_balance(self):
+            return BalanceInfo(balance=88.0)
+
+        async def get_current_install(self):
+            self.install_calls += 1
+            return InstallInfo(
+                issue=f"issue-{self.lottery_type}",
+                state=1,
+                close_countdown_sec=10,
+                pre_issue="prev",
+                pre_result="1,2,3",
+                open_countdown_sec=12,
+            )
+
+        async def load_odds(self, issue):
+            return {"DX1": 20100}
+
+        async def close(self):
+            return None
+
+    adapter = CountingAdapter()
+    monkeypatch.setattr(
+        accounts_api,
+        "create_platform_adapter",
+        lambda platform_type, platform_url=None: adapter,
+    )
+
+    resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert resp.status_code == 200
+    assert adapter.login_calls == 1
+    assert adapter.install_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_latest_run_failure_does_not_override_effective(client, monkeypatch):
+    uid = _uid()
+    token, _ = await _create_operator(f"latestop_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"latest_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    first_verify = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert first_verify.status_code == 200
+    effective_run_id = first_verify.json()["data"]["effective_verification_run_id"]
+    assert effective_run_id is not None
+
+    monkeypatch.setattr(
+        accounts_api,
+        "_login_platform_account",
+        AsyncMock(return_value=LoginResult(success=False, message="invalid credentials")),
+    )
+    second_verify = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert second_verify.status_code == 400
+
+    list_resp = await client.get("/api/v1/accounts", headers=headers)
+    account = list_resp.json()["data"][0]
+    assert account["effective_verification_run_id"] == effective_run_id
+    assert account["latest_verification_run_id"] != effective_run_id
+    assert account["latest_verification_run_id"] > effective_run_id
+    assert sorted(account["allowed_strategy_platform_types"]) == ["JND282", "JND28WEB"]
+
+
+@pytest.mark.asyncio
+async def test_verification_stale_when_ttl_expired(client):
+    uid = _uid()
+    token, _ = await _create_operator(f"staleop_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"stale_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    verify_resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert verify_resp.status_code == 200
+    run_id = verify_resp.json()["data"]["effective_verification_run_id"]
+    assert run_id is not None
+
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE account_verification_runs SET started_at='2000-01-01 00:00:00', stale=0, stale_reason=NULL WHERE id=?",
+        (run_id,),
+    )
+    await db.commit()
+
+    list_resp = await client.get("/api/v1/accounts", headers=headers)
+    assert list_resp.status_code == 200
+    account = list_resp.json()["data"][0]
+    assert account["verification_stale"] is True
+    assert account["effective_verification_run_id"] is None
+    assert account["allowed_strategy_platform_types"] == []
+    assert account["summary_status_reason"] == "not_verified"
 
 
 # 
@@ -636,7 +816,7 @@ async def test_data_isolation_delete(client):
 
 
 @pytest.mark.asyncio
-async def test_data_isolation_login(client):
+async def test_data_isolation_verify(client):
     """ A  B """
     uid = _uid()
     token_a, _ = await _create_operator(f"isologin_a_{uid}", max_accounts=3)
@@ -657,7 +837,7 @@ async def test_data_isolation_login(client):
     b_account_id = create_resp.json()["data"]["id"]
 
     # A  B   404
-    resp = await client.post(f"/api/v1/accounts/{b_account_id}/login", headers=headers_a)
+    resp = await client.post(f"/api/v1/accounts/{b_account_id}/verify", headers=headers_a)
     assert resp.status_code == 404
 
 

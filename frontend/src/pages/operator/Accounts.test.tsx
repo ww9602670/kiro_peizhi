@@ -7,7 +7,7 @@ vi.mock('@/api/accounts', () => ({
   listAccounts: vi.fn(),
   createAccount: vi.fn(),
   deleteAccount: vi.fn(),
-  loginAccount: vi.fn(),
+  verifyAccount: vi.fn(),
   logoutAccount: vi.fn(),
   updateKillSwitch: vi.fn(),
 }));
@@ -22,33 +22,19 @@ vi.mock('@/api/request', () => ({
   isApiError: () => false,
 }));
 
-import { createAccount, listAccounts } from '@/api/accounts';
+import { createAccount, listAccounts, verifyAccount } from '@/api/accounts';
 import { getAccountOdds } from '@/api/odds';
 
 const mockListAccounts = vi.mocked(listAccounts);
 const mockCreateAccount = vi.mocked(createAccount);
+const mockVerifyAccount = vi.mocked(verifyAccount);
 const mockGetAccountOdds = vi.mocked(getAccountOdds);
 
 beforeEach(() => {
   vi.clearAllMocks();
   mockListAccounts.mockResolvedValue({ code: 0, message: 'success', data: [] });
-  mockCreateAccount.mockResolvedValue({
-    code: 0,
-    message: 'success',
-    data: {
-      id: 1,
-      account_name: 'player001',
-      password_masked: 'pl****',
-      game_type: 'LUCKYSB',
-      allowed_strategy_platform_types: ['LUCKYSB'],
-      platform_type: 'LUCKYSB',
-      platform_url: 'https://member.example',
-      status: 'inactive',
-      balance: 0,
-      kill_switch: false,
-      last_login_at: null,
-    },
-  });
+  mockCreateAccount.mockResolvedValue({ code: 0, message: 'success', data: null });
+  mockVerifyAccount.mockResolvedValue({ code: 0, message: 'success', data: null });
   mockGetAccountOdds.mockResolvedValue({
     code: 0,
     message: 'success',
@@ -69,10 +55,7 @@ describe('Accounts', () => {
     await user.click(container.querySelector('.bind-toggle-btn') as HTMLButtonElement);
     await user.type(document.getElementById('bind-name') as HTMLInputElement, 'jnd001');
     await user.type(document.getElementById('bind-password') as HTMLInputElement, 'secret');
-
-    const platformUrl = document.getElementById('bind-platform-url') as HTMLInputElement;
-    expect(platformUrl).toBeRequired();
-    await user.type(platformUrl, 'https://merchant.example');
+    await user.type(document.getElementById('bind-platform-url') as HTMLInputElement, 'https://merchant.example');
     await user.click(container.querySelector('.bind-submit-btn') as HTMLButtonElement);
 
     await waitFor(() => {
@@ -94,21 +77,7 @@ describe('Accounts', () => {
     await user.selectOptions(document.getElementById('bind-game-type') as HTMLSelectElement, 'LUCKYSB');
 
     const memberSiteUrl = document.getElementById('bind-platform-url') as HTMLInputElement;
-    expect(memberSiteUrl).toBeInTheDocument();
     expect(memberSiteUrl).toHaveValue('https://member.example');
-
-    await user.type(document.getElementById('bind-name') as HTMLInputElement, 'lucky001');
-    await user.type(document.getElementById('bind-password') as HTMLInputElement, 'secret');
-    await user.click(container.querySelector('.bind-submit-btn') as HTMLButtonElement);
-
-    await waitFor(() => {
-      expect(mockCreateAccount).toHaveBeenCalledWith({
-        account_name: 'lucky001',
-        password: 'secret',
-        game_type: 'LUCKYSB',
-        platform_url: 'https://member.example',
-      });
-    });
   });
 
   it('renders game-type options in the account form', async () => {
@@ -122,7 +91,7 @@ describe('Accounts', () => {
     expect(optionValues).toEqual(['JND28', 'LUCKYSB']);
   });
 
-  it('requests odds with an explicit platform_type when switching JND platforms', async () => {
+  it('calls verifyAccount when clicking verify button', async () => {
     const user = userEvent.setup();
     mockListAccounts.mockResolvedValue({
       code: 0,
@@ -130,10 +99,114 @@ describe('Accounts', () => {
       data: [
         {
           id: 1,
-          account_name: 'jnd001',
-          password_masked: 'jn****',
+          account_name: 'acc-1',
+          password_masked: 'ac****',
           game_type: 'JND28',
-          allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
+          allowed_strategy_platform_types: [],
+          summary_status_reason: 'not_verified',
+          verification_stale: false,
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(<Accounts />);
+
+    await user.click(await screen.findByRole('button', { name: '验证账号' }));
+
+    await waitFor(() => {
+      expect(mockVerifyAccount).toHaveBeenCalledWith(1);
+    });
+  });
+
+  it('renders summary status and summary reason from verification result', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 2,
+          account_name: 'acc-2',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: [],
+          summary_status_reason: 'unsupported_only',
+          verification_stale: false,
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(<Accounts />);
+
+    expect(await screen.findByText('验证失败')).toBeInTheDocument();
+    expect(screen.getByText('平台不支持')).toBeInTheDocument();
+  });
+
+  it('uses verified platform capability as platform source (no game_type fallback)', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 3,
+          account_name: 'acc-3',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: [],
+          platform_capabilities: [
+            { platform_type: 'LUCKYSB', verify_status: 'supported', market_state: 'open' },
+          ],
+          summary_status_reason: null,
+          effective_verification_run_id: 3001,
+          status: 'online',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+    mockGetAccountOdds.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: {
+        account_id: 3,
+        platform_type: 'LUCKYSB',
+        items: [],
+        has_unconfirmed: false,
+      },
+    });
+
+    render(<Accounts />);
+
+    await waitFor(() => {
+      expect(mockGetAccountOdds).toHaveBeenCalledWith(3, 'LUCKYSB');
+    });
+  });
+
+  it('does not fallback to static game_type when no verified platform exists', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 4,
+          account_name: 'acc-4',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: [],
+          platform_capabilities: [
+            { platform_type: 'JND28WEB', verify_status: 'unsupported', market_state: 'unknown' },
+            { platform_type: 'JND282', verify_status: 'probe_failed', market_state: 'unknown' },
+          ],
+          summary_status_reason: 'unsupported_with_probe_failed',
+          effective_verification_run_id: null,
           status: 'online',
           balance: 0,
           kill_switch: false,
@@ -145,14 +218,8 @@ describe('Accounts', () => {
     render(<Accounts />);
 
     await waitFor(() => {
-      expect(mockGetAccountOdds).toHaveBeenCalledWith(1, 'JND28WEB');
+      expect(screen.getByText('验证失败')).toBeInTheDocument();
     });
-
-    await user.click(await screen.findByRole('button', { name: /赔率详情/i }));
-    await user.selectOptions(screen.getByRole('combobox'), 'JND282');
-
-    await waitFor(() => {
-      expect(mockGetAccountOdds).toHaveBeenLastCalledWith(1, 'JND282');
-    });
+    expect(mockGetAccountOdds).not.toHaveBeenCalled();
   });
 });

@@ -18,6 +18,10 @@ from fastapi import APIRouter, Depends, Request
 from app.api.dependencies import get_current_operator, get_db_conn
 from app.models.db_ops import (
     account_get_by_id,
+    account_platform_capability_list_by_run,
+    account_verification_run_get_effective,
+    account_verification_run_get_latest,
+    account_verification_run_get_latest_completed,
     strategy_create,
     strategy_delete,
     strategy_get_by_id,
@@ -35,7 +39,6 @@ from app.schemas.strategy import (
     normalize_dw3_group_play_code,
     validate_state_transition,
 )
-from app.schemas.account import get_allowed_platform_types
 from app.utils.strategy_timing import (
     BET_TIMING_MAX,
     BET_TIMING_MIN,
@@ -107,19 +110,175 @@ def _validate_luckysb_or_raise(type_: str, play_code: str) -> None:
         raise BizError(1002, str(exc), status_code=400)
 
 
+def _normalize_strategy_platform_type(platform_type: str | None) -> str:
+    normalized = (platform_type or "").strip().upper()
+    return normalized or "JND28WEB"
+
+
+def _is_truthy_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _parse_allowed_platform_types(value: object) -> list[str]:
+    if value is None:
+        return []
+    raw_items: list[object]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            raw_items = [item.strip() for item in stripped.split(",")]
+        else:
+            raw_items = decoded if isinstance(decoded, list) else [decoded]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    allowed: list[str] = []
+    for raw in raw_items:
+        normalized = str(raw or "").strip().upper()
+        if normalized not in {"JND28WEB", "JND282", "LUCKYSB"}:
+            continue
+        if normalized not in allowed:
+            allowed.append(normalized)
+    return allowed
+
+
+def _build_summary_status_reason_from_capabilities(capabilities: list[dict]) -> str | None:
+    if not capabilities:
+        return "not_verified"
+    if any(item.get("verify_status") == "supported" for item in capabilities):
+        return None
+    if any(item.get("verify_status") == "unsupported" for item in capabilities):
+        return "unsupported_platform"
+    if any(item.get("verify_status") == "error" for item in capabilities):
+        return "verification_error"
+    return "not_verified"
+
+
+async def _load_account_with_strategy_gate_context(
+    db,
+    *,
+    account_id: int,
+    operator_id: int,
+) -> dict | None:
+    account = await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
+    if not account:
+        return None
+
+    latest_run = await account_verification_run_get_latest(db, account_id=account_id)
+    latest_completed_run = await account_verification_run_get_latest_completed(
+        db, account_id=account_id
+    )
+    effective_run = await account_verification_run_get_effective(db, account_id=account_id)
+
+    capabilities: list[dict] = []
+    allowed_strategy_platform_types: list[str] = []
+    if effective_run:
+        raw_capabilities = await account_platform_capability_list_by_run(
+            db,
+            verification_run_id=effective_run["id"],
+        )
+        for item in raw_capabilities:
+            normalized_platform_type = _normalize_strategy_platform_type(
+                item.get("platform_type")
+            )
+            verify_status = str(item.get("verify_status") or "")
+            capability = {
+                "platform_type": normalized_platform_type,
+                "verify_status": verify_status,
+                "market_state": item.get("market_state"),
+                "detected_issue": item.get("detected_issue"),
+                "odds_synced": bool(item.get("odds_synced")),
+                "odds_message": item.get("odds_message"),
+                "last_verified_at": item.get("last_verified_at"),
+            }
+            capabilities.append(capability)
+            if (
+                verify_status == "supported"
+                and normalized_platform_type not in allowed_strategy_platform_types
+            ):
+                allowed_strategy_platform_types.append(normalized_platform_type)
+
+    verification_stale = bool(
+        latest_completed_run and int(latest_completed_run.get("stale") or 0) == 1
+    )
+
+    enriched = dict(account)
+    enriched["latest_verification_run_id"] = latest_run["id"] if latest_run else None
+    enriched["effective_verification_run_id"] = effective_run["id"] if effective_run else None
+    enriched["verification_stale"] = verification_stale
+    enriched["allowed_strategy_platform_types"] = allowed_strategy_platform_types
+    enriched["platform_capabilities"] = capabilities
+    enriched["summary_status_reason"] = _build_summary_status_reason_from_capabilities(
+        capabilities
+    )
+    return enriched
+
+
+def _get_effective_verification_run_id(account: dict) -> int | None:
+    raw = account.get("effective_verification_run_id")
+    if raw is None:
+        return None
+    try:
+        run_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return run_id if run_id > 0 else None
+
+
+def _validate_account_platform_gate_or_raise(
+    *,
+    account: dict,
+    strategy_platform_type: str,
+    error_code: int,
+) -> str:
+    normalized = _normalize_strategy_platform_type(strategy_platform_type)
+    effective_run_id = _get_effective_verification_run_id(account)
+    if _is_truthy_flag(account.get("verification_stale")):
+        raise BizError(
+            error_code,
+            "verification_stale=true; refresh verification before strategy operations",
+            status_code=400,
+        )
+    if effective_run_id is None:
+        raise BizError(
+            error_code,
+            "effective_verification_run_id is missing; verify account before strategy operations",
+            status_code=400,
+        )
+    allowed = _parse_allowed_platform_types(account.get("allowed_strategy_platform_types"))
+    if normalized not in allowed:
+        raise BizError(
+            error_code,
+            (
+                f"platform_type={normalized} is not allowed by "
+                f"effective_verification_run_id={effective_run_id}"
+            ),
+            status_code=400,
+        )
+    return normalized
+
+
 def _validate_strategy_platform_type_for_account(
     strategy_platform_type: str,
     account: dict,
 ) -> str:
-    normalized = (strategy_platform_type or "").strip().upper()
-    allowed = get_allowed_platform_types(account.get("game_type", ""))
-    if normalized not in allowed:
-        raise BizError(
-            1002,
-            f"platform_type is not allowed for game_type={account.get('game_type')}",
-            status_code=400,
-        )
-    return normalized
+    return _validate_account_platform_gate_or_raise(
+        account=account,
+        strategy_platform_type=strategy_platform_type,
+        error_code=1002,
+    )
 
 
 def _is_dw3_timing_conflict_exempt(play_code: str) -> bool:
@@ -238,8 +397,10 @@ async def create_strategy(
     3. 
     """
     # 1.  account 
-    account = await account_get_by_id(
-        db, account_id=body.account_id, operator_id=operator["id"]
+    account = await _load_account_with_strategy_gate_context(
+        db,
+        account_id=body.account_id,
+        operator_id=operator["id"],
     )
     if not account:
         raise BizError(4001, "", status_code=404)
@@ -302,8 +463,10 @@ async def update_strategy(
     )
     if not existing:
         raise BizError(4001, "", status_code=404)
-    account = await account_get_by_id(
-        db, account_id=existing["account_id"], operator_id=operator["id"]
+    account = await _load_account_with_strategy_gate_context(
+        db,
+        account_id=existing["account_id"],
+        operator_id=operator["id"],
     )
     if not account:
         raise BizError(4001, "", status_code=404)
@@ -317,7 +480,7 @@ async def update_strategy(
         update_fields["name"] = body.name
     if body.base_amount is not None:
         update_fields["base_amount"] = _yuan_to_fen(body.base_amount)
-    existing_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
+    existing_platform_type = _normalize_strategy_platform_type(existing.get("platform_type"))
     requested_platform_type = (
         _validate_strategy_platform_type_for_account(body.platform_type, account)
         if body.platform_type is not None
@@ -516,32 +679,33 @@ async def _transition_strategy(
         logger.info("  Worker...")
         
         # 
-        account = await account_get_by_id(
-            db, account_id=existing["account_id"], operator_id=operator["id"]
+        account = await _load_account_with_strategy_gate_context(
+            db,
+            account_id=existing["account_id"],
+            operator_id=operator["id"],
         )
         if not account:
             logger.error(" account_id=%d", existing["account_id"])
             raise BizError(4001, "", status_code=404)
         
         logger.info(
-            " account_id=%d account_name=%s status=%s",
+            " account_id=%d account_name=%s",
             account["id"],
             account["account_name"],
-            account["status"],
         )
         
-        # 
-        if account["status"] != "online":
-            logger.error(" account_id=%d status=%s", account["id"], account["status"])
-            raise BizError(4002, "", status_code=400)
-        
-        strategy_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
+        strategy_platform_type = _normalize_strategy_platform_type(existing.get("platform_type"))
+        _validate_account_platform_gate_or_raise(
+            account=account,
+            strategy_platform_type=strategy_platform_type,
+            error_code=4002,
+        )
         all_strategies = await strategy_list_by_operator(db, operator_id=operator["id"])
         running_strategies = [
             s for s in all_strategies
             if s.get("account_id") == existing["account_id"]
             and s.get("status") == "running"
-            and (s.get("platform_type") or strategy_platform_type) == strategy_platform_type
+            and _normalize_strategy_platform_type(s.get("platform_type")) == strategy_platform_type
         ]
         
         logger.info(
@@ -577,14 +741,14 @@ async def _transition_strategy(
         )
         if not account:
             raise BizError(4001, "", status_code=404)
-        strategy_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
+        strategy_platform_type = _normalize_strategy_platform_type(existing.get("platform_type"))
         all_strategies = await strategy_list_by_operator(db, operator_id=operator["id"])
         running_strategies = [
             s for s in all_strategies
             if s.get("account_id") == existing["account_id"]
             and s.get("status") == "running"
             and s.get("id") != strategy_id
-            and (s.get("platform_type") or strategy_platform_type) == strategy_platform_type
+            and _normalize_strategy_platform_type(s.get("platform_type")) == strategy_platform_type
         ]
         
         logger.info(
@@ -627,7 +791,7 @@ async def _transition_strategy(
             )
             if not account:
                 raise BizError(4001, "", status_code=404)
-            strategy_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
+            strategy_platform_type = _normalize_strategy_platform_type(existing.get("platform_type"))
             worker = await engine.registry.get((existing["account_id"], strategy_platform_type))
             if worker and worker.running:
                 worker.remove_strategy(strategy_id)

@@ -50,7 +50,15 @@ const accounts = [
     account_name: 'jnd',
     password_masked: 'jn****',
     game_type: 'JND28',
+    latest_verification_run_id: 101,
+    effective_verification_run_id: 101,
+    verification_stale: false,
+    summary_status_reason: null,
     allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
+    platform_capabilities: [
+      { platform_type: 'JND28WEB', verify_status: 'supported', market_state: 'open' },
+      { platform_type: 'JND282', verify_status: 'supported', market_state: 'open' },
+    ],
     platform_type: 'JND28WEB',
     status: 'inactive',
     balance: 0,
@@ -62,7 +70,14 @@ const accounts = [
     account_name: 'lucky',
     password_masked: 'lu****',
     game_type: 'LUCKYSB',
+    latest_verification_run_id: 202,
+    effective_verification_run_id: 202,
+    verification_stale: false,
+    summary_status_reason: null,
     allowed_strategy_platform_types: ['LUCKYSB'],
+    platform_capabilities: [
+      { platform_type: 'LUCKYSB', verify_status: 'supported', market_state: 'open' },
+    ],
     platform_type: 'LUCKYSB',
     platform_url: 'https://member.example',
     status: 'inactive',
@@ -229,6 +244,54 @@ describe('StrategyForm', () => {
       );
     });
     expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows platform empty state and disables submit when verification is stale', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 3,
+          account_name: 'stale_jnd',
+          password_masked: 'st****',
+          game_type: 'JND28',
+          latest_verification_run_id: 303,
+          effective_verification_run_id: 303,
+          verification_stale: true,
+          summary_status_reason: 'not_verified',
+          allowed_strategy_platform_types: [],
+          platform_capabilities: [],
+          platform_type: 'JND28WEB',
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    const { container } = render(
+      <StrategyForm
+        strategy={null}
+        onDone={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('3');
+    });
+    expect(screen.getByText(/verification is stale/i)).toBeInTheDocument();
+
+    const platformSelect = document.getElementById('sf-platform') as HTMLSelectElement;
+    expect(platformSelect).toBeDisabled();
+    expect(platformSelect.value).toBe('');
+    expect(screen.getByRole('option', { name: 'No verified platform available' })).toBeInTheDocument();
+
+    const submitButton = container.querySelector('.form-submit-btn') as HTMLButtonElement;
+    expect(submitButton).toBeDisabled();
+    expect(mockCreateStrategy).not.toHaveBeenCalled();
   });
 
   it('shows the DW3 multi-strategy risk warning for the same account', async () => {

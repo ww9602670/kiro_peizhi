@@ -1,10 +1,5 @@
 /**
- * 博彩账号 API 封装
- * - listAccounts: 我的博彩账号列表
- * - createAccount: 绑定博彩账号
- * - deleteAccount: 解绑博彩账号
- * - loginAccount: 手动触发登录
- * - updateKillSwitch: 账号级熔断开关
+ * Account API wrappers.
  */
 
 import { request } from '@/api/request';
@@ -27,10 +22,17 @@ export async function deleteAccount(id: number) {
   });
 }
 
-export async function loginAccount(id: number) {
-  return request<AccountInfo>(`/accounts/${id}/login`, {
+export async function verifyAccount(id: number) {
+  return request<AccountInfo>(`/accounts/${id}/verify`, {
     method: 'POST',
   });
+}
+
+/**
+ * @deprecated Use verifyAccount. Kept only as a compatibility alias.
+ */
+export async function loginAccount(id: number) {
+  return verifyAccount(id);
 }
 
 export async function logoutAccount(id: number) {

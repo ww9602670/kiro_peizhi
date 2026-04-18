@@ -14,7 +14,7 @@ import type {
   StrategyPlatformType,
   StrategyUpdate,
 } from '@/types/api/strategy';
-import type { AccountGameType, AccountInfo } from '@/types/api/account';
+import type { AccountInfo } from '@/types/api/account';
 import {
   buildDw3PlayCode,
   getDw3GroupLabel,
@@ -84,46 +84,81 @@ function isDw3Platform(platformType: string) {
   return platformType === 'JND28WEB' || platformType === 'JND282';
 }
 
-function resolveAccountGameType(account?: AccountInfo): AccountGameType | string | undefined {
-  if (!account) return undefined;
-  if (account.game_type) return account.game_type;
-  if (account.platform_type === LUCKYSB_PLATFORM_TYPE) return 'LUCKYSB';
-  if (account.platform_type === 'JND28WEB' || account.platform_type === 'JND282') return 'JND28';
-  return undefined;
-}
-
 function getAccountGameTypeLabel(account: AccountInfo): string {
-  const gameType = resolveAccountGameType(account);
+  const gameType = account.game_type;
   if (gameType === 'JND28') return 'JND28';
   if (gameType === 'LUCKYSB') return getPlatformLabel('LUCKYSB');
   return gameType ?? '-';
 }
 
-function resolveAllowedPlatformTypes(
-  account?: AccountInfo,
-  fallbackPlatformType?: string
-): StrategyPlatformType[] {
+type AccountVerificationMeta = {
+  effectiveVerificationRunId: number | null;
+  verificationStale: boolean;
+};
+
+function toTruthyFlag(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') return ['1', 'true', 'yes', 'y'].includes(value.trim().toLowerCase());
+  return false;
+}
+
+function getAccountVerificationMeta(account?: AccountInfo): AccountVerificationMeta {
+  if (!account) {
+    return {
+      effectiveVerificationRunId: null,
+      verificationStale: false,
+    };
+  }
+  const verification = account as AccountInfo & {
+    effective_verification_run_id?: number | string | null;
+    verification_stale?: boolean | number | string | null;
+  };
+  const parsedRunId = Number(verification.effective_verification_run_id);
+  const effectiveVerificationRunId =
+    Number.isInteger(parsedRunId) && parsedRunId > 0 ? parsedRunId : null;
+  return {
+    effectiveVerificationRunId,
+    verificationStale: toTruthyFlag(verification.verification_stale),
+  };
+}
+
+function resolveAllowedPlatformTypes(account?: AccountInfo): StrategyPlatformType[] {
+  const verificationMeta = getAccountVerificationMeta(account);
+  if (!verificationMeta.effectiveVerificationRunId || verificationMeta.verificationStale) return [];
   const explicit = Array.from(
-    new Set((account?.allowed_strategy_platform_types ?? []).map((item) => normalizePlatformType(item)))
+    new Set(
+      (account?.allowed_strategy_platform_types ?? [])
+        .map((item) => `${item}`.trim().toUpperCase())
+        .filter((item): item is StrategyPlatformType => isRealPlatformType(item))
+    )
   );
-  if (explicit.length > 0) return explicit;
-
-  const gameType = resolveAccountGameType(account);
-  if (gameType === 'LUCKYSB') return ['LUCKYSB'];
-  if (gameType === 'JND28') return [...JND_PLATFORM_TYPES];
-
-  if (fallbackPlatformType) return [normalizePlatformType(fallbackPlatformType)];
-  return [...JND_PLATFORM_TYPES];
+  return explicit;
 }
 
 function pickPlatformType(
   allowed: StrategyPlatformType[],
   preferred?: string | null
-): StrategyPlatformType {
+): string {
+  if (allowed.length === 0) return '';
   const normalizedPreferred = normalizePlatformType(preferred);
   if (allowed.includes(normalizedPreferred)) return normalizedPreferred;
-  if (allowed.length > 0) return allowed[0];
-  return DEFAULT_JND_PLATFORM_TYPE;
+  return allowed[0];
+}
+
+function getVerificationGateError(account: AccountInfo | undefined, allowedPlatformTypes: StrategyPlatformType[]): string {
+  if (!account) return 'Please select an account';
+  const { effectiveVerificationRunId, verificationStale } = getAccountVerificationMeta(account);
+  if (!effectiveVerificationRunId) {
+    return 'Selected account has no effective verification run. Please verify the account first.';
+  }
+  if (verificationStale) {
+    return 'Selected account verification is stale. Please re-verify before creating or starting strategies.';
+  }
+  if (allowedPlatformTypes.length === 0) {
+    return 'Selected account has no supported platform_type in its effective verification run.';
+  }
+  return '';
 }
 
 function isStrategyTypeValidForPlatform(
@@ -198,15 +233,19 @@ export default function StrategyForm({
   const isRedWaveDouble = type === RED_WAVE_DOUBLE_TYPE;
 
   const selectedAccount = accounts.find((a) => a.id === accountId);
-  const allowedPlatformTypes = resolveAllowedPlatformTypes(
-    selectedAccount,
-    strategy?.platform_type ?? platformType
-  );
+  const allowedPlatformTypes = resolveAllowedPlatformTypes(selectedAccount);
+  const verificationGateError = getVerificationGateError(selectedAccount, allowedPlatformTypes);
   const selectablePlatformTypes = (
     dw3Mode ? allowedPlatformTypes.filter((item) => isDw3Platform(item)) : allowedPlatformTypes
   );
-  const effectivePlatformTypes =
-    selectablePlatformTypes.length > 0 ? selectablePlatformTypes : [DEFAULT_JND_PLATFORM_TYPE];
+  const effectivePlatformTypes = selectablePlatformTypes;
+  const currentPlatformType = isRealPlatformType(platformType) ? platformType : '';
+  const displayedPlatformType =
+    currentPlatformType && effectivePlatformTypes.includes(currentPlatformType)
+      ? currentPlatformType
+      : '';
+  const submitDisabled =
+    submitting || (accounts.length === 0 && !isEdit) || Boolean(verificationGateError);
   const canUseDw3 = allowedPlatformTypes.some((item) => isDw3Platform(item)) || dw3Mode;
   const sameAccountExistingDw3Count = existingStrategies.filter((item) => {
     if (item.account_id !== accountId) return false;
@@ -270,10 +309,7 @@ export default function StrategyForm({
         const nextAccountId = accountId === 0 ? (initialAccountId ?? list[0].id) : accountId;
         const selected = list.find((account) => account.id === nextAccountId) ?? list[0];
         if (!isEdit) setAccountId(selected.id);
-        const nextAllowed = resolveAllowedPlatformTypes(
-          selected,
-          strategy?.platform_type
-        );
+        const nextAllowed = resolveAllowedPlatformTypes(selected);
         setPlatformType((current) => pickPlatformType(nextAllowed, current));
       }
     } catch (err) {
@@ -290,7 +326,7 @@ export default function StrategyForm({
   const handleAccountChange = (nextAccountId: number) => {
     setAccountId(nextAccountId);
     const nextAccount = accounts.find((a) => a.id === nextAccountId);
-    const nextAllowed = resolveAllowedPlatformTypes(nextAccount, strategy?.platform_type ?? platformType);
+    const nextAllowed = resolveAllowedPlatformTypes(nextAccount);
     const nextPlatformType = pickPlatformType(nextAllowed, platformType);
     if (dw3Mode && !isDw3Platform(nextPlatformType)) {
       setDw3Mode(false);
@@ -346,6 +382,11 @@ export default function StrategyForm({
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setFormError('');
+
+    if (verificationGateError) {
+      setFormError(verificationGateError);
+      return;
+    }
     const submitPlatformType = normalizePlatformType(platformType);
     const isLuckySbPlatform = submitPlatformType === LUCKYSB_PLATFORM_TYPE;
 
@@ -484,6 +525,7 @@ export default function StrategyForm({
 
         {formError && <div role="alert" className="form-error">{formError}</div>}
         {resetNotice && <div role="status" className="form-hint form-hint-warn">{resetNotice}</div>}
+        {verificationGateError && <div role="status" className="form-hint form-hint-warn">{verificationGateError}</div>}
         {showDw3MultiWarning && (
           <div role="status" className="form-warning">
             {DW3_MULTI_WARNING}
@@ -706,15 +748,19 @@ export default function StrategyForm({
           <select
             id="sf-platform"
             className="form-select"
-            value={platformType}
+            value={displayedPlatformType}
             onChange={(e) => applyPlatformChange(e.target.value)}
-            disabled={submitting || effectivePlatformTypes.length <= 1}
+            disabled={submitting || Boolean(verificationGateError) || effectivePlatformTypes.length <= 1}
           >
-            {effectivePlatformTypes.map((item) => (
-              <option key={item} value={item}>
-                {getPlatformLabel(item)}
-              </option>
-            ))}
+            {effectivePlatformTypes.length === 0 ? (
+              <option value="">No verified platform available</option>
+            ) : (
+              effectivePlatformTypes.map((item) => (
+                <option key={item} value={item}>
+                  {getPlatformLabel(item)}
+                </option>
+              ))
+            )}
           </select>
         </div>
 
@@ -817,7 +863,7 @@ export default function StrategyForm({
           <button type="button" className="form-cancel-btn" onClick={onCancel} disabled={submitting}>
             取消
           </button>
-          <button type="submit" className="form-submit-btn" disabled={submitting || (accounts.length === 0 && !isEdit)}>
+          <button type="submit" className="form-submit-btn" disabled={submitDisabled}>
             {submitting ? '提交中...' : isEdit ? '更新' : BUTTON_CREATE}
           </button>
         </div>

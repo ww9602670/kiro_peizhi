@@ -90,7 +90,23 @@ class AccountInfo(BaseModel):
                 "account_name": "player001",
                 "password_masked": "my****",
                 "game_type": "JND28",
-                "allowed_strategy_platform_types": ["JND28WEB", "JND282"],
+                "allowed_strategy_platform_types": ["JND28WEB"],
+                "platform_capabilities": [
+                    {
+                        "platform_type": "JND28WEB",
+                        "verify_status": "supported",
+                        "market_state": "open",
+                        "detected_issue": None,
+                        "odds_synced": True,
+                        "odds_message": "odds synced: 2 items",
+                        "last_verified_at": "2026-01-01 12:00:00",
+                    }
+                ],
+                "latest_verification_run_id": 10,
+                "effective_verification_run_id": 10,
+                "verification_in_progress": False,
+                "verification_stale": False,
+                "summary_status_reason": None,
                 "status": "inactive",
                 "balance": 0.0,
                 "kill_switch": False,
@@ -102,11 +118,26 @@ class AccountInfo(BaseModel):
         }
     )
 
+    class PlatformCapability(BaseModel):
+        platform_type: str
+        verify_status: str
+        market_state: str
+        detected_issue: Optional[str] = None
+        odds_synced: bool = False
+        odds_message: Optional[str] = None
+        last_verified_at: Optional[str] = None
+
     id: int
     account_name: str
     password_masked: str
     game_type: str
     allowed_strategy_platform_types: list[str]
+    platform_capabilities: list[PlatformCapability] = Field(default_factory=list)
+    latest_verification_run_id: Optional[int] = None
+    effective_verification_run_id: Optional[int] = None
+    verification_in_progress: bool = False
+    verification_stale: bool = False
+    summary_status_reason: Optional[str] = None
     platform_url: Optional[str] = None
     status: str
     balance: float

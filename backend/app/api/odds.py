@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 from fastapi import APIRouter, Depends, Query
@@ -14,7 +15,6 @@ from app.models.db_ops import (
     odds_confirm_all,
     odds_list_by_account,
 )
-from app.schemas.account import get_allowed_platform_types
 from app.schemas.common import ApiResponse
 from app.schemas.odds import (
     OddsConfirmResponse,
@@ -36,15 +36,82 @@ async def _get_verified_account(account_id: int, operator: dict, db):
     return account
 
 
+def _is_truthy_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _get_effective_verification_run_id(account: dict) -> int | None:
+    raw = account.get("effective_verification_run_id")
+    if raw is None:
+        return None
+    try:
+        run_id = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return run_id if run_id > 0 else None
+
+
+def _parse_allowed_platform_types(value: object) -> set[str]:
+    if value is None:
+        return set()
+    raw_items: list[object]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return set()
+        try:
+            decoded = json.loads(stripped)
+        except json.JSONDecodeError:
+            raw_items = [item.strip() for item in stripped.split(",")]
+        else:
+            raw_items = decoded if isinstance(decoded, list) else [decoded]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    allowed: set[str] = set()
+    for raw in raw_items:
+        normalized = str(raw or "").strip().upper()
+        if normalized:
+            allowed.add(normalized)
+    return allowed
+
+
 def _resolve_platform_type(account: dict, platform_type: str | None) -> str:
     normalized = (platform_type or "").strip().upper()
     if not normalized:
         raise BizError(1002, "platform_type is required", status_code=400)
-    allowed = get_allowed_platform_types(account["game_type"])
+
+    if _is_truthy_flag(account.get("verification_stale")):
+        raise BizError(
+            1002,
+            "verification_stale=true; refresh verification before odds operations",
+            status_code=400,
+        )
+
+    effective_run_id = _get_effective_verification_run_id(account)
+    if effective_run_id is None:
+        raise BizError(
+            1002,
+            "effective_verification_run_id is missing; verify account before odds operations",
+            status_code=400,
+        )
+
+    allowed = _parse_allowed_platform_types(account.get("allowed_strategy_platform_types"))
     if normalized not in allowed:
         raise BizError(
             1002,
-            f"platform_type is not allowed for game_type={account['game_type']}",
+            (
+                f"platform_type={normalized} is not allowed by "
+                f"effective_verification_run_id={effective_run_id}"
+            ),
             status_code=400,
         )
     return normalized

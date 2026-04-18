@@ -10,6 +10,7 @@
 - 
 """
 import uuid
+import hashlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,7 +18,12 @@ from httpx import ASGITransport, AsyncClient
 
 from app.main import app
 from app.database import get_shared_db
-from app.models.db_ops import account_create, operator_create
+from app.models.db_ops import (
+    account_create,
+    account_verification_run_complete,
+    account_verification_run_create,
+    operator_create,
+)
 from app.schemas.strategy import validate_state_transition
 from app.utils.auth import create_token, register_session, persist_jti
 
@@ -31,6 +37,7 @@ async def _create_operator_with_account(
     max_accounts: int = 3,
     game_type: str = "JND28",
     platform_url: str | None = None,
+    create_effective_verification: bool = True,
 ) -> tuple[str, int, int]:
     """ +  (token, operator_id, account_id)"""
     db = await get_shared_db()
@@ -50,6 +57,33 @@ async def _create_operator_with_account(
         game_type=game_type,
         platform_url=platform_url,
     )
+    if create_effective_verification:
+        run = await account_verification_run_create(
+            db,
+            account_id=acc["id"],
+            snapshot_game_type=game_type,
+            snapshot_platform_url=platform_url,
+            snapshot_password_hash=hashlib.sha256("accpass".encode("utf-8")).hexdigest(),
+        )
+        supported_platforms = ["LUCKYSB"] if game_type == "LUCKYSB" else ["JND28WEB", "JND282"]
+        await account_verification_run_complete(
+            db,
+            verification_run_id=run["id"],
+            capabilities=[
+                {
+                    "platform_type": platform_type,
+                    "verify_status": "supported",
+                    "market_state": "open",
+                    "detected_issue": None,
+                    "last_verified_at": "2026-04-19 00:00:00",
+                    "odds_synced": True,
+                    "odds_count": 1,
+                    "odds_message": "ok",
+                    "last_error": None,
+                }
+                for platform_type in supported_platforms
+            ],
+        )
     # Set account to online so strategy start works
     await db.execute(
         "UPDATE gambling_accounts SET status='online' WHERE id=?", (acc["id"],)
@@ -517,6 +551,61 @@ async def test_create_strategy_invalid_account(client):
 
 
 @pytest.mark.asyncio
+async def test_create_strategy_rejected_without_effective_verification_run(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"noverify_{uid}",
+        create_effective_verification=False,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "no_verify",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1002
+    assert "effective_verification_run_id" in resp.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_create_strategy_rejected_when_verification_stale(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"create_stale_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE account_verification_runs SET stale=1, stale_reason='test_stale' WHERE account_id=?",
+        (acc_id,),
+    )
+    await db.commit()
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "stale_create",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1002
+    assert "verification_stale" in resp.json()["message"]
+
+
+@pytest.mark.asyncio
 async def test_create_martin_without_sequence(client):
     """ 422"""
     uid = _uid()
@@ -789,6 +878,69 @@ async def test_start_strategy_auto_adjusts_same_direction_timing(client, mock_en
     assert start_second.status_code == 200
     assert start_second.json()["data"]["bet_timing"] == 50
     mock_engine.start_worker.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_start_strategy_rejected_without_effective_verification_run(client, mock_engine):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"start_noverify_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "start_no_verify",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute("DELETE FROM account_verification_runs WHERE account_id=?", (acc_id,))
+    await db.commit()
+
+    resp = await client.post(f"/api/v1/strategies/{sid}/start", headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 4002
+    assert "effective_verification_run_id" in resp.json()["message"]
+    mock_engine.start_worker.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_start_strategy_rejected_when_verification_stale(client, mock_engine):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"start_stale_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "start_stale",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE account_verification_runs SET stale=1, stale_reason='test_stale' WHERE account_id=?",
+        (acc_id,),
+    )
+    await db.commit()
+
+    resp = await client.post(f"/api/v1/strategies/{sid}/start", headers=headers)
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 4002
+    assert "verification_stale" in resp.json()["message"]
+    mock_engine.start_worker.assert_not_called()
 
 
 # 
