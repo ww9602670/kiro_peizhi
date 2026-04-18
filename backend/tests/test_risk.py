@@ -19,11 +19,12 @@ from app.engine.alert import AlertService
 from app.engine.risk import (
     PLATFORM_DEFAULT_SINGLE_BET_LIMIT,
     RiskCheckResult,
-    RiskController,
+    RiskController as _RiskController,
 )
 from app.engine.strategy_runner import BetSignal
 from app.models.db_ops import (
     account_create,
+    account_platform_session_upsert,
     account_update,
     bet_order_create,
     operator_create,
@@ -31,6 +32,15 @@ from app.models.db_ops import (
     strategy_get_by_id,
     strategy_update,
 )
+
+
+TEST_GAME_TYPE = "JND28"
+TEST_PLATFORM_TYPE = "JND28WEB"
+
+
+def RiskController(*args, **kwargs):
+    kwargs.setdefault("platform_type", TEST_PLATFORM_TYPE)
+    return _RiskController(*args, **kwargs)
 
 
 # 
@@ -60,12 +70,19 @@ async def setup_data(db):
     )
     acct = await account_create(
         db, operator_id=op["id"], account_name="acct1",
-        password="pw", platform_type="JND28WEB",
+        password="pw", game_type=TEST_GAME_TYPE,
     )
-    #  +  session_token + 
+    #  + 
     acct = await account_update(
         db, account_id=acct["id"], operator_id=op["id"],
-        status="online", session_token="valid_token", balance=100_000,
+        status="online", balance=100_000,
+    )
+    await account_platform_session_upsert(
+        db,
+        account_id=acct["id"],
+        platform_type=TEST_PLATFORM_TYPE,
+        status="online",
+        session_token="valid_token",
     )
     strat = await strategy_create(
         db, operator_id=op["id"], account_id=acct["id"],
@@ -254,6 +271,13 @@ class TestSession:
             db, account_id=setup_data["account"]["id"],
             operator_id=setup_data["operator"]["id"], session_token=None,
         )
+        await account_platform_session_upsert(
+            db,
+            account_id=setup_data["account"]["id"],
+            platform_type=TEST_PLATFORM_TYPE,
+            status="online",
+            session_token=None,
+        )
         risk = RiskController(
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
@@ -268,7 +292,14 @@ class TestSession:
     async def test_empty_session_token(self, db, setup_data, alert_service):
         await account_update(
             db, account_id=setup_data["account"]["id"],
-            operator_id=setup_data["operator"]["id"], session_token="",
+            operator_id=setup_data["operator"]["id"], session_token=None,
+        )
+        await account_platform_session_upsert(
+            db,
+            account_id=setup_data["account"]["id"],
+            platform_type=TEST_PLATFORM_TYPE,
+            status="online",
+            session_token="",
         )
         risk = RiskController(
             db=db, alert_service=alert_service,
@@ -1118,11 +1149,18 @@ async def _pbt_setup():
     )
     acct = await account_create(
         conn, operator_id=op["id"], account_name="pbt_acct",
-        password="pw", platform_type="JND28WEB",
+        password="pw", game_type=TEST_GAME_TYPE,
     )
     acct = await account_update(
         conn, account_id=acct["id"], operator_id=op["id"],
-        status="online", session_token="valid_token", balance=999_999_999,
+        status="online", balance=999_999_999,
+    )
+    await account_platform_session_upsert(
+        conn,
+        account_id=acct["id"],
+        platform_type=TEST_PLATFORM_TYPE,
+        status="online",
+        session_token="valid_token",
     )
     strat = await strategy_create(
         conn, operator_id=op["id"], account_id=acct["id"],
@@ -1422,8 +1460,11 @@ class TestPBT_P19_CheckOrderInvariance:
         try:
             # Configure conditions based on generated inputs
             if not has_session:
-                await account_update(
-                    conn, account_id=acct["id"], operator_id=op["id"],
+                await account_platform_session_upsert(
+                    conn,
+                    account_id=acct["id"],
+                    platform_type=TEST_PLATFORM_TYPE,
+                    status="offline",
                     session_token=None,
                 )
 

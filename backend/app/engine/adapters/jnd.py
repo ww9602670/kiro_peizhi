@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -17,6 +18,7 @@ from app.engine.adapters.base import (
     PlatformAdapter,
 )
 from app.engine.adapters.config import DEFAULT_HEADERS, MID_CODES
+from app.engine.adapters.jnd_dw3_profiles import get_jnd_dw3_profile
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,21 @@ class JNDAdapter(PlatformAdapter):
     @staticmethod
     def _safe_text(value: Any) -> str:
         return "" if value is None else str(value)
+
+    @staticmethod
+    def _format_amount_yuan(amount_fen: int) -> str:
+        whole, cents = divmod(int(amount_fen), 100)
+        if cents == 0:
+            return str(whole)
+        return f"{amount_fen / 100:.2f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _format_odds_value(odds_scaled: int) -> str:
+        return f"{int(odds_scaled) / 10000:.4f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _make_bet_num() -> str:
+        return str(time.time_ns())[-15:]
 
     @classmethod
     def _normalize_state(cls, value: Any) -> int:
@@ -218,47 +235,18 @@ class JNDAdapter(PlatformAdapter):
         captcha_code: Optional[str] = None,
     ) -> LoginResult:
         """
+        Formal platform login via AjaxLogin.
 
-         VisitorLogin  token cookie
-         txtName/txtPwd/txtVerify
-        
+        This flow must not probe VisitorLogin during account binding or manual
+        login. When no captcha code is provided, the caller should fetch a
+        captcha first and retry with AjaxLogin credentials.
         """
         session = await self._ensure_session()
-        url = f"{self.base_url}/Member/VisitorLogin"
-        try:
-            async with session.get(
-                url,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                #  cookies  token
-                cookies = session.cookie_jar.filter_cookies(URL(self.base_url))
-                token_value = None
-                for key, cookie in cookies.items():
-                    if key.lower() == "token":
-                        token_value = cookie.value
-                        break
-
-                if token_value:
-                    self._token = token_value
-                    return LoginResult(
-                        success=True,
-                        token=token_value,
-                        message="",
-                    )
-                logger.info("VisitorLogin did not return token cookie")
-        except aiohttp.ClientError as e:
-            logger.error(": %s", e)
-            if captcha_code is None:
-                return LoginResult(
-                    success=False,
-                    message=f": {e}",
-                )
-
         if not captcha_code:
             return LoginResult(
                 success=False,
-                message=" token cookie",
+                message="captcha required",
+                captcha_required=True,
             )
 
         ajax_url = f"{self.base_url}/Member/AjaxLogin"
@@ -555,6 +543,113 @@ class JNDAdapter(PlatformAdapter):
             if isinstance(data, list):
                 return data
         return []
+
+    # DW3-aware overrides are defined after legacy methods so the class uses the
+    # verified payloads and odds loaders for both WEB and 2.0.
+    async def load_odds(self, issue: str) -> dict[str, int]:
+        odds = await self._load_odds_for_form(
+            issue,
+            {
+                "itype": "-1",
+                "midCode": MID_CODES,
+                "oddstype": "A",
+            },
+        )
+        dw3_profile = get_jnd_dw3_profile(self.lottery_type)
+        if dw3_profile is not None:
+            dw3_odds = await self._load_odds_for_form(
+                issue,
+                {
+                    "itype": "-1",
+                    "settingCode": dw3_profile.odds_setting_code,
+                    "oddstype": "A",
+                },
+            )
+            odds.update(dw3_odds)
+        return odds
+
+    async def _load_odds_for_form(
+        self,
+        issue: str,
+        extra_form: dict[str, str],
+    ) -> dict[str, int]:
+        url = (
+            f"{self.base_url}/PlaceBet/Loaddata"
+            f"?lotteryType={self.lottery_type}"
+        )
+        form_data = {
+            "lotteryType": self.lottery_type,
+            "install": issue,
+            **extra_form,
+        }
+        resp = await self._post(url, data=form_data)
+        return self._extract_scaled_odds(resp)
+
+    @staticmethod
+    def _extract_scaled_odds(resp: Any) -> dict[str, int]:
+        odds_raw: dict[str, Any] = resp if isinstance(resp, dict) else {}
+        if "data" in odds_raw and isinstance(odds_raw["data"], dict):
+            odds_raw = odds_raw["data"]
+
+        odds: dict[str, int] = {}
+        for key, value in odds_raw.items():
+            try:
+                float_val = float(value)
+                odds[key] = round(float_val * 10000)
+            except (ValueError, TypeError):
+                continue
+        return odds
+
+    async def place_bet(self, issue: str, betdata: list[dict]) -> BetResult:
+        url = f"{self.base_url}/PlaceBet/Confirmbet"
+        form_data: dict[str, str] = {}
+        for i, bet in enumerate(betdata):
+            amount_fen = self._safe_int(bet["Amount"], 0)
+            odds_scaled = self._safe_int(bet["Odds"], 0)
+            form_data[f"betdata[{i}][Amount]"] = self._format_amount_yuan(amount_fen)
+            form_data[f"betdata[{i}][KeyCode]"] = str(bet["KeyCode"])
+            form_data[f"betdata[{i}][Odds]"] = self._format_odds_value(odds_scaled)
+        form_data["lotteryType"] = self.lottery_type
+        form_data["betNum"] = self._make_bet_num()
+        form_data["prompt"] = "false"
+        form_data["gt"] = "A"
+        form_data["install"] = issue
+
+        try:
+            resp = await self._post(url, data=form_data, timeout=15.0)
+            return BetResult(
+                succeed=int(resp.get("succeed", 0)),
+                message=str(resp.get("msg", "")),
+                raw_response=resp,
+            )
+        except Exception as e:
+            logger.error(": %s", e)
+            return BetResult(
+                succeed=0,
+                message=f": {e}",
+                raw_response={},
+            )
+
+    async def get_bet_history(self, count: int = 15) -> list[dict]:
+        url = f"{self.base_url}/BettingList/getBetChecked"
+        form_data = {
+            "startIndex": "0",
+            "rows": str(count),
+        }
+        resp = await self._post(url, data=form_data)
+        records = self._extract_bet_history_records(resp)
+        expected_type = (self.lottery_type or "").upper()
+        has_platform_type = any(
+            isinstance(record, dict) and str(record.get("LotteryType", "")).strip()
+            for record in records
+        )
+        if has_platform_type and expected_type:
+            return [
+                record
+                for record in records
+                if str(record.get("LotteryType", "")).upper() == expected_type
+            ]
+        return records
 
     async def heartbeat(self) -> bool:
         """"""

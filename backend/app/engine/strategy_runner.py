@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import logging
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from app.engine.strategies.base import (
     BaseStrategy,
@@ -37,6 +38,7 @@ class BetSignal:
     idempotent_id: str  # {issue}-{strategy_id}-{key_code}
     martin_level: int = 0
     simulation: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class StrategyRunner:
@@ -158,4 +160,5 @@ class StrategyRunner:
             idempotent_id=f"{issue}-{self.strategy_id}-{key_code_upper}",
             martin_level=martin_level,
             simulation=self.simulation,
+            metadata=dict(inst.metadata),
         )

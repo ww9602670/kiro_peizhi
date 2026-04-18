@@ -9,9 +9,10 @@ interface Props {
   value: string;
   onChange: (keyCode: string) => void;
   disabled?: boolean;
+  platformType?: string;
 }
 
-export default function PlayCodeSelect({ value, onChange, disabled }: Props) {
+export default function PlayCodeSelect({ value, onChange, disabled, platformType }: Props) {
   const [groups, setGroups] = useState<PlayCodeGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -20,7 +21,7 @@ export default function PlayCodeSelect({ value, onChange, disabled }: Props) {
     setLoading(true);
     setError('');
     try {
-      const res = await listPlayCodes();
+      const res = await listPlayCodes({ platformType });
       setGroups(res.data ?? []);
     } catch {
       setError('加载玩法列表失败');
@@ -29,7 +30,7 @@ export default function PlayCodeSelect({ value, onChange, disabled }: Props) {
     }
   };
 
-  useEffect(() => { fetchGroups(); }, []);
+  useEffect(() => { fetchGroups(); }, [platformType]);
 
   if (loading) {
     return <span className="play-code-loading">加载玩法中...</span>;

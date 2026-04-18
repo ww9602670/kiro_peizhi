@@ -30,13 +30,49 @@ from app.schemas.strategy import (
     StrategyCreate,
     StrategyInfo,
     StrategyUpdate,
-    normalize_red_wave_double_play_code,
+    has_dw3_prefix,
+    is_dw3_group_play_code,
+    normalize_dw3_group_play_code,
     validate_state_transition,
+)
+from app.schemas.account import get_allowed_platform_types
+from app.utils.strategy_timing import (
+    BET_TIMING_MAX,
+    BET_TIMING_MIN,
+    build_candidate_from_row,
+    build_timing_candidate,
+    normalize_red_wave_double_play_code,
+    resolve_timing_conflicts,
+    summarize_timing_conflicts,
 )
 from app.utils.response import BizError
 from app.utils.key_code_map import get_key_code_name
+from app.utils.luckysb_play_codes import (
+    LUCKYSB_PLATFORM_TYPE,
+    get_luckysb_play_code_name,
+    validate_luckysb_strategy,
+)
 
 router = APIRouter()
+
+DW3_PLAY_CODE_LABELS: dict[str, str] = {
+    "DW3_BS_BBB": "DW3 Big-Big-Big",
+    "DW3_BS_BBS": "DW3 Big-Big-Small",
+    "DW3_BS_BSB": "DW3 Big-Small-Big",
+    "DW3_BS_BSS": "DW3 Big-Small-Small",
+    "DW3_BS_SBB": "DW3 Small-Big-Big",
+    "DW3_BS_SBS": "DW3 Small-Big-Small",
+    "DW3_BS_SSB": "DW3 Small-Small-Big",
+    "DW3_BS_SSS": "DW3 Small-Small-Small",
+    "DW3_OE_OOO": "DW3 Odd-Odd-Odd",
+    "DW3_OE_OOE": "DW3 Odd-Odd-Even",
+    "DW3_OE_OEO": "DW3 Odd-Even-Odd",
+    "DW3_OE_OEE": "DW3 Odd-Even-Even",
+    "DW3_OE_EOO": "DW3 Even-Odd-Odd",
+    "DW3_OE_EOE": "DW3 Even-Odd-Even",
+    "DW3_OE_EEO": "DW3 Even-Even-Odd",
+    "DW3_OE_EEE": "DW3 Even-Even-Even",
+}
 
 
 #   
@@ -56,6 +92,88 @@ def _fen_to_yuan_optional(fen: Optional[int]) -> Optional[float]:
     return fen / 100 if fen is not None else None
 
 
+def _get_play_code_name(platform_type: str, play_code: str) -> str:
+    if platform_type == LUCKYSB_PLATFORM_TYPE:
+        return get_luckysb_play_code_name(play_code)
+    if is_dw3_group_play_code(play_code):
+        return ", ".join(DW3_PLAY_CODE_LABELS.get(c, c) for c in play_code.split(","))
+    return ", ".join(get_key_code_name(c) for c in play_code.split(","))
+
+
+def _validate_luckysb_or_raise(type_: str, play_code: str) -> None:
+    try:
+        validate_luckysb_strategy(type_, play_code)
+    except ValueError as exc:
+        raise BizError(1002, str(exc), status_code=400)
+
+
+def _validate_strategy_platform_type_for_account(
+    strategy_platform_type: str,
+    account: dict,
+) -> str:
+    normalized = (strategy_platform_type or "").strip().upper()
+    allowed = get_allowed_platform_types(account.get("game_type", ""))
+    if normalized not in allowed:
+        raise BizError(
+            1002,
+            f"platform_type is not allowed for game_type={account.get('game_type')}",
+            status_code=400,
+        )
+    return normalized
+
+
+def _is_dw3_timing_conflict_exempt(play_code: str) -> bool:
+    """Policy A: DW3 does not join generic save-time timing auto-allocation."""
+    return is_dw3_group_play_code(play_code)
+
+
+def _raise_timing_conflict(conflicts, *, reason: str | None = None) -> None:
+    detail = summarize_timing_conflicts(conflicts)
+    detail["reason"] = reason or "BET_TIMING_CONFLICT"
+    detail["bet_timing_window"] = {
+        "min": BET_TIMING_MIN,
+        "max": BET_TIMING_MAX,
+    }
+    raise BizError(
+        1003,
+        "bet_timing conflicts with same-direction strategies; keep at least 20s gap",
+        status_code=400,
+        data=detail,
+    )
+
+
+async def _resolve_bet_timing_for_save(
+    db,
+    *,
+    operator_id: int,
+    candidate,
+    statuses: set[str] | None = None,
+) -> int:
+    if _is_dw3_timing_conflict_exempt(candidate.play_code):
+        return candidate.bet_timing
+
+    if statuses is None:
+        statuses = {"running"}
+
+    rows = await strategy_list_by_operator(db, operator_id=operator_id)
+    others = []
+    for row in rows:
+        if row.get("account_id") != candidate.account_id:
+            continue
+        if candidate.strategy_id is not None and row.get("id") == candidate.strategy_id:
+            continue
+        if statuses is not None and row.get("status") not in statuses:
+            continue
+        if _is_dw3_timing_conflict_exempt(str(row.get("play_code") or "")):
+            continue
+        others.append(build_candidate_from_row(row))
+
+    resolution = resolve_timing_conflicts(candidate, others)
+    if resolution.resolved_bet_timing is None:
+        _raise_timing_conflict(resolution.conflicts, reason=resolution.reason)
+    return int(resolution.resolved_bet_timing)
+
+
 #  DB   StrategyInfo  
 
 def _to_strategy_info(row: dict) -> StrategyInfo:
@@ -69,13 +187,15 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
     today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     daily_pnl_raw = row["daily_pnl"] if row.get("daily_pnl_date") == today else 0
 
+    platform_type = row.get("platform_type", "JND28WEB")
+
     return StrategyInfo(
         id=row["id"],
         account_id=row["account_id"],
         name=row["name"],
         type=row["type"],
         play_code=row["play_code"],
-        play_code_name=", ".join(get_key_code_name(c) for c in row["play_code"].split(",")),
+        play_code_name=_get_play_code_name(platform_type, row["play_code"]),
         base_amount=_fen_to_yuan(row["base_amount"]),
         martin_sequence=martin_sequence,
         bet_timing=row["bet_timing"],
@@ -86,7 +206,8 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
         take_profit=_fen_to_yuan_optional(row.get("take_profit")),
         daily_pnl=_fen_to_yuan(daily_pnl_raw),
         total_pnl=_fen_to_yuan(row["total_pnl"]),
-        platform_type=row.get("platform_type", "JND28WEB"),
+        gate_window_issues=row.get("gate_window_issues"),
+        platform_type=platform_type,
     )
 
 
@@ -122,9 +243,27 @@ async def create_strategy(
     )
     if not account:
         raise BizError(4001, "", status_code=404)
+    strategy_platform_type = _validate_strategy_platform_type_for_account(
+        body.platform_type,
+        account,
+    )
 
     # 2. 
     play_code = body.play_code
+    if strategy_platform_type == LUCKYSB_PLATFORM_TYPE:
+        _validate_luckysb_or_raise(body.type, play_code)
+
+    resolved_bet_timing = await _resolve_bet_timing_for_save(
+        db,
+        operator_id=operator["id"],
+        candidate=build_timing_candidate(
+            strategy_id=None,
+            account_id=body.account_id,
+            strategy_type=body.type,
+            play_code=play_code,
+            bet_timing=body.bet_timing,
+        ),
+    )
 
     martin_seq_json = (
         json.dumps(body.martin_sequence) if body.martin_sequence else None
@@ -139,11 +278,12 @@ async def create_strategy(
         play_code=play_code,
         base_amount=_yuan_to_fen(body.base_amount),
         martin_sequence=martin_seq_json,
-        bet_timing=body.bet_timing,
+        bet_timing=resolved_bet_timing,
         simulation=1 if body.simulation else 0,
         stop_loss=_yuan_to_fen(body.stop_loss) if body.stop_loss is not None else None,
         take_profit=_yuan_to_fen(body.take_profit) if body.take_profit is not None else None,
-        platform_type=body.platform_type,
+        gate_window_issues=body.gate_window_issues,
+        platform_type=strategy_platform_type,
     )
 
     return ApiResponse[StrategyInfo](data=_to_strategy_info(row))
@@ -162,6 +302,11 @@ async def update_strategy(
     )
     if not existing:
         raise BizError(4001, "", status_code=404)
+    account = await account_get_by_id(
+        db, account_id=existing["account_id"], operator_id=operator["id"]
+    )
+    if not account:
+        raise BizError(4001, "", status_code=404)
 
     if existing["status"] != "stopped":
         raise BizError(4003, "", status_code=400)
@@ -172,15 +317,35 @@ async def update_strategy(
         update_fields["name"] = body.name
     if body.base_amount is not None:
         update_fields["base_amount"] = _yuan_to_fen(body.base_amount)
+    existing_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
+    requested_platform_type = (
+        _validate_strategy_platform_type_for_account(body.platform_type, account)
+        if body.platform_type is not None
+        else existing_platform_type
+    )
     if body.play_code is not None:
-        if existing["type"] != "red_wave_double_martin":
-            raise BizError(1002, "only red_wave_double_martin supports play_code update", status_code=400)
-        try:
-            update_fields["play_code"] = normalize_red_wave_double_play_code(
-                body.play_code
+        if requested_platform_type == LUCKYSB_PLATFORM_TYPE:
+            update_fields["play_code"] = body.play_code
+        elif existing["type"] == "red_wave_double_martin":
+            try:
+                update_fields["play_code"] = normalize_red_wave_double_play_code(
+                    body.play_code
+                )
+            except ValueError as exc:
+                raise BizError(1002, str(exc), status_code=400)
+        elif existing["type"] in ("flat", "martin") and (
+            has_dw3_prefix(body.play_code) or is_dw3_group_play_code(existing["play_code"])
+        ):
+            try:
+                update_fields["play_code"] = normalize_dw3_group_play_code(body.play_code)
+            except ValueError as exc:
+                raise BizError(1002, str(exc), status_code=400)
+        else:
+            raise BizError(
+                1002,
+                "play_code update is only allowed for red_wave_double_martin or DW3 flat/martin",
+                status_code=400,
             )
-        except ValueError as exc:
-            raise BizError(1002, str(exc), status_code=400)
     if body.martin_sequence is not None:
         # 
         for v in body.martin_sequence:
@@ -195,11 +360,38 @@ async def update_strategy(
         update_fields["stop_loss"] = _yuan_to_fen(body.stop_loss)
     if body.take_profit is not None:
         update_fields["take_profit"] = _yuan_to_fen(body.take_profit)
+    if body.gate_window_issues is not None:
+        update_fields["gate_window_issues"] = body.gate_window_issues
     if body.platform_type is not None:
-        update_fields["platform_type"] = body.platform_type
+        update_fields["platform_type"] = requested_platform_type
 
     if not update_fields:
         return ApiResponse[StrategyInfo](data=_to_strategy_info(existing))
+
+    final_platform_type = update_fields.get("platform_type", existing_platform_type)
+    final_play_code = update_fields.get("play_code", existing["play_code"])
+    final_gate_window_issues = update_fields.get(
+        "gate_window_issues", existing.get("gate_window_issues")
+    )
+    if final_platform_type == LUCKYSB_PLATFORM_TYPE:
+        _validate_luckysb_or_raise(existing["type"], final_play_code)
+    if is_dw3_group_play_code(final_play_code) and final_gate_window_issues is None:
+        raise BizError(1002, "gate_window_issues is required for DW3 play_code", status_code=400)
+
+    candidate = build_timing_candidate(
+        strategy_id=existing["id"],
+        account_id=existing["account_id"],
+        strategy_type=existing["type"],
+        play_code=update_fields.get("play_code", existing["play_code"]),
+        bet_timing=update_fields.get("bet_timing", existing["bet_timing"]),
+    )
+    resolved_bet_timing = await _resolve_bet_timing_for_save(
+        db,
+        operator_id=operator["id"],
+        candidate=candidate,
+    )
+    if resolved_bet_timing != candidate.bet_timing:
+        update_fields["bet_timing"] = resolved_bet_timing
 
     row = await strategy_update(
         db, strategy_id=strategy_id, operator_id=operator["id"], **update_fields
@@ -280,6 +472,21 @@ async def _transition_strategy(
             status_code=400,
         )
 
+    if target_status == "running":
+        resolved_bet_timing = await _resolve_bet_timing_for_save(
+            db,
+            operator_id=operator["id"],
+            candidate=build_candidate_from_row(existing),
+            statuses={"running"},
+        )
+        if resolved_bet_timing != existing["bet_timing"]:
+            existing = await strategy_update(
+                db,
+                strategy_id=strategy_id,
+                operator_id=operator["id"],
+                bet_timing=resolved_bet_timing,
+            )
+
     row = await strategy_update_status(
         db,
         strategy_id=strategy_id,
@@ -328,12 +535,13 @@ async def _transition_strategy(
             logger.error(" account_id=%d status=%s", account["id"], account["status"])
             raise BizError(4002, "", status_code=400)
         
-        #  running 
+        strategy_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
         all_strategies = await strategy_list_by_operator(db, operator_id=operator["id"])
         running_strategies = [
             s for s in all_strategies
             if s.get("account_id") == existing["account_id"]
             and s.get("status") == "running"
+            and (s.get("platform_type") or strategy_platform_type) == strategy_platform_type
         ]
         
         logger.info(
@@ -346,7 +554,6 @@ async def _transition_strategy(
         try:
             logger.info("  engine.start_worker...")
             # 优先使用策略的 platform_type，回退到账号的 platform_type
-            strategy_platform_type = existing.get("platform_type") or account.get("platform_type", "JND28WEB")
             await engine.start_worker(
                 operator_id=operator["id"],
                 account_id=account["id"],
@@ -365,13 +572,19 @@ async def _transition_strategy(
     elif target_status == "stopped":
         logger.info("  Worker...")
         
-        #  running 
+        account = await account_get_by_id(
+            db, account_id=existing["account_id"], operator_id=operator["id"]
+        )
+        if not account:
+            raise BizError(4001, "", status_code=404)
+        strategy_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
         all_strategies = await strategy_list_by_operator(db, operator_id=operator["id"])
         running_strategies = [
             s for s in all_strategies
             if s.get("account_id") == existing["account_id"]
             and s.get("status") == "running"
-            and s.get("id") != strategy_id  # 
+            and s.get("id") != strategy_id
+            and (s.get("platform_type") or strategy_platform_type) == strategy_platform_type
         ]
         
         logger.info(
@@ -384,7 +597,10 @@ async def _transition_strategy(
         if not running_strategies:
             try:
                 logger.info("  engine.stop_worker...")
-                await engine.stop_worker(account_id=existing["account_id"])
+                await engine.stop_worker(
+                    account_id=existing["account_id"],
+                    platform_type=strategy_platform_type,
+                )
                 logger.info(" engine.stop_worker ")
             except Exception as e:
                 logger.exception(f"  Worker : {e}")
@@ -392,7 +608,7 @@ async def _transition_strategy(
         else:
             # 还有其他 running 策略：从 Worker 中移除该策略，不停止 Worker
             try:
-                worker = await engine.registry.get(existing["account_id"])
+                worker = await engine.registry.get((existing["account_id"], strategy_platform_type))
                 if worker and worker.running:
                     worker.remove_strategy(strategy_id)
                     logger.info(
@@ -406,7 +622,13 @@ async def _transition_strategy(
     elif target_status == "paused":
         logger.info("暂停策略，从 Worker 移除 strategy_id=%d...", strategy_id)
         try:
-            worker = await engine.registry.get(existing["account_id"])
+            account = await account_get_by_id(
+                db, account_id=existing["account_id"], operator_id=operator["id"]
+            )
+            if not account:
+                raise BizError(4001, "", status_code=404)
+            strategy_platform_type = existing.get("platform_type") or get_allowed_platform_types(account["game_type"])[0]
+            worker = await engine.registry.get((existing["account_id"], strategy_platform_type))
             if worker and worker.running:
                 worker.remove_strategy(strategy_id)
                 logger.info(

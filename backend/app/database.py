@@ -47,7 +47,7 @@ DDL_STATEMENTS = [
         operator_id     INTEGER NOT NULL REFERENCES operators(id),
         account_name    TEXT NOT NULL,
         password        TEXT NOT NULL,
-        platform_type   TEXT NOT NULL,
+        game_type       TEXT NOT NULL,
         platform_url    TEXT,
         status          TEXT NOT NULL DEFAULT 'inactive',
         session_token   TEXT,
@@ -58,13 +58,30 @@ DDL_STATEMENTS = [
         single_bet_limit INTEGER,
         daily_limit     INTEGER,
         period_limit    INTEGER,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        UNIQUE(operator_id, account_name, game_type)
+    );
+    """,
+
+    # 2.1 account_platform_sessions
+    """
+    CREATE TABLE IF NOT EXISTS account_platform_sessions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id      INTEGER NOT NULL REFERENCES gambling_accounts(id) ON DELETE CASCADE,
+        platform_type   TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'inactive',
+        session_token   TEXT,
+        login_fail_count INTEGER DEFAULT 0,
+        last_login_at   TEXT,
         worker_lock_token TEXT DEFAULT NULL,
         worker_lock_ts  TEXT DEFAULT NULL,
         created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
-        UNIQUE(operator_id, account_name, platform_type)
+        UNIQUE(account_id, platform_type)
     );
     """,
+    "CREATE INDEX IF NOT EXISTS idx_account_platform_sessions_account ON account_platform_sessions(account_id, platform_type);",
 
     # 3. strategies
     """
@@ -86,6 +103,7 @@ DDL_STATEMENTS = [
         daily_pnl       INTEGER NOT NULL DEFAULT 0,
         total_pnl       INTEGER NOT NULL DEFAULT 0,
         daily_pnl_date  TEXT,
+        gate_window_issues INTEGER,
         platform_type   TEXT NOT NULL DEFAULT 'JND28WEB',
         created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
@@ -100,6 +118,7 @@ DDL_STATEMENTS = [
         operator_id     INTEGER NOT NULL REFERENCES operators(id),
         account_id      INTEGER NOT NULL REFERENCES gambling_accounts(id),
         strategy_id     INTEGER NOT NULL REFERENCES strategies(id),
+        actual_platform_type TEXT,
         issue           TEXT NOT NULL,
         key_code        TEXT NOT NULL,
         amount          INTEGER NOT NULL,
@@ -214,15 +233,16 @@ DDL_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS account_odds (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         account_id      INTEGER NOT NULL REFERENCES gambling_accounts(id) ON DELETE CASCADE,
+        platform_type   TEXT NOT NULL DEFAULT 'JND28WEB',
         key_code        TEXT NOT NULL,
         odds_value      INTEGER NOT NULL,
         confirmed       INTEGER NOT NULL DEFAULT 0,
         fetched_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         confirmed_at    TEXT,
-        UNIQUE(account_id, key_code)
+        UNIQUE(account_id, platform_type, key_code)
     );
     """,
-    "CREATE INDEX IF NOT EXISTS idx_account_odds_account ON account_odds(account_id, confirmed);",
+    "CREATE INDEX IF NOT EXISTS idx_account_odds_account ON account_odds(account_id, platform_type, confirmed);",
 
     # 11. backtest_tasks (回测任务)
     """
@@ -288,6 +308,34 @@ async def close_shared_db() -> None:
     if _shared_db is not None:
         await _shared_db.close()
         _shared_db = None
+
+
+async def _reset_legacy_platform_binding_schema(db: aiosqlite.Connection) -> None:
+    """Drop legacy tables when the account schema still binds platform_type.
+
+    The current workspace only contains disposable test data, so a one-time
+    destructive reset is acceptable and avoids carrying forward the broken
+    account-platform coupling.
+    """
+    rows = await (await db.execute("PRAGMA table_info(gambling_accounts)")).fetchall()
+    if not rows:
+        return
+
+    existing_cols = {row[1] for row in rows}
+    if "game_type" in existing_cols and "platform_type" not in existing_cols:
+        return
+
+    logger.warning("Detected legacy account schema; resetting platform-coupled tables")
+    for table_name in (
+        "account_platform_sessions",
+        "bet_orders",
+        "strategies",
+        "reconcile_records",
+        "account_odds",
+        "gambling_accounts",
+    ):
+        await db.execute(f"DROP TABLE IF EXISTS {table_name}")
+    await db.commit()
 
 
 async def _auto_migrate(db: aiosqlite.Connection) -> None:
@@ -361,6 +409,7 @@ async def init_db(db_path: str | None = None) -> None:
 
     db = await get_db(path)
     try:
+        await _reset_legacy_platform_binding_schema(db)
         for stmt in DDL_STATEMENTS:
             await db.execute(stmt)
         # 自动迁移：检测并添加缺失列

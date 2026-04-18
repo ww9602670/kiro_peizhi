@@ -30,6 +30,8 @@ describe('listAccounts', () => {
         id: 1,
         account_name: 'player001',
         password_masked: 'pl****',
+        game_type: 'JND28',
+        allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
         platform_type: 'JND28WEB',
         status: 'inactive',
         balance: 100.5,
@@ -48,11 +50,13 @@ describe('listAccounts', () => {
 
 describe('createAccount', () => {
   it('调用正确路径、方法和请求体', async () => {
-    const payload = { account_name: 'player001', password: 'mypassword', platform_type: 'JND28WEB' as const };
+    const payload = { account_name: 'player001', password: 'mypassword', game_type: 'JND28' as const };
     const created = {
       id: 1,
       account_name: 'player001',
       password_masked: 'my****',
+      game_type: 'JND28',
+      allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
       platform_type: 'JND28WEB',
       status: 'inactive',
       balance: 0,
@@ -71,13 +75,43 @@ describe('createAccount', () => {
   });
 
   it('支持 JND282 盘口类型', async () => {
-    const payload = { account_name: 'test', password: 'pw', platform_type: 'JND282' as const };
+    const payload = { account_name: 'test', password: 'pw', game_type: 'JND28' as const };
     mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
 
     await createAccount(payload);
 
     const body = JSON.parse(mockRequest.mock.calls[0][1]!.body as string);
-    expect(body.platform_type).toBe('JND282');
+    expect(body.game_type).toBe('JND28');
+  });
+
+  it('支持 JND 平台地址', async () => {
+    const payload = {
+      account_name: 'jnd',
+      password: 'pw',
+      game_type: 'JND28' as const,
+      platform_url: 'https://merchant.example',
+    };
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
+
+    await createAccount(payload);
+
+    const body = JSON.parse(mockRequest.mock.calls[0][1]!.body as string);
+    expect(body).toEqual(payload);
+  });
+
+  it('支持 LUCKYSB 会员站地址', async () => {
+    const payload = {
+      account_name: 'lucky',
+      password: 'pw',
+      game_type: 'LUCKYSB' as const,
+      platform_url: 'https://member.example',
+    };
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
+
+    await createAccount(payload);
+
+    const body = JSON.parse(mockRequest.mock.calls[0][1]!.body as string);
+    expect(body).toEqual(payload);
   });
 });
 
@@ -99,6 +133,8 @@ describe('loginAccount', () => {
       id: 1,
       account_name: 'player001',
       password_masked: 'pl****',
+      game_type: 'JND28',
+      allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
       platform_type: 'JND28WEB',
       status: 'online',
       balance: 500,
@@ -122,6 +158,8 @@ describe('updateKillSwitch', () => {
       id: 5,
       account_name: 'player005',
       password_masked: 'pl****',
+      game_type: 'JND28',
+      allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
       platform_type: 'JND282',
       status: 'inactive',
       balance: 0,

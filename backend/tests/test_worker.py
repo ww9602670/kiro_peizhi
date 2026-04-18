@@ -27,6 +27,7 @@ from app.engine.worker import (
     SETTLE_DATA_RETRY_INTERVAL,
     API_RETRY_DELAYS,
     API_RETRY_MAX,
+    StrategyRuntimeProfile,
     _parse_result,
 )
 
@@ -82,6 +83,13 @@ def _make_worker(**overrides) -> AccountWorker:
     return AccountWorker(**defaults)
 
 
+def _mock_lock_cursor(rowcount: int) -> AsyncMock:
+    cursor = AsyncMock()
+    cursor.rowcount = rowcount
+    cursor.fetchone = AsyncMock(return_value=None)
+    return cursor
+
+
 # 
 # _parse_result 
 # 
@@ -130,11 +138,17 @@ class TestBetTiming:
         install = _make_install(close_countdown_sec=19)
         assert worker._should_bet(install) is True
 
-    def test_60s_bet(self):
-        """CloseTimeStamp=60s  """
+    def test_30s_bet(self):
+        """CloseTimeStamp=30s enters the default 30s window."""
+        worker = _make_worker()
+        install = _make_install(close_countdown_sec=30)
+        assert worker._should_bet(install) is True
+
+    def test_60s_waits_for_window(self):
+        """CloseTimeStamp=60s is still outside the default 30s window."""
         worker = _make_worker()
         install = _make_install(close_countdown_sec=60)
-        assert worker._should_bet(install) is True
+        assert worker._should_bet(install) is False
 
     def test_0s_skip(self):
         """CloseTimeStamp=0s  """
@@ -701,8 +715,7 @@ class TestLifecycle:
         worker = _make_worker()
 
         # Mock lock acquisition success
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 1
+        mock_cursor = _mock_lock_cursor(1)
         worker.db.execute = AsyncMock(return_value=mock_cursor)
         worker.db.commit = AsyncMock()
 
@@ -746,14 +759,28 @@ class TestLifecycle:
         worker = _make_worker()
         runner = MagicMock()
 
-        worker.add_strategy(1, runner)
+        worker.add_strategy(1, runner, apply_next_issue_only=False)
         assert 1 in worker.strategies
 
-        worker.remove_strategy(1)
+        worker.remove_strategy(1, apply_next_issue_only=False)
         assert 1 not in worker.strategies
 
         # 
         worker.remove_strategy(999)
+
+    def test_add_strategy_stages_next_issue_by_default(self):
+        worker = _make_worker()
+        staged_runner = MagicMock()
+
+        worker.add_strategy(
+            2,
+            staged_runner,
+            profile=StrategyRuntimeProfile(strategy_id=2, bet_timing=60),
+        )
+
+        assert 2 not in worker.strategies
+        assert 2 in worker.get_staged_or_current_strategies()
+        assert worker.get_staged_or_current_profiles()[2].bet_timing == 60
 
 
 # 
@@ -762,7 +789,8 @@ class TestLifecycle:
 
 
 class TestSignalCollection:
-    def test_collect_signals_from_running_strategies(self):
+    @pytest.mark.asyncio
+    async def test_collect_signals_from_running_strategies(self):
         """ running """
         from app.engine.strategy_runner import BetSignal
 
@@ -779,12 +807,13 @@ class TestSignalCollection:
         worker.strategies = {1: runner}
 
         install = _make_install(issue="20250302001")
-        signals = worker._collect_signals(install)
+        signals = await worker._collect_signals(install)
 
         assert len(signals) == 1
         assert signals[0].key_code == "DX1"
 
-    def test_collect_signals_exception_isolated(self):
+    @pytest.mark.asyncio
+    async def test_collect_signals_exception_isolated(self):
         """"""
         from app.engine.strategy_runner import BetSignal
 
@@ -806,13 +835,14 @@ class TestSignalCollection:
         worker.strategies = {1: runner_fail, 2: runner_ok}
 
         install = _make_install(issue="20250302001")
-        signals = worker._collect_signals(install)
+        signals = await worker._collect_signals(install)
 
         #  runner_ok 
         assert len(signals) == 1
         assert signals[0].strategy_id == 2
 
-    def test_collect_signals_passes_latest_result_history(self):
+    @pytest.mark.asyncio
+    async def test_collect_signals_passes_latest_result_history(self):
         """install.pre_result is exposed as StrategyContext.history[0]."""
         worker = _make_worker()
         runner = MagicMock()
@@ -824,7 +854,7 @@ class TestSignalCollection:
             pre_issue="20250302001",
             pre_result="1,2,3",
         )
-        worker._collect_signals(install)
+        await worker._collect_signals(install)
 
         ctx = runner.collect_signals.call_args.kwargs["ctx"]
         assert len(ctx.history) == 1
@@ -902,12 +932,13 @@ class TestPBT_P22_WorkerRecoveryIdempotency:
 
 
 class TestPBT_P27_SkipThreshold:
-    """P27: CloseTimeStamp 18  skip; > 18  bet.
+    """P27: the worker only enters the 19..bet_timing window.
 
     **Validates: Requirements 5.1**
 
     Property: For any CloseTimeStamp value, _should_bet returns False
-    when close_countdown_sec <= SKIP_THRESHOLD (18), and True otherwise.
+    when close_countdown_sec <= SKIP_THRESHOLD (18), and only returns True
+    inside the configured strategy window.
     """
 
     @given(close_countdown_sec=st.integers(min_value=0, max_value=18))
@@ -924,13 +955,10 @@ class TestPBT_P27_SkipThreshold:
             f"but _should_bet returned True"
         )
 
-    @given(close_countdown_sec=st.integers(min_value=19, max_value=300))
+    @given(close_countdown_sec=st.integers(min_value=19, max_value=30))
     @settings(max_examples=100)
-    def test_pbt_bet_when_gt_18(self, close_countdown_sec: int):
-        """CloseTimeStamp > 18  _should_bet returns True.
-
-        **Validates: Requirements 5.1**
-        """
+    def test_pbt_bet_when_within_default_window(self, close_countdown_sec: int):
+        """CloseTimeStamp inside 19..30 enters the default 30s window."""
         worker = _make_worker()
         install = _make_install(close_countdown_sec=close_countdown_sec)
         assert worker._should_bet(install) is True, (
@@ -938,13 +966,127 @@ class TestPBT_P27_SkipThreshold:
             f"but _should_bet returned False"
         )
 
+    @given(close_countdown_sec=st.integers(min_value=31, max_value=300))
+    @settings(max_examples=100)
+    def test_pbt_skip_when_window_not_open_yet(self, close_countdown_sec: int):
+        worker = _make_worker()
+        install = _make_install(close_countdown_sec=close_countdown_sec)
+        assert worker._should_bet(install) is False, (
+            f"Expected wait for close_countdown_sec={close_countdown_sec}, "
+            f"but _should_bet returned True"
+        )
+
+
+class TestIssueExecutionPlan:
+    @pytest.mark.asyncio
+    async def test_run_due_strategy_windows_executes_groups_in_desc_order(self):
+        from app.engine.executor import ExecutionReport
+        from app.engine.strategy_runner import BetSignal
+
+        worker = _make_worker(
+            strategies={1: MagicMock(), 2: MagicMock()},
+            strategy_profiles={
+                1: StrategyRuntimeProfile(strategy_id=1, bet_timing=60),
+                2: StrategyRuntimeProfile(strategy_id=2, bet_timing=40),
+            },
+        )
+        worker.running = True
+        worker.adapter.get_current_install = AsyncMock(
+            side_effect=[
+                _make_install(close_countdown_sec=34),
+                _make_install(close_countdown_sec=32),
+            ]
+        )
+        worker._collect_signals = AsyncMock(
+            side_effect=[
+                [BetSignal(strategy_id=1, key_code="DX1", amount=1000, idempotent_id="i-1")],
+                [BetSignal(strategy_id=2, key_code="DX2", amount=1000, idempotent_id="i-2")],
+            ]
+        )
+        worker.executor.execute = AsyncMock(
+            side_effect=[ExecutionReport(), ExecutionReport()]
+        )
+        worker._apply_execution_report = AsyncMock()
+
+        result = await worker._run_due_strategy_windows(
+            _make_install(close_countdown_sec=34)
+        )
+
+        assert result.close_countdown_sec == 32
+        assert worker._collect_signals.call_args_list[0].kwargs["strategy_ids"] == [1]
+        assert worker._collect_signals.call_args_list[1].kwargs["strategy_ids"] == [2]
+        assert worker.executor.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_run_due_strategy_windows_marks_pending_groups_skipped_when_closed(self):
+        worker = _make_worker(
+            strategies={1: MagicMock(), 2: MagicMock()},
+            strategy_profiles={
+                1: StrategyRuntimeProfile(strategy_id=1, bet_timing=60),
+                2: StrategyRuntimeProfile(strategy_id=2, bet_timing=40),
+            },
+        )
+        worker.running = True
+        closed_install = _make_install(state=2, close_countdown_sec=17)
+        worker.adapter.get_current_install = AsyncMock(return_value=closed_install)
+        worker.executor.execute = AsyncMock()
+
+        result = await worker._run_due_strategy_windows(
+            _make_install(close_countdown_sec=34)
+        )
+
+        assert result is closed_install
+        assert worker._issue_execution_plan is not None
+        assert worker._issue_execution_plan.skipped_strategy_reasons == {
+            1: "state_not_open",
+            2: "state_not_open",
+        }
+        worker.executor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_due_strategy_windows_marks_dw3_gate_skipped_reason(self):
+        runner = MagicMock()
+        runner.collect_signals.return_value = []
+        runner.strategy.required_history_issues = 1
+        runner.strategy.last_signal_metadata = {
+            "strategy_kind": "dw3",
+            "gate_skipped": True,
+            "skip_reason": "gate_skipped_all_blocked",
+        }
+        worker = _make_worker(
+            strategies={1: runner},
+            strategy_profiles={
+                1: StrategyRuntimeProfile(strategy_id=1, bet_timing=60),
+            },
+        )
+        worker.running = True
+        worker.adapter.get_current_install = AsyncMock(
+            return_value=_make_install(close_countdown_sec=34)
+        )
+        worker._load_recent_history = AsyncMock(return_value=[])
+        worker.executor.execute = AsyncMock()
+
+        result = await worker._run_due_strategy_windows(
+            _make_install(
+                close_countdown_sec=34,
+                pre_issue="20250302000",
+                pre_result="3,2,1",
+            )
+        )
+
+        assert result.close_countdown_sec == 34
+        assert worker._issue_execution_plan is not None
+        assert worker._issue_execution_plan.skipped_strategy_reasons == {
+            1: "gate_skipped_all_blocked",
+        }
+        worker.executor.execute.assert_not_awaited()
+
 
 # ==================================================================
 # Helper: 创建带 mock DB 的 worker（用于主循环测试）
 # ==================================================================
 
 def _make_worker_with_db(has_records: bool = True, **overrides) -> AccountWorker:
-    """创建带 mock DB 的 worker，简化主循环测试"""
     worker = _make_worker(**overrides)
 
     mock_cursor_count = AsyncMock()
@@ -1536,8 +1678,7 @@ class TestLockAcquireRenewRelease:
         """无锁时抢锁成功，返回 True，_lock_token 被设置"""
         worker = _make_worker()
 
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 1
+        mock_cursor = _mock_lock_cursor(1)
         worker.db.execute = AsyncMock(return_value=mock_cursor)
         worker.db.commit = AsyncMock()
 
@@ -1557,8 +1698,7 @@ class TestLockAcquireRenewRelease:
         """已有活跃锁时抢锁失败，返回 False，_lock_token 保持 None"""
         worker = _make_worker()
 
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 0  # CAS 失败
+        mock_cursor = _mock_lock_cursor(0)  # CAS 失败
         worker.db.execute = AsyncMock(return_value=mock_cursor)
         worker.db.commit = AsyncMock()
 
@@ -1573,8 +1713,7 @@ class TestLockAcquireRenewRelease:
         worker = _make_worker()
         worker._lock_token = "test-token-123"
 
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 1
+        mock_cursor = _mock_lock_cursor(1)
         worker.db.execute = AsyncMock(return_value=mock_cursor)
         worker.db.commit = AsyncMock()
 
@@ -1587,7 +1726,7 @@ class TestLockAcquireRenewRelease:
         sql = call_args[0][0]
         params = call_args[0][1]
         assert "worker_lock_token=?" in sql
-        assert params == (worker.account_id, "test-token-123")
+        assert params == (worker.account_id, worker._platform_type, "test-token-123")
 
     @pytest.mark.asyncio
     async def test_renew_lock_no_token(self):
@@ -1633,8 +1772,7 @@ class TestLockAcquireRenewRelease:
         worker = _make_worker()
 
         # Acquire
-        mock_cursor_acquire = AsyncMock()
-        mock_cursor_acquire.rowcount = 1
+        mock_cursor_acquire = _mock_lock_cursor(1)
         worker.db.execute = AsyncMock(return_value=mock_cursor_acquire)
         worker.db.commit = AsyncMock()
 
@@ -1669,8 +1807,7 @@ class TestLockTimeout:
         worker_b = _make_worker(account_id=100)
 
         # CAS 成功（旧锁已超时）
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 1
+        mock_cursor = _mock_lock_cursor(1)
         worker_b.db.execute = AsyncMock(return_value=mock_cursor)
         worker_b.db.commit = AsyncMock()
 
@@ -1687,8 +1824,7 @@ class TestLockTimeout:
         """
         worker_b = _make_worker(account_id=100)
 
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 0  # 旧锁仍活跃
+        mock_cursor = _mock_lock_cursor(0)  # 旧锁仍活跃
         worker_b.db.execute = AsyncMock(return_value=mock_cursor)
         worker_b.db.commit = AsyncMock()
 
@@ -1770,8 +1906,7 @@ class TestLockRaceCondition:
 
         # Worker B acquires lock (A's lock expired)
         worker_b = _make_worker(account_id=100)
-        mock_cursor_b = AsyncMock()
-        mock_cursor_b.rowcount = 1
+        mock_cursor_b = _mock_lock_cursor(1)
         worker_b.db.execute = AsyncMock(return_value=mock_cursor_b)
         worker_b.db.commit = AsyncMock()
 
@@ -1802,8 +1937,7 @@ class TestLockRaceCondition:
         worker_b = _make_worker(account_id=100)
 
         # B acquires
-        mock_cursor_acquire = AsyncMock()
-        mock_cursor_acquire.rowcount = 1
+        mock_cursor_acquire = _mock_lock_cursor(1)
         worker_b.db.execute = AsyncMock(return_value=mock_cursor_acquire)
         worker_b.db.commit = AsyncMock()
 
@@ -1828,8 +1962,7 @@ class TestStartWithLock:
         """start() 抢锁成功 → running=True"""
         worker = _make_worker()
 
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 1
+        mock_cursor = _mock_lock_cursor(1)
         worker.db.execute = AsyncMock(return_value=mock_cursor)
         worker.db.commit = AsyncMock()
 
@@ -1850,8 +1983,7 @@ class TestStartWithLock:
         """start() 抢锁失败 → 拒绝启动 + 发送 worker_lock_conflict 告警"""
         worker = _make_worker()
 
-        mock_cursor = AsyncMock()
-        mock_cursor.rowcount = 0  # 抢锁失败
+        mock_cursor = _mock_lock_cursor(0)
         worker.db.execute = AsyncMock(return_value=mock_cursor)
         worker.db.commit = AsyncMock()
 

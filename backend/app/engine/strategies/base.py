@@ -6,7 +6,7 @@ INTEGER1=100
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -32,6 +32,7 @@ class BetInstruction:
     key_code: str
     amount: int  # 
     martin_level: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

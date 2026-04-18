@@ -140,6 +140,19 @@ COMMON_GROUPS: set[str] = {"大小", "单双", "极值", "组合", "色波", "�
 
 def get_key_code_name(key_code: str) -> str:
     """ KeyCode  KeyCode """
+    if isinstance(key_code, str):
+        if key_code.startswith("DW3_") and len(key_code) == 7:
+            suffix = key_code[4:]
+            if suffix.isdigit():
+                return suffix
+        if key_code.startswith("DW3_BS_") or key_code.startswith("DW3_OE_"):
+            try:
+                from app.utils.dw3_groups import DW3_GROUP_LABELS
+
+                if key_code in DW3_GROUP_LABELS:
+                    return DW3_GROUP_LABELS[key_code]
+            except Exception:
+                pass
     return KEY_CODE_MAP.get(key_code, key_code)
 
 
@@ -170,7 +183,15 @@ def check_win(key_code: str, balls: list[int], sum_value: int) -> bool:
         True False 
          KeyCode  False
     """
-    # ---  ---
+    if (
+        isinstance(key_code, str)
+        and key_code.startswith("DW3_")
+        and len(key_code) == 7
+        and key_code[4:].isdigit()
+    ):
+        return "".join(str(ball) for ball in balls) == key_code[4:]
+
+    # ---  --- 
     if key_code == "DX1":
         return sum_value >= 14
     if key_code == "DX2":

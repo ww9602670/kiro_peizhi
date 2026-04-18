@@ -132,15 +132,19 @@ async def account_create(
     operator_id: int,
     account_name: str,
     password: str,
-    platform_type: str,
+    game_type: str | None = None,
+    platform_type: str | None = None,
     platform_url: str | None = None,
 ) -> dict[str, Any]:
+    from app.schemas.account import normalize_game_type
+
+    resolved_game_type = normalize_game_type(game_type, platform_type)
     now = _now()
     cursor = await db.execute(
         """INSERT INTO gambling_accounts
-           (operator_id, account_name, password, platform_type, platform_url, created_at, updated_at)
+           (operator_id, account_name, password, game_type, platform_url, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (operator_id, account_name, password, platform_type, platform_url, now, now),
+        (operator_id, account_name, password, resolved_game_type, platform_url, now, now),
     )
     await db.commit()
     row = await (await db.execute("SELECT * FROM gambling_accounts WHERE id=?", (cursor.lastrowid,))).fetchone()
@@ -180,6 +184,7 @@ async def account_update(
         "password", "status", "session_token", "balance",
         "login_fail_count", "last_login_at", "kill_switch",
         "single_bet_limit", "daily_limit", "period_limit",
+        "platform_url", "game_type",
     }
     filtered = {k: v for k, v in fields.items() if k in allowed}
     if not filtered:
@@ -223,6 +228,10 @@ async def account_delete(
         "DELETE FROM account_odds WHERE account_id=?",
         (account_id,),
     )
+    await db.execute(
+        "DELETE FROM account_platform_sessions WHERE account_id=?",
+        (account_id,),
+    )
     # 5. 删除账号本身
     cursor = await db.execute(
         "DELETE FROM gambling_accounts WHERE id=? AND operator_id=?",
@@ -250,6 +259,7 @@ async def strategy_create(
     simulation: int = 0,
     stop_loss: int | None = None,
     take_profit: int | None = None,
+    gate_window_issues: int | None = None,
     platform_type: str = "JND28WEB",
 ) -> dict[str, Any]:
     now = _now()
@@ -257,11 +267,11 @@ async def strategy_create(
         """INSERT INTO strategies
            (operator_id, account_id, name, type, play_code, base_amount,
             martin_sequence, bet_timing, simulation, stop_loss, take_profit,
-            platform_type, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            gate_window_issues, platform_type, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (operator_id, account_id, name, type, play_code, base_amount,
          martin_sequence, bet_timing, simulation, stop_loss, take_profit,
-         platform_type, now, now),
+         gate_window_issues, platform_type, now, now),
     )
     await db.commit()
     row = await (await db.execute("SELECT * FROM strategies WHERE id=?", (cursor.lastrowid,))).fetchone()
@@ -301,7 +311,7 @@ async def strategy_update(
         "name", "play_code", "base_amount", "martin_sequence",
         "bet_timing", "simulation", "status", "martin_level",
         "stop_loss", "take_profit", "daily_pnl", "total_pnl", "daily_pnl_date",
-        "platform_type",
+        "gate_window_issues", "platform_type",
     }
     filtered = {k: v for k, v in fields.items() if k in allowed}
     if not filtered:
@@ -374,6 +384,105 @@ async def strategy_update_pnl(
     )
 
 
+async def account_platform_session_get(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str,
+) -> dict[str, Any] | None:
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_platform_sessions WHERE account_id=? AND platform_type=?",
+            (account_id, platform_type),
+        )
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+async def account_platform_session_list(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+) -> list[dict[str, Any]]:
+    rows = await (
+        await db.execute(
+            "SELECT * FROM account_platform_sessions WHERE account_id=? ORDER BY platform_type",
+            (account_id,),
+        )
+    ).fetchall()
+    return _rows_to_list(rows)
+
+
+async def account_platform_session_upsert(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    allowed = {
+        "status",
+        "session_token",
+        "login_fail_count",
+        "last_login_at",
+        "worker_lock_token",
+        "worker_lock_ts",
+    }
+    filtered = {k: v for k, v in fields.items() if k in allowed}
+    now = _now()
+
+    insert_fields = {
+        "account_id": account_id,
+        "platform_type": platform_type,
+        **filtered,
+        "created_at": now,
+        "updated_at": now,
+    }
+    columns = ", ".join(insert_fields.keys())
+    placeholders = ", ".join("?" for _ in insert_fields)
+    update_fields = {**filtered, "updated_at": now}
+    update_clause = ", ".join(f"{key}=excluded.{key}" for key in update_fields)
+
+    await db.execute(
+        f"""INSERT INTO account_platform_sessions ({columns})
+            VALUES ({placeholders})
+            ON CONFLICT(account_id, platform_type) DO UPDATE SET {update_clause}""",
+        tuple(insert_fields.values()),
+    )
+    await db.commit()
+    row = await (
+        await db.execute(
+            "SELECT * FROM account_platform_sessions WHERE account_id=? AND platform_type=?",
+            (account_id, platform_type),
+        )
+    ).fetchone()
+    return _row_to_dict(row)  # type: ignore
+
+
+async def account_platform_session_delete(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str,
+) -> bool:
+    cursor = await db.execute(
+        "DELETE FROM account_platform_sessions WHERE account_id=? AND platform_type=?",
+        (account_id, platform_type),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def account_platform_session_clear_locks(
+    db: aiosqlite.Connection,
+) -> None:
+    await db.execute(
+        "UPDATE account_platform_sessions SET worker_lock_token=NULL, worker_lock_ts=NULL "
+        "WHERE worker_lock_token IS NOT NULL"
+    )
+    await db.commit()
+
+
 # 
 # 4. bet_orders CRUD
 # 
@@ -392,16 +501,17 @@ async def bet_order_create(
     status: str = "pending",
     simulation: int = 0,
     martin_level: int | None = None,
+    actual_platform_type: str | None = None,
 ) -> dict[str, Any]:
     """idempotent_id  UNIQUE  IntegrityError"""
     now = _now()
     cursor = await db.execute(
         """INSERT INTO bet_orders
-           (idempotent_id, operator_id, account_id, strategy_id, issue,
-            key_code, amount, odds, status, simulation, martin_level, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (idempotent_id, operator_id, account_id, strategy_id, issue,
-         key_code, amount, odds, status, simulation, martin_level, now),
+           (idempotent_id, operator_id, account_id, strategy_id, actual_platform_type,
+            issue, key_code, amount, odds, status, simulation, martin_level, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (idempotent_id, operator_id, account_id, strategy_id, actual_platform_type,
+         issue, key_code, amount, odds, status, simulation, martin_level, now),
     )
     await db.commit()
     row = await (await db.execute("SELECT * FROM bet_orders WHERE id=?", (cursor.lastrowid,))).fetchone()
@@ -817,6 +927,7 @@ async def odds_batch_upsert(
     db: aiosqlite.Connection,
     *,
     account_id: int,
+    platform_type: str,
     odds_map: dict[str, int],
     confirmed: bool = False,
 ) -> None:
@@ -833,9 +944,9 @@ async def odds_batch_upsert(
     for key_code, odds_value in odds_map.items():
         await db.execute(
             f"""INSERT OR REPLACE INTO account_odds
-               (account_id, key_code, odds_value, confirmed, fetched_at, confirmed_at)
-               VALUES (?, ?, ?, ?, datetime('now', '+8 hours'), {confirmed_at_expr})""",
-            (account_id, key_code, odds_value, confirmed_int),
+               (account_id, platform_type, key_code, odds_value, confirmed, fetched_at, confirmed_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now', '+8 hours'), {confirmed_at_expr})""",
+            (account_id, platform_type, key_code, odds_value, confirmed_int),
         )
     await db.commit()
 
@@ -844,12 +955,20 @@ async def odds_list_by_account(
     db: aiosqlite.Connection,
     *,
     account_id: int,
+    platform_type: str | None = None,
 ) -> list[dict[str, Any]]:
     """获取账号所有赔率记录，按 key_code 字母序排列。"""
-    rows = await (await db.execute(
-        "SELECT * FROM account_odds WHERE account_id=? ORDER BY key_code ASC",
-        (account_id,),
-    )).fetchall()
+    if platform_type:
+        rows = await (await db.execute(
+            "SELECT * FROM account_odds WHERE account_id=? AND platform_type=? "
+            "ORDER BY key_code ASC",
+            (account_id, platform_type),
+        )).fetchall()
+    else:
+        rows = await (await db.execute(
+            "SELECT * FROM account_odds WHERE account_id=? ORDER BY platform_type ASC, key_code ASC",
+            (account_id,),
+        )).fetchall()
     return _rows_to_list(rows)
 
 
@@ -857,11 +976,13 @@ async def odds_get_confirmed_map(
     db: aiosqlite.Connection,
     *,
     account_id: int,
+    platform_type: str,
 ) -> dict[str, int] | None:
     """获取已确认赔率 dict。无记录→None；有未确认→None；全确认→{key_code: odds_value}。"""
     rows = await (await db.execute(
-        "SELECT key_code, odds_value, confirmed FROM account_odds WHERE account_id=?",
-        (account_id,),
+        "SELECT key_code, odds_value, confirmed FROM account_odds "
+        "WHERE account_id=? AND platform_type=?",
+        (account_id, platform_type),
     )).fetchall()
 
     if not rows:
@@ -879,12 +1000,13 @@ async def odds_confirm_all(
     db: aiosqlite.Connection,
     *,
     account_id: int,
+    platform_type: str,
 ) -> int:
     """确认该账号所有未确认赔率，返回更新行数。幂等。"""
     cursor = await db.execute(
         """UPDATE account_odds SET confirmed=1, confirmed_at=datetime('now', '+8 hours')
-           WHERE account_id=? AND confirmed=0""",
-        (account_id,),
+           WHERE account_id=? AND platform_type=? AND confirmed=0""",
+        (account_id, platform_type),
     )
     await db.commit()
     return cursor.rowcount
@@ -894,10 +1016,17 @@ async def odds_has_records(
     db: aiosqlite.Connection,
     *,
     account_id: int,
+    platform_type: str | None = None,
 ) -> bool:
     """检查账号是否有赔率记录。"""
-    row = await (await db.execute(
-        "SELECT COUNT(*) as cnt FROM account_odds WHERE account_id=?",
-        (account_id,),
-    )).fetchone()
+    if platform_type:
+        row = await (await db.execute(
+            "SELECT COUNT(*) as cnt FROM account_odds WHERE account_id=? AND platform_type=?",
+            (account_id, platform_type),
+        )).fetchone()
+    else:
+        row = await (await db.execute(
+            "SELECT COUNT(*) as cnt FROM account_odds WHERE account_id=?",
+            (account_id,),
+        )).fetchone()
     return (row["cnt"] if row else 0) > 0

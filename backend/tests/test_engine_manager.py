@@ -1,4 +1,4 @@
-"""EngineManager 
+﻿"""EngineManager 
 
 
 - start_worker / stop_worker
@@ -456,13 +456,13 @@ class TestGracefulShutdown:
 
 
 # 
-# _build_strategy_runner: registry 契约修复测试
+# _build_strategy_runner: registry 濂戠害淇娴嬭瘯
 # 
 
 
 class TestBuildStrategyRunner:
     def test_unknown_strategy_type_returns_none(self):
-        """未知策略类型应返回 None 而不是抛出 KeyError"""
+        """鏈煡绛栫暐绫诲瀷搴旇繑鍥?None 鑰屼笉鏄姏鍑?KeyError"""
         manager = _make_manager()
         strategy_data = {
             "id": 1,
@@ -475,7 +475,7 @@ class TestBuildStrategyRunner:
         assert result is None
 
     def test_flat_strategy_builds_successfully(self):
-        """flat 策略应正常构建"""
+        """flat strategy builds successfully."""
         manager = _make_manager()
         strategy_data = {
             "id": 1,
@@ -489,7 +489,7 @@ class TestBuildStrategyRunner:
         assert result.strategy_id == 1
 
     def test_martin_strategy_builds_successfully(self):
-        """martin 策略应正常构建"""
+        """martin strategy builds successfully."""
         manager = _make_manager()
         strategy_data = {
             "id": 2,
@@ -505,13 +505,13 @@ class TestBuildStrategyRunner:
 
 
 # 
-# _create_adapter: Adapter Factory 测试
+# _create_adapter: Adapter Factory 娴嬭瘯
 # 
 
 
 class TestAdapterFactory:
     def test_jnd28web_creates_jnd_adapter(self):
-        """JND28WEB 应创建 JNDAdapter"""
+        """JND28WEB 搴斿垱寤?JNDAdapter"""
         from app.engine.adapters.jnd import JNDAdapter
 
         manager = _make_manager()
@@ -519,7 +519,7 @@ class TestAdapterFactory:
         assert isinstance(adapter, JNDAdapter)
 
     def test_jnd282_creates_jnd_adapter(self):
-        """JND282 应创建 JNDAdapter"""
+        """JND282 搴斿垱寤?JNDAdapter"""
         from app.engine.adapters.jnd import JNDAdapter
 
         manager = _make_manager()
@@ -527,17 +527,30 @@ class TestAdapterFactory:
         assert isinstance(adapter, JNDAdapter)
 
     def test_custom_url_passed_to_adapter(self):
-        """自定义 URL 应传递给 adapter"""
+        """鑷畾涔?URL 搴斾紶閫掔粰 adapter"""
         from app.engine.adapters.jnd import JNDAdapter
 
         manager = _make_manager()
         adapter = manager._create_adapter("JND28WEB", platform_url="https://custom.example.com")
         assert isinstance(adapter, JNDAdapter)
 
-    def test_unsupported_platform_raises_error(self):
-        """不支持的平台类型应抛出 ValueError"""
+    def test_luckysb_creates_member_site_placeholder(self):
+        """LUCKYSB must not be routed to JNDAdapter."""
+        from app.engine.adapters.factory import MemberSiteAdapter
+        from app.engine.adapters.jnd import JNDAdapter
+
         manager = _make_manager()
-        with pytest.raises(ValueError, match="不支持的平台类型"):
+        adapter = manager._create_adapter("LUCKYSB", platform_url="https://member.example.com")
+
+        assert isinstance(adapter, MemberSiteAdapter)
+        assert not isinstance(adapter, JNDAdapter)
+        assert adapter.platform_type == "LUCKYSB"
+        assert adapter.base_url == "https://member.example.com"
+
+    def test_unsupported_platform_raises_error(self):
+        """涓嶆敮鎸佺殑骞冲彴绫诲瀷搴旀姏鍑?ValueError"""
+        manager = _make_manager()
+        with pytest.raises(ValueError, match="Unsupported platform type"):
             manager._create_adapter("UNKNOWN_PLATFORM")
 
 

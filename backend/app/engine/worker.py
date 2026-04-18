@@ -20,9 +20,11 @@ Phase 10.1:  AccountWorker EngineManager
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 import logging
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Optional
 
 import aiosqlite
@@ -37,15 +39,20 @@ from app.engine.session import SessionManager
 from app.engine.settlement import SettlementProcessor
 from app.engine.strategies.base import StrategyStopRequest
 from app.engine.strategy_runner import BetSignal, StrategyRunner
-from app.models.db_ops import strategy_update_status
+from app.models.db_ops import account_platform_session_upsert, strategy_update_status
+from app.utils.strategy_timing import (
+    BET_TIMING_MAX,
+    BET_TIMING_MIN,
+    SAFE_CLOSE_THRESHOLD,
+)
 
 logger = logging.getLogger(__name__)
 
 # 
-MIN_BET_TIMING = 5       #  5s
+MIN_BET_TIMING = BET_TIMING_MIN
 DEFAULT_BET_TIMING = 30   #  30s
 DEADLINE_MARGIN = 10      #  10s 
-SKIP_THRESHOLD = 18       # CloseTimeStamp  18s 
+SKIP_THRESHOLD = SAFE_CLOSE_THRESHOLD
 
 # 
 RESTART_DELAYS = [5, 10, 30]
@@ -67,6 +74,37 @@ API_RETRY_MAX = 3
 # 跨进程互斥锁
 LOCK_TTL_MINUTES = 5
 LOCK_RENEW_INTERVAL = 60  # 秒
+
+
+@dataclass(frozen=True)
+class StrategyRuntimeProfile:
+    """Runtime metadata for one strategy in one worker snapshot."""
+
+    strategy_id: int
+    bet_timing: int
+    normalized_direction_keys: tuple[str, ...] = ()
+    version: int = 0
+
+
+@dataclass
+class TimingGroup:
+    """Strategies that share the same effective bet_timing."""
+
+    bet_timing: int
+    strategy_ids: list[int]
+    executed: bool = False
+
+
+@dataclass
+class IssueExecutionPlan:
+    """Stable execution snapshot for one issue."""
+
+    issue: str
+    plan_version: int
+    created_from_profiles_version: int
+    groups: list[TimingGroup]
+    executed_strategy_ids: set[int] = field(default_factory=set)
+    skipped_strategy_reasons: dict[int, str] = field(default_factory=dict)
 
 
 def _parse_result(result_str: str) -> tuple[list[int], int]:
@@ -112,6 +150,7 @@ class AccountWorker:
         risk: RiskController,
         alert_service: AlertService,
         strategies: Optional[dict[int, StrategyRunner]] = None,
+        strategy_profiles: Optional[dict[int, StrategyRuntimeProfile]] = None,
         bet_timing: int = DEFAULT_BET_TIMING,
         platform_type: str = "JND28WEB",
         settlement_wait_seconds: int = SETTLEMENT_WAIT_SECONDS_DEFAULT,
@@ -129,11 +168,27 @@ class AccountWorker:
         self.alert_service = alert_service
         self.strategies: dict[int, StrategyRunner] = strategies or {}
         self.bet_timing = max(MIN_BET_TIMING, min(bet_timing, 300))
+        self.strategy_profiles: dict[int, StrategyRuntimeProfile] = (
+            dict(strategy_profiles)
+            if strategy_profiles is not None
+            else {
+                strategy_id: StrategyRuntimeProfile(
+                    strategy_id=strategy_id,
+                    bet_timing=self.bet_timing,
+                )
+                for strategy_id in self.strategies
+            }
+        )
+        self._profiles_version: int = 1 if self.strategy_profiles else 0
+        self._issue_execution_plan: Optional[IssueExecutionPlan] = None
+        self._next_issue_strategies: Optional[dict[int, StrategyRunner]] = None
+        self._next_issue_profiles: Optional[dict[int, StrategyRuntimeProfile]] = None
         self._platform_type = platform_type
         self._settlement_wait_seconds = max(
             SETTLEMENT_WAIT_SECONDS_MIN,
             min(settlement_wait_seconds, SETTLEMENT_WAIT_SECONDS_MAX),
         )
+        self._last_signal_collection_reasons: dict[int, str] = {}
 
         # 
         self.running: bool = False
@@ -151,13 +206,178 @@ class AccountWorker:
     # 
     # ------------------------------------------------------------------
 
-    def add_strategy(self, strategy_id: int, runner: StrategyRunner) -> None:
-        """"""
-        self.strategies[strategy_id] = runner
+    def add_strategy(
+        self,
+        strategy_id: int,
+        runner: StrategyRunner,
+        *,
+        profile: Optional[StrategyRuntimeProfile] = None,
+        apply_next_issue_only: bool = True,
+    ) -> None:
+        """Hot-add a strategy, defaulting to next-issue activation."""
+        if apply_next_issue_only:
+            next_runners = self.get_staged_or_current_strategies()
+            next_profiles = self.get_staged_or_current_profiles()
+            next_runners[strategy_id] = runner
+            next_profiles[strategy_id] = profile or StrategyRuntimeProfile(
+                strategy_id=strategy_id,
+                bet_timing=self.bet_timing,
+            )
+            self.stage_strategy_snapshot(next_runners, next_profiles)
+            return
 
-    def remove_strategy(self, strategy_id: int) -> None:
-        """"""
+        self.strategies[strategy_id] = runner
+        self.strategy_profiles[strategy_id] = profile or StrategyRuntimeProfile(
+            strategy_id=strategy_id,
+            bet_timing=self.bet_timing,
+        )
+        self._profiles_version += 1
+        self._remove_strategy_from_issue_plan(strategy_id)
+
+    def remove_strategy(self, strategy_id: int, *, apply_next_issue_only: bool = True) -> None:
+        """Hot-remove a strategy, defaulting to next-issue deactivation."""
+        if apply_next_issue_only:
+            next_runners = self.get_staged_or_current_strategies()
+            next_profiles = self.get_staged_or_current_profiles()
+            next_runners.pop(strategy_id, None)
+            next_profiles.pop(strategy_id, None)
+            self.stage_strategy_snapshot(next_runners, next_profiles)
+            return
+
         self.strategies.pop(strategy_id, None)
+        self.strategy_profiles.pop(strategy_id, None)
+        self._profiles_version += 1
+        self._remove_strategy_from_issue_plan(strategy_id)
+
+    def get_staged_or_current_strategies(self) -> dict[int, StrategyRunner]:
+        """Return the snapshot that will feed the next issue plan."""
+        return dict(self._next_issue_strategies or self.strategies)
+
+    def get_staged_or_current_profiles(self) -> dict[int, StrategyRuntimeProfile]:
+        """Return the profiles snapshot that will feed the next issue plan."""
+        return dict(self._next_issue_profiles or self.strategy_profiles)
+
+    def stage_strategy_snapshot(
+        self,
+        strategies: dict[int, StrategyRunner],
+        profiles: dict[int, StrategyRuntimeProfile],
+    ) -> None:
+        """Replace the next-issue strategy snapshot without touching current issue."""
+        self._next_issue_strategies = dict(strategies)
+        self._next_issue_profiles = dict(profiles)
+        self._profiles_version += 1
+
+    def _apply_staged_snapshot(self) -> None:
+        if self._next_issue_strategies is None and self._next_issue_profiles is None:
+            return
+        self.strategies = dict(self._next_issue_strategies or {})
+        self.strategy_profiles = dict(self._next_issue_profiles or {})
+        self._next_issue_strategies = None
+        self._next_issue_profiles = None
+
+    def _build_issue_execution_plan(self, issue: str) -> IssueExecutionPlan:
+        grouped: dict[int, list[int]] = {}
+        for strategy_id, profile in self.strategy_profiles.items():
+            if strategy_id not in self.strategies:
+                continue
+            grouped.setdefault(profile.bet_timing, []).append(strategy_id)
+
+        groups = [
+            TimingGroup(
+                bet_timing=bet_timing,
+                strategy_ids=sorted(strategy_ids),
+            )
+            for bet_timing, strategy_ids in sorted(grouped.items(), reverse=True)
+        ]
+        return IssueExecutionPlan(
+            issue=issue,
+            plan_version=self._profiles_version,
+            created_from_profiles_version=self._profiles_version,
+            groups=groups,
+        )
+
+    def _ensure_issue_execution_plan(self, issue: str) -> IssueExecutionPlan:
+        if self._issue_execution_plan and self._issue_execution_plan.issue == issue:
+            return self._issue_execution_plan
+
+        self._apply_staged_snapshot()
+        self._issue_execution_plan = self._build_issue_execution_plan(issue)
+        return self._issue_execution_plan
+
+    def _remove_strategy_from_issue_plan(self, strategy_id: int) -> None:
+        if self._issue_execution_plan is None:
+            return
+        self._issue_execution_plan.executed_strategy_ids.discard(strategy_id)
+        self._issue_execution_plan.skipped_strategy_reasons.pop(strategy_id, None)
+        for group in self._issue_execution_plan.groups:
+            if strategy_id in group.strategy_ids:
+                group.strategy_ids = [
+                    existing_id
+                    for existing_id in group.strategy_ids
+                    if existing_id != strategy_id
+                ]
+                if not group.strategy_ids:
+                    group.executed = True
+
+    def _mark_pending_groups_skipped(self, reason: str) -> None:
+        if self._issue_execution_plan is None:
+            return
+        for group in self._issue_execution_plan.groups:
+            if group.executed:
+                continue
+            self._mark_strategy_reasons(group.strategy_ids, reason)
+
+    def _mark_strategy_reasons(self, strategy_ids: list[int], reason: str) -> None:
+        if self._issue_execution_plan is None:
+            return
+        for strategy_id in strategy_ids:
+            self._issue_execution_plan.skipped_strategy_reasons.setdefault(
+                strategy_id,
+                reason,
+            )
+
+    def _consume_timing_group(self, group: TimingGroup) -> None:
+        if self._issue_execution_plan is None:
+            return
+        group.executed = True
+        self._issue_execution_plan.executed_strategy_ids.update(group.strategy_ids)
+
+    def _get_due_timing_groups(self, remaining: int) -> list[TimingGroup]:
+        if self._issue_execution_plan is None:
+            return []
+        return [
+            group
+            for group in self._issue_execution_plan.groups
+            if not group.executed and remaining <= group.bet_timing
+        ]
+
+    async def _revalidate_group_window(
+        self,
+        install: InstallInfo,
+        *,
+        bet_timing: int,
+    ) -> tuple[InstallInfo, str | None]:
+        """Refresh the current issue snapshot before submitting one timing group."""
+        try:
+            refreshed = await self.adapter.get_current_install()
+        except Exception:
+            logger.exception(
+                "group revalidation failed issue=%s account_id=%d bet_timing=%ds",
+                install.issue,
+                self.account_id,
+                bet_timing,
+            )
+            return install, "precheck_failed"
+
+        if refreshed.issue != install.issue:
+            return refreshed, "issue_changed"
+        if refreshed.state != 1:
+            return refreshed, "state_not_open"
+        if refreshed.close_countdown_sec <= SKIP_THRESHOLD:
+            return refreshed, "remaining_too_small"
+        if refreshed.close_countdown_sec > bet_timing:
+            return refreshed, "window_not_open"
+        return refreshed, None
 
     async def _has_unsettled_orders(self) -> bool:
         """检查是否有未结算订单（bet_success 或 pending_match）"""
@@ -183,6 +403,10 @@ class AccountWorker:
 
         # 清空策略，防止产生投注信号
         self.strategies.clear()
+        self.strategy_profiles.clear()
+        self._issue_execution_plan = None
+        self._next_issue_profiles = None
+        self._next_issue_strategies = None
 
         # 记录日志：待结算期号和订单数量
         try:
@@ -357,9 +581,12 @@ class AccountWorker:
             pre_issue = install.issue
 
             # 3. 投注阶段（结算模式下跳过）
+            settlement_anchor = install
             if not self.settling_only:
+                settlement_anchor = await self._run_due_strategy_windows(install)
+            if False and not self.settling_only:
                 if install.state == 1 and self._should_bet(install):
-                    signals = self._collect_signals(install)
+                    signals = await self._collect_signals(install)
                     if signals:
                         try:
                             report = await self.executor.execute(install, signals)
@@ -372,8 +599,11 @@ class AccountWorker:
                             )
 
             # 4. 等待开奖倒计时归零
-            if install.open_countdown_sec > 0:
-                await asyncio.sleep(install.open_countdown_sec)
+            if (
+                settlement_anchor.issue == pre_issue
+                and settlement_anchor.open_countdown_sec > 0
+            ):
+                await asyncio.sleep(settlement_anchor.open_countdown_sec)
 
             # 5. 额外等待 settlement_wait_seconds
             await asyncio.sleep(self._settlement_wait_seconds)
@@ -448,6 +678,95 @@ class AccountWorker:
     # ------------------------------------------------------------------
     # 7.2 _fetch_install_with_retry
     # ------------------------------------------------------------------
+
+    async def _run_due_strategy_windows(self, install: InstallInfo) -> InstallInfo:
+        """Execute timing groups for one issue until the window closes or rolls."""
+        current_install = install
+        plan = self._ensure_issue_execution_plan(current_install.issue)
+
+        while self.running and not self.settling_only:
+            if current_install.issue != plan.issue:
+                self._mark_pending_groups_skipped("issue_changed")
+                return current_install
+
+            if current_install.state != 1:
+                self._mark_pending_groups_skipped("state_not_open")
+                return current_install
+
+            remaining = current_install.close_countdown_sec
+            if remaining <= SKIP_THRESHOLD:
+                self._mark_pending_groups_skipped("remaining_too_small")
+                return current_install
+
+            due_groups = self._get_due_timing_groups(remaining)
+            if due_groups:
+                for group in due_groups:
+                    current_install, revalidate_reason = await self._revalidate_group_window(
+                        current_install,
+                        bet_timing=group.bet_timing,
+                    )
+                    if revalidate_reason == "window_not_open":
+                        break
+                    if revalidate_reason is not None:
+                        self._mark_pending_groups_skipped(revalidate_reason)
+                        return current_install
+
+                    self._consume_timing_group(group)
+                    signals = await self._collect_signals(
+                        current_install,
+                        strategy_ids=group.strategy_ids,
+                    )
+                    signal_strategy_ids = {
+                        int(signal.strategy_id) for signal in signals
+                    }
+                    skipped_ids = [
+                        strategy_id
+                        for strategy_id in group.strategy_ids
+                        if strategy_id not in signal_strategy_ids
+                    ]
+                    if skipped_ids:
+                        self._mark_signal_collection_reasons(skipped_ids)
+                    if not signals:
+                        self._mark_signal_collection_reasons(group.strategy_ids)
+                        continue
+                    try:
+                        report = await self.executor.execute(current_install, signals)
+                        await self._apply_execution_report(report)
+                    except Exception:
+                        self._mark_strategy_reasons(
+                            sorted(signal_strategy_ids),
+                            "execution_failed",
+                        )
+                        logger.exception(
+                            "bet execution failed issue=%s account_id=%d group=%ds",
+                            current_install.issue,
+                            self.account_id,
+                            group.bet_timing,
+                        )
+
+            pending_groups = [group for group in plan.groups if not group.executed]
+            if not pending_groups:
+                return current_install
+
+            next_group = max(pending_groups, key=lambda group: group.bet_timing)
+            if remaining <= next_group.bet_timing:
+                wait_seconds = max(1, int(getattr(self.poller, "poll_interval", 5)))
+            else:
+                wait_seconds = max(
+                    1,
+                    min(
+                        int(getattr(self.poller, "poll_interval", 5)),
+                        remaining - next_group.bet_timing,
+                    ),
+                )
+
+            await asyncio.sleep(wait_seconds)
+            next_install = await self._fetch_install_with_retry()
+            if next_install is None:
+                return current_install
+            current_install = next_install
+
+        return current_install
 
     async def _fetch_install_with_retry(self) -> Optional[InstallInfo]:
         """获取当前期号信息，网络异常时按 5s → 10s → 30s 重试
@@ -945,9 +1264,14 @@ class AccountWorker:
 
     async def _stop_strategy_runner(self, strategy_id: int, reason: str) -> None:
         """Stop one strategy runner and persist strategy status to stopped."""
-        runner = self.strategies.pop(strategy_id, None)
+        runner = self.strategies.get(strategy_id)
         if runner is not None:
             runner.stop()
+        self.remove_strategy(strategy_id, apply_next_issue_only=False)
+        if self._next_issue_strategies is not None:
+            self._next_issue_strategies.pop(strategy_id, None)
+        if self._next_issue_profiles is not None:
+            self._next_issue_profiles.pop(strategy_id, None)
 
         try:
             await strategy_update_status(
@@ -991,32 +1315,40 @@ class AccountWorker:
     # ------------------------------------------------------------------
 
     async def _acquire_lock(self) -> bool:
-        """CAS 抢锁：生成 UUID4 token，写入 gambling_accounts
+        """CAS 抢锁：生成 UUID4 token，写入 account_platform_sessions
 
         条件：无锁（worker_lock_token IS NULL）或锁超时（worker_lock_ts < now - 5min）。
         使用 DB 时间 datetime('now') 消除应用时钟漂移。
         返回 True 表示抢锁成功，False 表示已有活跃锁。
         """
         token = str(uuid.uuid4())
+        await account_platform_session_upsert(
+            self.db,
+            account_id=self.account_id,
+            platform_type=self._platform_type,
+            status=self.status,
+        )
         cursor = await self.db.execute(
-            "UPDATE gambling_accounts "
+            "UPDATE account_platform_sessions "
             "SET worker_lock_token=?, worker_lock_ts=datetime('now', '+8 hours') "
-            "WHERE id=? AND (worker_lock_token IS NULL "
+            "WHERE account_id=? AND platform_type=? AND (worker_lock_token IS NULL "
             "OR worker_lock_ts < datetime('now', '+8 hours', '-5 minutes'))",
-            (token, self.account_id),
+            (token, self.account_id, self._platform_type),
         )
         await self.db.commit()
         if cursor.rowcount > 0:
             self._lock_token = token
             logger.info(
-                "抢锁成功 account_id=%d token=%s",
+                "抢锁成功 account_id=%d platform=%s token=%s",
                 self.account_id,
+                self._platform_type,
                 token,
             )
             return True
         logger.warning(
-            "抢锁失败（已有活跃锁） account_id=%d",
+            "抢锁失败（已有活跃锁） account_id=%d platform=%s",
             self.account_id,
+            self._platform_type,
         )
         return False
 
@@ -1029,26 +1361,27 @@ class AccountWorker:
         if self._lock_token is None:
             return False
         cursor = await self.db.execute(
-            "UPDATE gambling_accounts "
+            "UPDATE account_platform_sessions "
             "SET worker_lock_ts=datetime('now', '+8 hours') "
-            "WHERE id=? AND worker_lock_token=?",
-            (self.account_id, self._lock_token),
+            "WHERE account_id=? AND platform_type=? AND worker_lock_token=?",
+            (self.account_id, self._platform_type, self._lock_token),
         )
         await self.db.commit()
         if cursor.rowcount > 0:
             return True
         # 失锁：立即停止
         logger.error(
-            "续约失败（已失锁） account_id=%d token=%s",
+            "续约失败（已失锁） account_id=%d platform=%s token=%s",
             self.account_id,
+            self._platform_type,
             self._lock_token,
         )
         self.running = False
         await self.alert_service.send(
             operator_id=self.operator_id,
             alert_type="worker_lock_lost",
-            title=f"Worker 失锁 account_id={self.account_id}",
-            detail=f"续约失败，token={self._lock_token}",
+            title=f"Worker 失锁 account_id={self.account_id} platform={self._platform_type}",
+            detail=f"续约失败，platform={self._platform_type}, token={self._lock_token}",
             account_id=self.account_id,
         )
         return False
@@ -1059,21 +1392,23 @@ class AccountWorker:
             return
         try:
             await self.db.execute(
-                "UPDATE gambling_accounts "
+                "UPDATE account_platform_sessions "
                 "SET worker_lock_token=NULL, worker_lock_ts=NULL "
-                "WHERE id=? AND worker_lock_token=?",
-                (self.account_id, self._lock_token),
+                "WHERE account_id=? AND platform_type=? AND worker_lock_token=?",
+                (self.account_id, self._platform_type, self._lock_token),
             )
             await self.db.commit()
             logger.info(
-                "释放锁 account_id=%d token=%s",
+                "释放锁 account_id=%d platform=%s token=%s",
                 self.account_id,
+                self._platform_type,
                 self._lock_token,
             )
         except Exception:
             logger.exception(
-                "释放锁异常 account_id=%d token=%s",
+                "释放锁异常 account_id=%d platform=%s token=%s",
                 self.account_id,
+                self._platform_type,
                 self._lock_token,
             )
         finally:
@@ -1083,7 +1418,12 @@ class AccountWorker:
     # 
     # ------------------------------------------------------------------
 
-    def _should_bet(self, install: InstallInfo) -> bool:
+    def _should_bet(
+        self,
+        install: InstallInfo,
+        *,
+        bet_timing: Optional[int] = None,
+    ) -> bool:
         """
 
         
@@ -1107,7 +1447,6 @@ class AccountWorker:
             )
             return False
 
-        # 
         remaining = install.close_countdown_sec
         if remaining <= SKIP_THRESHOLD:
             logger.info(
@@ -1119,13 +1458,32 @@ class AccountWorker:
             )
             return False
 
+        effective_bet_timing = max(
+            MIN_BET_TIMING,
+            min(bet_timing or self.bet_timing, BET_TIMING_MAX),
+        )
+        if remaining > effective_bet_timing:
+            logger.info(
+                "issue=%s remaining=%ds window=%ds account_id=%d",
+                install.issue,
+                remaining,
+                effective_bet_timing,
+                self.account_id,
+            )
+            return False
+
         return True
 
     # ------------------------------------------------------------------
     # 
     # ------------------------------------------------------------------
 
-    def _collect_signals(self, install: InstallInfo) -> list[BetSignal]:
+    def _collect_signals(
+        self,
+        install: InstallInfo,
+        *,
+        strategy_ids: Optional[list[int]] = None,
+    ) -> list[BetSignal]:
         """ running """
         from app.engine.strategies.base import StrategyContext, LotteryResult
 
@@ -1157,7 +1515,12 @@ class AccountWorker:
             strategy_state={},
         )
 
-        for _sid, runner in self.strategies.items():
+        selected_ids = strategy_ids or list(self.strategies.keys())
+
+        for _sid in selected_ids:
+            runner = self.strategies.get(_sid)
+            if runner is None:
+                continue
             try:
                 runner_signals = runner.collect_signals(
                     ctx=context, issue=install.issue
@@ -1171,3 +1534,241 @@ class AccountWorker:
                 )
 
         return signals
+
+    async def _collect_signals(
+        self,
+        install: InstallInfo,
+        *,
+        strategy_ids: Optional[list[int]] = None,
+    ) -> list[BetSignal]:
+        """Collect signals with enough recent closed history for DW3 gates."""
+        from app.engine.strategies.base import StrategyContext, LotteryResult
+
+        selected_ids = strategy_ids or list(self.strategies.keys())
+        history_limit = self._get_required_history_issues(selected_ids)
+        history: list[LotteryResult] = []
+        if history_limit > 0:
+            history = await self._load_recent_history(install, history_limit)
+
+        context = StrategyContext(
+            current_issue=install.issue,
+            history=history,
+            balance=0,
+            strategy_state={},
+        )
+
+        signals: list[BetSignal] = []
+        self._last_signal_collection_reasons = {}
+        for strategy_id in selected_ids:
+            runner = self.strategies.get(strategy_id)
+            if runner is None:
+                continue
+            try:
+                runner_signals = runner.collect_signals(
+                    ctx=context,
+                    issue=install.issue,
+                )
+                signals.extend(runner_signals)
+                if runner_signals:
+                    continue
+                metadata = getattr(runner.strategy, "last_signal_metadata", {})
+                if (
+                    isinstance(metadata, dict)
+                    and metadata.get("strategy_kind") == "dw3"
+                    and metadata.get("gate_skipped")
+                ):
+                    skip_reason = str(metadata.get("skip_reason") or "gate_skipped")
+                    self._last_signal_collection_reasons[strategy_id] = skip_reason
+            except Exception:
+                logger.exception(
+                    "strategy_id=%d account_id=%d",
+                    strategy_id,
+                    self.account_id,
+                )
+        return signals
+
+    def _mark_signal_collection_reasons(self, strategy_ids: list[int]) -> None:
+        for strategy_id in strategy_ids:
+            reason = self._last_signal_collection_reasons.get(
+                strategy_id,
+                "no_signal",
+            )
+            self._mark_strategy_reasons([strategy_id], reason)
+
+    def _get_required_history_issues(self, strategy_ids: list[int]) -> int:
+        required = 1
+        for strategy_id in strategy_ids:
+            runner = self.strategies.get(strategy_id)
+            if runner is None:
+                continue
+            strategy = getattr(runner, "strategy", None)
+            history_issues = getattr(strategy, "required_history_issues", 1)
+            try:
+                required = max(required, int(history_issues))
+            except (TypeError, ValueError):
+                continue
+        return required
+
+    async def _load_recent_history(
+        self,
+        install: InstallInfo,
+        limit: int,
+    ) -> list["LotteryResult"]:
+        from app.engine.strategies.base import LotteryResult
+
+        if limit <= 0:
+            return []
+
+        history: list[LotteryResult] = []
+        seen_issues: set[str] = set()
+
+        def append_history(issue: str | None, open_result: str | None, sum_value: int | None = None) -> None:
+            issue_text = str(issue or "").strip()
+            result_text = str(open_result or "").strip()
+            if not issue_text or not result_text or issue_text in seen_issues:
+                return
+            try:
+                balls, parsed_sum = _parse_result(result_text)
+            except Exception:
+                logger.warning(
+                    "invalid history ignored account_id=%d issue=%s open_result=%r",
+                    self.account_id,
+                    issue_text,
+                    result_text,
+                )
+                return
+            if not balls:
+                return
+            history.append(
+                LotteryResult(
+                    issue=issue_text,
+                    balls=balls,
+                    sum_value=int(sum_value) if sum_value is not None else parsed_sum,
+                )
+            )
+            seen_issues.add(issue_text)
+
+        append_history(install.pre_issue, install.pre_result)
+        if len(history) >= limit:
+            return history[:limit]
+
+        query_limit = max(limit * 4, limit + 8)
+        rows = await (
+            await self.db.execute(
+                "SELECT issue, open_result, sum_value FROM lottery_results "
+                "ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?",
+                (query_limit,),
+            )
+        ).fetchall()
+        for row in rows:
+            append_history(row["issue"], row["open_result"], row["sum_value"])
+            if len(history) >= limit:
+                break
+        return history[:limit]
+
+    async def _feedback_settlement_results(self, issue: str) -> None:
+        rows = await (
+            await self.db.execute(
+                "SELECT strategy_id, key_code, is_win, pnl, martin_level FROM bet_orders "
+                "WHERE issue=? AND account_id=? AND operator_id=? "
+                "AND status='settled'",
+                (issue, self.account_id, self.operator_id),
+            )
+        ).fetchall()
+
+        issue_scope_rows: dict[int, list] = defaultdict(list)
+        for row in rows:
+            strategy_id = int(row["strategy_id"])
+            runner = self.strategies.get(strategy_id)
+            if runner is None:
+                continue
+            strategy = getattr(runner, "strategy", None)
+            if getattr(strategy, "settlement_scope", "order") == "issue":
+                issue_scope_rows[strategy_id].append(row)
+                continue
+            await self._apply_settlement_feedback(
+                strategy_id,
+                runner,
+                row["is_win"],
+                row["pnl"],
+                issue,
+                key_code=row["key_code"],
+                martin_level=row.get("martin_level"),
+            )
+
+        for strategy_id, grouped_rows in issue_scope_rows.items():
+            runner = self.strategies.get(strategy_id)
+            if runner is None:
+                continue
+            total_pnl = sum(int(row["pnl"] or 0) for row in grouped_rows)
+            if total_pnl > 0:
+                issue_result = 1
+            elif total_pnl < 0:
+                issue_result = 0
+            else:
+                issue_result = -1
+            martin_level = next(
+                (
+                    row.get("martin_level")
+                    for row in grouped_rows
+                    if row.get("martin_level") is not None
+                ),
+                None,
+            )
+            await self._apply_settlement_feedback(
+                strategy_id,
+                runner,
+                issue_result,
+                total_pnl,
+                issue,
+                martin_level=martin_level,
+            )
+
+    async def _apply_settlement_feedback(
+        self,
+        strategy_id: int,
+        runner: StrategyRunner,
+        is_win: int | None,
+        pnl: int,
+        issue: str,
+        *,
+        key_code: str | None = None,
+        martin_level: int | None = None,
+    ) -> None:
+        try:
+            feedback_kwargs: dict[str, object] = {}
+            if key_code is not None:
+                feedback_kwargs["key_code"] = key_code
+            if martin_level is not None:
+                feedback_kwargs["martin_level"] = martin_level
+            stop_request = await runner.on_result(
+                is_win,
+                pnl,
+                **feedback_kwargs,
+            )
+            if (
+                isinstance(stop_request, StrategyStopRequest)
+                and stop_request.should_stop
+            ):
+                if not self._should_apply_settlement_stop_request(
+                    runner, stop_request
+                ):
+                    logger.info(
+                        "settlement stop request ignored strategy_id=%d "
+                        "account_id=%d reason=%s",
+                        strategy_id,
+                        self.account_id,
+                        stop_request.reason,
+                    )
+                    return
+                await self._stop_strategy_runner(
+                    strategy_id,
+                    stop_request.reason or "strategy_requested_stop",
+                )
+        except Exception:
+            logger.exception(
+                "ç¼æ’¶ç•»é™å¶‰î›­å¯®å‚šçˆ¶ strategy_id=%d issue=%s account_id=%d",
+                strategy_id,
+                issue,
+                self.account_id,
+            )

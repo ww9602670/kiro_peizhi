@@ -12,19 +12,23 @@
 from __future__ import annotations
 
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 import aiosqlite
 from httpx import ASGITransport, AsyncClient
 
+from app.api import accounts as accounts_api
 from app.database import DDL_STATEMENTS, INSERT_DEFAULT_ADMIN, get_shared_db
 from app.engine.alert import AlertService
 from app.engine.kill_switch import get_global_kill, set_global_kill
 from app.engine.risk import RiskController
 from app.engine.strategy_runner import BetSignal
+from app.engine.adapters.base import LoginResult
 from app.main import app
 from app.models.db_ops import (
     account_create,
+    account_platform_session_upsert,
     account_update,
     operator_create,
     strategy_create,
@@ -35,6 +39,10 @@ from app.utils.auth import create_token, persist_jti, register_session
 
 def _uid() -> str:
     return uuid.uuid4().hex[:8]
+
+
+def _platform_url(platform_type: str = "JND28WEB") -> str:
+    return f"https://{platform_type.lower()}.example.com"
 
 
 async def _get_admin_token() -> str:
@@ -66,6 +74,15 @@ async def client():
         yield c
         # 
         set_global_kill(False)
+
+
+@pytest.fixture(autouse=True)
+def mock_account_bind_login(monkeypatch):
+    monkeypatch.setattr(
+        accounts_api,
+        "_login_platform_account",
+        AsyncMock(return_value=LoginResult(success=True, token="platform-token")),
+    )
 
 
 @pytest.fixture
@@ -213,7 +230,12 @@ class TestAccountKillSwitch:
         create_resp = await client.post(
             "/api/v1/accounts",
             headers=headers,
-            json={"account_name": f"acc_{uid}", "password": "pw123", "platform_type": "JND28WEB"},
+            json={
+                "account_name": f"acc_{uid}",
+                "password": "pw123",
+                "platform_type": "JND28WEB",
+                "platform_url": _platform_url("JND28WEB"),
+            },
         )
         account_id = create_resp.json()["data"]["id"]
 
@@ -237,7 +259,12 @@ class TestAccountKillSwitch:
         create_resp = await client.post(
             "/api/v1/accounts",
             headers=headers,
-            json={"account_name": f"acc_{uid}", "password": "pw123", "platform_type": "JND282"},
+            json={
+                "account_name": f"acc_{uid}",
+                "password": "pw123",
+                "platform_type": "JND282",
+                "platform_url": _platform_url("JND282"),
+            },
         )
         account_id = create_resp.json()["data"]["id"]
 
@@ -266,7 +293,12 @@ class TestAccountKillSwitch:
         create_resp = await client.post(
             "/api/v1/accounts",
             headers=headers,
-            json={"account_name": f"acc_{uid}", "password": "pw123", "platform_type": "JND28WEB"},
+            json={
+                "account_name": f"acc_{uid}",
+                "password": "pw123",
+                "platform_type": "JND28WEB",
+                "platform_url": _platform_url("JND28WEB"),
+            },
         )
         account_id = create_resp.json()["data"]["id"]
 
@@ -296,7 +328,12 @@ class TestAccountKillSwitch:
         create_resp = await client.post(
             "/api/v1/accounts",
             headers=headers_b,
-            json={"account_name": f"iso_{uid}", "password": "pw123", "platform_type": "JND28WEB"},
+            json={
+                "account_name": f"iso_{uid}",
+                "password": "pw123",
+                "platform_type": "JND28WEB",
+                "platform_url": _platform_url("JND28WEB"),
+            },
         )
         b_account_id = create_resp.json()["data"]["id"]
 
@@ -342,6 +379,13 @@ class TestRiskControllerKillSwitch:
             db, account_id=acct["id"], operator_id=op["id"],
             status="online", session_token="valid_token", balance=100_000,
         )
+        await account_platform_session_upsert(
+            db,
+            account_id=acct["id"],
+            platform_type="JND28WEB",
+            status="online",
+            session_token="valid_token",
+        )
         strat = await strategy_create(
             db, operator_id=op["id"], account_id=acct["id"],
             name="", type="flat", play_code="DX1",
@@ -371,6 +415,7 @@ class TestRiskControllerKillSwitch:
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
+            platform_type="JND28WEB",
             global_kill=True,
         )
         signal = self._make_signal(setup_data["strategy"]["id"])
@@ -387,6 +432,7 @@ class TestRiskControllerKillSwitch:
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
+            platform_type="JND28WEB",
             global_kill=False,
         )
         signal = self._make_signal(setup_data["strategy"]["id"])
@@ -405,6 +451,7 @@ class TestRiskControllerKillSwitch:
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
+            platform_type="JND28WEB",
             global_kill=False,
         )
         signal = self._make_signal(setup_data["strategy"]["id"])
@@ -431,6 +478,7 @@ class TestRiskControllerKillSwitch:
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
+            platform_type="JND28WEB",
             global_kill=False,
         )
         signal = self._make_signal(setup_data["strategy"]["id"])
@@ -449,6 +497,7 @@ class TestRiskControllerKillSwitch:
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
+            platform_type="JND28WEB",
             global_kill=True,
         )
         signal = self._make_signal(setup_data["strategy"]["id"])
@@ -468,6 +517,7 @@ class TestRiskControllerKillSwitch:
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
+            platform_type="JND28WEB",
             global_kill=get_global_kill(),
         )
         signal = self._make_signal(setup_data["strategy"]["id"])
@@ -481,6 +531,7 @@ class TestRiskControllerKillSwitch:
             db=db, alert_service=alert_service,
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
+            platform_type="JND28WEB",
             global_kill=get_global_kill(),
         )
         result2 = await risk2.check(signal)

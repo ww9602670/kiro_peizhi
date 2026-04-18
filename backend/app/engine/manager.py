@@ -1,18 +1,5 @@
-"""EngineManager  
+"""Engine manager for account-platform workers."""
 
-Phase 10.2:  AccountWorker 
-
-
-  - start_worker / stop_worker/ AccountWorker 
-  - global_kill_switch Worker + 
-  - account_kill_switch Worker
-  - restore_workers_on_startup online  Worker
-  -  30%+  /  5 
-
-
-  - SessionStore  + InMemorySessionStore
-  - WorkerRegistry  + InMemoryWorkerRegistry
-"""
 from __future__ import annotations
 
 import asyncio
@@ -23,10 +10,10 @@ from typing import Any, Optional
 import aiosqlite
 
 from app.engine.adapters.base import PlatformAdapter
-from app.engine.adapters.jnd import JNDAdapter
+from app.engine.adapters.factory import create_platform_adapter
 from app.engine.alert import AlertService
 from app.engine.executor import BetExecutor
-from app.engine.kill_switch import get_global_kill, set_global_kill
+from app.engine.kill_switch import set_global_kill
 from app.engine.poller import IssuePoller
 from app.engine.rate_limiter import RateLimiter
 from app.engine.reconciler import Reconciler
@@ -34,133 +21,124 @@ from app.engine.risk import RiskController
 from app.engine.session import SessionManager
 from app.engine.settlement import SettlementProcessor
 from app.engine.strategy_runner import StrategyRunner
-from app.engine.worker import AccountWorker
+from app.engine.worker import AccountWorker, StrategyRuntimeProfile
 from app.models import db_ops
-from app.utils.captcha import CaptchaService
+from app.utils.strategy_timing import normalize_direction_keys
 
 logger = logging.getLogger(__name__)
 
+RuntimeKey = tuple[int, str]
+RuntimeKeyLike = RuntimeKey | int
+HEALTH_CHECK_INTERVAL = 60
 
-# 
-#  Redis 
-# 
+
+def _is_dw3_group_token(token: str) -> bool:
+    return token.startswith("DW3_BS_") or token.startswith("DW3_OE_")
+
+
+def make_runtime_key(account_id: int, platform_type: str) -> RuntimeKey:
+    return account_id, (platform_type or "JND28WEB").upper()
+
+
+def _runtime_key_matches_account(runtime_key: RuntimeKeyLike, account_id: int) -> bool:
+    if isinstance(runtime_key, tuple):
+        return runtime_key[0] == account_id
+    return runtime_key == account_id
+
+
+def _runtime_key_parts(
+    runtime_key: RuntimeKeyLike,
+    worker: AccountWorker | None = None,
+) -> RuntimeKey:
+    if isinstance(runtime_key, tuple):
+        return make_runtime_key(runtime_key[0], runtime_key[1])
+
+    platform_type = (
+        getattr(worker, "_platform_type", None)
+        or getattr(worker, "platform_type", None)
+        or "JND28WEB"
+    )
+    return make_runtime_key(runtime_key, str(platform_type))
 
 
 class SessionStore(ABC):
-    """ InMemory Redis"""
-
     @abstractmethod
-    async def get(self, account_id: int) -> Optional[str]:
-        """ session token"""
+    async def get(self, runtime_key: RuntimeKey) -> Optional[str]:
         ...
 
     @abstractmethod
-    async def set(self, account_id: int, token: str) -> None:
-        """ session token"""
+    async def set(self, runtime_key: RuntimeKey, token: str) -> None:
         ...
 
     @abstractmethod
-    async def delete(self, account_id: int) -> None:
-        """ session token"""
+    async def delete(self, runtime_key: RuntimeKey) -> None:
         ...
 
     @abstractmethod
-    async def all_keys(self) -> list[int]:
-        """ session  account_id"""
+    async def all_keys(self) -> list[RuntimeKey]:
         ...
 
 
 class InMemorySessionStore(SessionStore):
-    """"""
-
     def __init__(self) -> None:
-        self._store: dict[int, str] = {}
+        self._store: dict[RuntimeKey, str] = {}
 
-    async def get(self, account_id: int) -> Optional[str]:
-        return self._store.get(account_id)
+    async def get(self, runtime_key: RuntimeKey) -> Optional[str]:
+        return self._store.get(runtime_key)
 
-    async def set(self, account_id: int, token: str) -> None:
-        self._store[account_id] = token
+    async def set(self, runtime_key: RuntimeKey, token: str) -> None:
+        self._store[runtime_key] = token
 
-    async def delete(self, account_id: int) -> None:
-        self._store.pop(account_id, None)
+    async def delete(self, runtime_key: RuntimeKey) -> None:
+        self._store.pop(runtime_key, None)
 
-    async def all_keys(self) -> list[int]:
+    async def all_keys(self) -> list[RuntimeKey]:
         return list(self._store.keys())
 
 
 class WorkerRegistry(ABC):
-    """Worker  InMemory Redis"""
-
     @abstractmethod
-    async def register(self, account_id: int, worker: AccountWorker) -> None:
-        """ Worker"""
+    async def register(self, runtime_key: RuntimeKey, worker: AccountWorker) -> None:
         ...
 
     @abstractmethod
-    async def unregister(self, account_id: int) -> Optional[AccountWorker]:
-        """ Worker Worker"""
+    async def unregister(self, runtime_key: RuntimeKey) -> Optional[AccountWorker]:
         ...
 
     @abstractmethod
-    async def get(self, account_id: int) -> Optional[AccountWorker]:
-        """ Worker"""
+    async def get(self, runtime_key: RuntimeKey) -> Optional[AccountWorker]:
         ...
 
     @abstractmethod
-    async def all_workers(self) -> dict[int, AccountWorker]:
-        """ Worker"""
+    async def all_workers(self) -> dict[RuntimeKey, AccountWorker]:
         ...
 
     @abstractmethod
     async def count(self) -> int:
-        """ Worker """
         ...
 
 
 class InMemoryWorkerRegistry(WorkerRegistry):
-    """ Worker """
-
     def __init__(self) -> None:
-        self._workers: dict[int, AccountWorker] = {}
+        self._workers: dict[RuntimeKey, AccountWorker] = {}
 
-    async def register(self, account_id: int, worker: AccountWorker) -> None:
-        self._workers[account_id] = worker
+    async def register(self, runtime_key: RuntimeKey, worker: AccountWorker) -> None:
+        self._workers[runtime_key] = worker
 
-    async def unregister(self, account_id: int) -> Optional[AccountWorker]:
-        return self._workers.pop(account_id, None)
+    async def unregister(self, runtime_key: RuntimeKey) -> Optional[AccountWorker]:
+        return self._workers.pop(runtime_key, None)
 
-    async def get(self, account_id: int) -> Optional[AccountWorker]:
-        return self._workers.get(account_id)
+    async def get(self, runtime_key: RuntimeKey) -> Optional[AccountWorker]:
+        return self._workers.get(runtime_key)
 
-    async def all_workers(self) -> dict[int, AccountWorker]:
+    async def all_workers(self) -> dict[RuntimeKey, AccountWorker]:
         return dict(self._workers)
 
     async def count(self) -> int:
         return len(self._workers)
 
 
-# 
-# EngineManager
-# 
-
-# 
-HEALTH_CHECK_INTERVAL = 60
-
-
 class EngineManager:
-    """
-
-     AccountWorker /
-     online  Worker
-
-    Args:
-        db: 
-        session_store:  InMemory
-        worker_registry: Worker  InMemory
-        alert_service: 
-    """
-
     def __init__(
         self,
         *,
@@ -173,33 +151,13 @@ class EngineManager:
         self.session_store = session_store or InMemorySessionStore()
         self.registry = worker_registry or InMemoryWorkerRegistry()
         self.alert_service = alert_service or AlertService(db)
-
-        # 
         self._account_fail_counts: dict[int, int] = {}
         self._account_consecutive_bet_fails: dict[int, int] = {}
         self._health_check_task: Optional[asyncio.Task] = None
-        self._shutting_down: bool = False
-
-    # ------------------------------------------------------------------
-    # Adapter Factory
-    # ------------------------------------------------------------------
+        self._shutting_down = False
 
     def _create_adapter(self, platform_type: str, platform_url: Optional[str] = None) -> PlatformAdapter:
-        """根据 platform_type 创建对应的平台适配器
-
-        当前支持 JND 系列平台，后续新增平台只需在此扩展。
-        """
-        jnd_types = {"JND28WEB", "JND282"}
-        if platform_type in jnd_types:
-            return JNDAdapter(
-                base_url=platform_url or None,
-                platform_type=platform_type,
-            )
-        raise ValueError(f"不支持的平台类型: {platform_type}")
-
-    # ------------------------------------------------------------------
-    # Worker 
-    # ------------------------------------------------------------------
+        return create_platform_adapter(platform_type, platform_url)
 
     async def start_worker(
         self,
@@ -212,36 +170,30 @@ class EngineManager:
         platform_url: Optional[str] = None,
         strategies: Optional[list[dict[str, Any]]] = None,
     ) -> AccountWorker:
-        """ AccountWorker
-
-         account_id  Worker，热插入新策略而非重建。
-        """
+        runtime_key = make_runtime_key(account_id, platform_type)
         logger.info(
-            "启动 Worker operator_id=%d account_id=%d strategies_count=%d",
+            "start_worker operator_id=%d account_id=%d platform=%s strategies_count=%d",
             operator_id,
             account_id,
+            runtime_key[1],
             len(strategies) if strategies else 0,
         )
-        
-        # 检查已有 Worker：热插入策略，不再 stop + 重建
-        existing = await self.registry.get(account_id)
+
+        existing = await self.registry.get(runtime_key)
         if existing and existing.running:
-            logger.info("已有运行中 Worker，执行热更新 account_id=%d", account_id)
             return await self._hot_update_worker(existing, strategies)
 
-        # 创建平台适配器（通过 factory）
-        adapter = self._create_adapter(platform_type, platform_url)
+        adapter = self._create_adapter(runtime_key[1], platform_url)
         rate_limiter = RateLimiter()
-        captcha_service = CaptchaService()
         session = SessionManager(
             adapter=adapter,
             alert_service=self.alert_service,
-            captcha_service=captcha_service,
             operator_id=operator_id,
             account_id=account_id,
             account_name=account_name,
             password=password,
-            db=self.db,  #   db 
+            platform_type=runtime_key[1],
+            db=self.db,
         )
         poller = IssuePoller(adapter=adapter, rate_limiter=rate_limiter)
         risk = RiskController(
@@ -249,6 +201,7 @@ class EngineManager:
             alert_service=self.alert_service,
             operator_id=operator_id,
             account_id=account_id,
+            platform_type=runtime_key[1],
         )
         executor = BetExecutor(
             db=self.db,
@@ -257,27 +210,23 @@ class EngineManager:
             alert_service=self.alert_service,
             operator_id=operator_id,
             account_id=account_id,
+            platform_type=runtime_key[1],
         )
         settler = SettlementProcessor(
             db=self.db,
             operator_id=operator_id,
             account_id=account_id,
+            platform_type=runtime_key[1],
         )
         reconciler = Reconciler(
             db=self.db,
             adapter=adapter,
             alert_service=self.alert_service,
             operator_id=operator_id,
+            platform_type=runtime_key[1],
         )
 
-        # 
-        strategy_runners: dict[int, StrategyRunner] = {}
-        if strategies:
-            for s in strategies:
-                runner = self._build_strategy_runner(s)
-                if runner:
-                    strategy_runners[s["id"]] = runner
-
+        strategy_runners, strategy_profiles = self._build_strategy_snapshot(strategies)
         worker = AccountWorker(
             operator_id=operator_id,
             account_id=account_id,
@@ -291,19 +240,12 @@ class EngineManager:
             risk=risk,
             alert_service=self.alert_service,
             strategies=strategy_runners,
-            bet_timing=strategies[0].get("bet_timing", 30) if strategies else 30,
-            platform_type=platform_type,
+            strategy_profiles=strategy_profiles,
+            platform_type=runtime_key[1],
         )
 
-        await self.registry.register(account_id, worker)
+        await self.registry.register(runtime_key, worker)
         await worker.start()
-
-        logger.info(
-            " Worker operator_id=%d account_id=%d strategies=%d",
-            operator_id,
-            account_id,
-            len(strategy_runners),
-        )
         return worker
 
     async def _hot_update_worker(
@@ -311,159 +253,115 @@ class EngineManager:
         worker: AccountWorker,
         strategies: Optional[list[dict[str, Any]]] = None,
     ) -> AccountWorker:
-        """热更新 Worker 策略：对比现有策略，增删差异部分
-
-        不中断 Worker 主循环，不影响正在进行的结算周期。
-        """
         if not strategies:
             return worker
-
-        new_ids = {s["id"] for s in strategies if s.get("status") == "running"}
-        old_ids = set(worker.strategies.keys())
-
-        # 移除不再需要的策略
-        for sid in old_ids - new_ids:
-            worker.remove_strategy(sid)
-            logger.info("热更新：移除策略 strategy_id=%d account_id=%d", sid, worker.account_id)
-
-        # 添加新策略
-        for s in strategies:
-            if s["id"] in new_ids and s["id"] not in old_ids:
-                runner = self._build_strategy_runner(s)
-                if runner:
-                    worker.add_strategy(s["id"], runner)
-                    logger.info("热更新：添加策略 strategy_id=%d account_id=%d", s["id"], worker.account_id)
-
-        logger.info(
-            "热更新完成 account_id=%d 策略数=%d",
-            worker.account_id,
-            len(worker.strategies),
-        )
+        next_runners, next_profiles = self._build_strategy_snapshot(strategies)
+        worker.stage_strategy_snapshot(next_runners, next_profiles)
         return worker
 
-    async def stop_worker(self, account_id: int) -> bool:
-        """停止 Worker：有未结算订单时进入结算模式，否则直接停止"""
-        worker = await self.registry.get(account_id)
+    async def stop_worker(self, account_id: int, platform_type: str | None = None) -> bool:
+        if platform_type:
+            return await self._stop_worker_by_key(make_runtime_key(account_id, platform_type))
+
+        workers = await self.registry.all_workers()
+        matched_keys = [key for key in workers if _runtime_key_matches_account(key, account_id)]
+        if not matched_keys:
+            return False
+        results = await asyncio.gather(*(self._stop_worker_by_key(key) for key in matched_keys))
+        return any(results)
+
+    async def _stop_worker_by_key(self, runtime_key: RuntimeKeyLike) -> bool:
+        registry_key: RuntimeKeyLike = runtime_key
+        worker = await self.registry.get(registry_key)
+        if worker is None and isinstance(runtime_key, tuple):
+            registry_key = runtime_key[0]
+            worker = await self.registry.get(registry_key)
         if worker is None:
             return False
 
+        account_id, platform_type = _runtime_key_parts(runtime_key, worker)
         try:
             has_unsettled = await worker._has_unsettled_orders()
         except Exception:
             logger.exception(
-                "检查未结算订单异常，降级为直接停止 account_id=%d", account_id,
+                "failed to inspect unsettled orders account_id=%d platform=%s",
+                account_id,
+                platform_type,
             )
             has_unsettled = False
 
         if has_unsettled:
-            # 有未结算订单：进入结算模式，Worker 保留在 registry 中
-            async def _on_complete(aid: int) -> None:
-                await self.registry.unregister(aid)
-                await self.session_store.delete(aid)
-                logger.info("结算模式完成，Worker 已清理 account_id=%d", aid)
+            async def _on_complete(_: int, __: str = platform_type) -> None:
+                await self.registry.unregister(registry_key)
+                await self.session_store.delete(registry_key)
 
             worker._on_settle_complete = _on_complete
             await worker.enter_settling_mode()
-            logger.info(
-                "Worker 进入结算模式 account_id=%d", account_id,
-            )
         else:
-            # 无未结算订单：直接停止
-            await self.registry.unregister(account_id)
+            await self.registry.unregister(registry_key)
             await worker.stop()
-            await self.session_store.delete(account_id)
-            logger.info("Worker 已停止 account_id=%d", account_id)
+            await self.session_store.delete(registry_key)
         return True
 
-    # ------------------------------------------------------------------
-    # 
-    # ------------------------------------------------------------------
-
     async def global_kill_switch(self) -> None:
-        """ +  Worker"""
         set_global_kill(True)
         workers = await self.registry.all_workers()
-        for account_id, worker in workers.items():
+        for runtime_key, worker in workers.items():
             try:
                 await worker.stop()
-                await self.registry.unregister(account_id)
+                await self.registry.unregister(runtime_key)
             except Exception:
-                logger.exception(" Worker account_id=%d", account_id)
+                logger.exception("failed to stop worker key=%s", runtime_key)
         logger.warning("stopped_workers=%d", len(workers))
 
     async def account_kill_switch(self, account_id: int) -> bool:
-        """ Worker"""
         stopped = await self.stop_worker(account_id)
         if stopped:
-            logger.warning("account_id=%d", account_id)
+            logger.warning("account_kill_switch account_id=%d", account_id)
         return stopped
 
-    # ------------------------------------------------------------------
-    # 
-    # ------------------------------------------------------------------
-
     async def restore_workers_on_startup(self) -> int:
-        """ online  Worker
-
-         status='online'  + running  Worker
-
-        Returns:
-             Worker 
-        """
         restored = 0
         operators = await db_ops.operator_list_all(self.db)
-
-        for op in operators:
-            if op.get("status") != "active":
+        for operator in operators:
+            if operator.get("status") != "active":
                 continue
-            operator_id = op["id"]
-            accounts = await db_ops.account_list_by_operator(
-                self.db, operator_id=operator_id
-            )
-            for acc in accounts:
-                if acc.get("status") != "online":
-                    continue
-                #  running 
-                all_strategies = await db_ops.strategy_list_by_operator(
-                    self.db, operator_id=operator_id
-                )
-                running_strategies = [
-                    s for s in all_strategies
-                    if s.get("account_id") == acc["id"]
-                    and s.get("status") == "running"
-                ]
-                if not running_strategies:
+            operator_id = operator["id"]
+            accounts = await db_ops.account_list_by_operator(self.db, operator_id=operator_id)
+            strategies = await db_ops.strategy_list_by_operator(self.db, operator_id=operator_id)
+            for account in accounts:
+                if account.get("status") != "online":
                     continue
 
-                try:
-                    # 优先使用策略的 platform_type，回退到账号的 platform_type
-                    strategy_platform_type = running_strategies[0].get("platform_type") or acc.get("platform_type", "JND28WEB")
-                    await self.start_worker(
-                        operator_id=operator_id,
-                        account_id=acc["id"],
-                        account_name=acc["account_name"],
-                        password=acc["password"],
-                        platform_type=strategy_platform_type,
-                        platform_url=acc.get("platform_url"),
-                        strategies=running_strategies,
-                    )
-                    restored += 1
-                except Exception:
-                    logger.exception(
-                        " Worker operator_id=%d account_id=%d",
-                        operator_id,
-                        acc["id"],
-                    )
+                grouped: dict[str, list[dict[str, Any]]] = {}
+                for strategy in strategies:
+                    if strategy.get("account_id") != account["id"] or strategy.get("status") != "running":
+                        continue
+                    grouped.setdefault(strategy.get("platform_type") or "JND28WEB", []).append(strategy)
 
+                for platform_type, running_strategies in grouped.items():
+                    try:
+                        await self.start_worker(
+                            operator_id=operator_id,
+                            account_id=account["id"],
+                            account_name=account["account_name"],
+                            password=account["password"],
+                            platform_type=platform_type,
+                            platform_url=account.get("platform_url"),
+                            strategies=running_strategies,
+                        )
+                        restored += 1
+                    except Exception:
+                        logger.exception(
+                            "restore worker failed operator_id=%d account_id=%d platform=%s",
+                            operator_id,
+                            account["id"],
+                            platform_type,
+                        )
         logger.info("restored_workers=%d", restored)
         return restored
 
-    # ------------------------------------------------------------------
-    # 
-    # ------------------------------------------------------------------
-
     async def start_health_check(self, admin_operator_id: int = 1) -> None:
-        """"""
         if self._health_check_task and not self._health_check_task.done():
             return
         self._health_check_task = asyncio.create_task(
@@ -471,14 +369,15 @@ class EngineManager:
         )
 
     async def _health_check_loop(self, admin_operator_id: int) -> None:
-        """"""
         while not self._shutting_down:
             try:
                 workers = await self.registry.all_workers()
                 active_accounts = []
-                for account_id, worker in workers.items():
-                    active_accounts.append({"id": account_id, "status": worker.status})
-
+                for key, worker in workers.items():
+                    account_id, platform_type = _runtime_key_parts(key, worker)
+                    active_accounts.append(
+                        {"id": account_id, "platform_type": platform_type, "status": worker.status}
+                    )
                 await self.alert_service.check_system_health(
                     admin_operator_id=admin_operator_id,
                     active_accounts=active_accounts,
@@ -486,39 +385,25 @@ class EngineManager:
                     account_consecutive_bet_fails=self._account_consecutive_bet_fails,
                 )
             except Exception:
-                logger.exception("")
-
+                logger.exception("health check failed")
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
     def record_account_fail(self, account_id: int) -> None:
-        """ Worker """
-        self._account_fail_counts[account_id] = (
-            self._account_fail_counts.get(account_id, 0) + 1
-        )
+        self._account_fail_counts[account_id] = self._account_fail_counts.get(account_id, 0) + 1
 
     def record_bet_fail(self, account_id: int) -> None:
-        """ Worker """
         self._account_consecutive_bet_fails[account_id] = (
             self._account_consecutive_bet_fails.get(account_id, 0) + 1
         )
 
     def reset_bet_fail(self, account_id: int) -> None:
-        """"""
         self._account_consecutive_bet_fails.pop(account_id, None)
 
     def reset_account_fail(self, account_id: int) -> None:
-        """"""
         self._account_fail_counts.pop(account_id, None)
 
-    # ------------------------------------------------------------------
-    # Graceful Shutdown
-    # ------------------------------------------------------------------
-
     async def shutdown(self) -> None:
-        """ Worker + """
         self._shutting_down = True
-
-        # 
         if self._health_check_task and not self._health_check_task.done():
             self._health_check_task.cancel()
             try:
@@ -526,45 +411,65 @@ class EngineManager:
             except asyncio.CancelledError:
                 pass
 
-        #  Worker
         workers = await self.registry.all_workers()
-        stop_tasks = []
-        for account_id, worker in workers.items():
-            stop_tasks.append(self._stop_worker_safe(account_id, worker))
-
-        if stop_tasks:
-            await asyncio.gather(*stop_tasks)
-
+        if workers:
+            await asyncio.gather(
+                *(self._stop_worker_safe(runtime_key, worker) for runtime_key, worker in workers.items())
+            )
         logger.info("EngineManager stopped_workers=%d", len(workers))
 
-    async def _stop_worker_safe(self, account_id: int, worker: AccountWorker) -> None:
-        """ Worker"""
+    async def _stop_worker_safe(self, runtime_key: RuntimeKey, worker: AccountWorker) -> None:
         try:
             await worker.stop()
-            await self.registry.unregister(account_id)
+            await self.registry.unregister(runtime_key)
+            await self.session_store.delete(runtime_key)
         except Exception:
-            logger.exception(" Worker account_id=%d", account_id)
+            logger.exception("failed to stop worker key=%s", runtime_key)
 
-    # ------------------------------------------------------------------
-    # 
-    # ------------------------------------------------------------------
+    def _build_runtime_profile(
+        self,
+        strategy_data: dict[str, Any],
+    ) -> StrategyRuntimeProfile:
+        return StrategyRuntimeProfile(
+            strategy_id=int(strategy_data["id"]),
+            bet_timing=int(strategy_data.get("bet_timing", 30)),
+            normalized_direction_keys=normalize_direction_keys(
+                str(strategy_data.get("type", "flat")),
+                str(strategy_data.get("play_code", "")),
+            ),
+        )
+
+    def _build_strategy_snapshot(
+        self,
+        strategies: Optional[list[dict[str, Any]]],
+    ) -> tuple[dict[int, StrategyRunner], dict[int, StrategyRuntimeProfile]]:
+        runners: dict[int, StrategyRunner] = {}
+        profiles: dict[int, StrategyRuntimeProfile] = {}
+        if not strategies:
+            return runners, profiles
+        for strategy in strategies:
+            if strategy.get("status") not in (None, "running"):
+                continue
+            runner = self._build_strategy_runner(strategy)
+            if runner is None:
+                continue
+            strategy_id = int(strategy["id"])
+            runners[strategy_id] = runner
+            profiles[strategy_id] = self._build_runtime_profile(strategy)
+        return runners, profiles
 
     def _build_strategy_runner(self, strategy_data: dict[str, Any]) -> Optional[StrategyRunner]:
-        """ StrategyRunner"""
         import app.engine.strategies  # noqa: F401
+        from app.engine.strategies.dw3 import DW3FlatStrategy, DW3MartinStrategy
         from app.engine.strategies.registry import get_strategy_class
 
         strategy_type = strategy_data.get("type", "flat")
-        try:
-            strategy_cls = get_strategy_class(strategy_type)
-        except KeyError:
-            logger.warning("未知策略类型 type=%s", strategy_type)
-            return None
-
-        # 
         play_code = strategy_data.get("play_code", "DX1")
         base_amount = strategy_data.get("base_amount", 100)
         key_codes = [c.strip() for c in play_code.split(",") if c.strip()]
+        is_dw3_group_strategy = bool(key_codes) and all(_is_dw3_group_token(code) for code in key_codes)
+        gate_window_issues = int(strategy_data.get("gate_window_issues") or 0)
+
         seq_values: list[float] | None = None
         if strategy_data.get("martin_sequence"):
             seq_str = strategy_data["martin_sequence"]
@@ -579,43 +484,68 @@ class EngineManager:
             elif isinstance(seq_str, list):
                 seq_values = [float(x) for x in seq_str]
 
-        if strategy_type == "flat":
-            # key_codes 
-            kwargs: dict[str, Any] = {
-                "key_codes": key_codes,
-                "base_amount": base_amount,
-            }
-        elif strategy_type in ("martin", "red_wave_double_martin"):
-            # key_codes  sequence
-            if not seq_values:
-                # 
-                logger.warning(" martin_sequencestrategy_id=%s", strategy_data.get("id"))
+        if is_dw3_group_strategy:
+            if gate_window_issues <= 0:
+                logger.warning("invalid DW3 gate_window_issues strategy_id=%s", strategy_data.get("id"))
                 return None
-            if strategy_type == "martin":
-                kwargs = {
+            if strategy_type == "flat":
+                strategy_instance = DW3FlatStrategy(
+                    group_tokens=key_codes,
+                    base_amount=base_amount,
+                    gate_window_issues=gate_window_issues,
+                )
+            elif strategy_type == "martin":
+                if not seq_values:
+                    logger.warning("missing martin_sequence strategy_id=%s", strategy_data.get("id"))
+                    return None
+                strategy_instance = DW3MartinStrategy(
+                    group_tokens=key_codes,
+                    base_amount=base_amount,
+                    sequence=seq_values,
+                    gate_window_issues=gate_window_issues,
+                    strategy_name=str(strategy_data.get("name") or "dw3_martin"),
+                )
+            else:
+                logger.warning("unsupported DW3 strategy type=%s", strategy_type)
+                return None
+        else:
+            try:
+                strategy_cls = get_strategy_class(strategy_type)
+            except KeyError:
+                logger.warning("unknown strategy type=%s", strategy_type)
+                return None
+
+            if strategy_type == "flat":
+                kwargs: dict[str, Any] = {
                     "key_codes": key_codes,
                     "base_amount": base_amount,
-                    "sequence": seq_values,
                 }
+            elif strategy_type in ("martin", "red_wave_double_martin"):
+                if not seq_values:
+                    logger.warning("missing martin_sequence strategy_id=%s", strategy_data.get("id"))
+                    return None
+                if strategy_type == "martin":
+                    kwargs = {
+                        "key_codes": key_codes,
+                        "base_amount": base_amount,
+                        "sequence": seq_values,
+                    }
+                else:
+                    kwargs = {
+                        "base_amount": base_amount,
+                        "sequence": seq_values,
+                        "direction_codes": key_codes,
+                    }
             else:
-                kwargs = {
-                    "base_amount": base_amount,
-                    "sequence": seq_values,
-                    "direction_codes": key_codes,
-                }
-        else:
-            logger.warning("type=%s", strategy_type)
-            return None
-
-        strategy_instance = strategy_cls(**kwargs)
+                logger.warning("unsupported strategy type=%s", strategy_type)
+                return None
+            strategy_instance = strategy_cls(**kwargs)
 
         runner = StrategyRunner(
             strategy_id=strategy_data["id"],
             strategy=strategy_instance,
             simulation=bool(strategy_data.get("simulation", 0)),
         )
-        #  running runner
         if strategy_data.get("status") == "running":
             runner.start()
-
         return runner

@@ -1,16 +1,17 @@
 """FastAPI app entrypoint."""
+
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.accounts import router as accounts_router
 from app.api.admin import router as admin_router
-from app.api.backtest import router as backtest_router
 from app.api.alerts import router as alerts_router
 from app.api.auth import router as auth_router
+from app.api.backtest import router as backtest_router
 from app.api.bet_orders import router as bet_orders_router
 from app.api.dashboard import router as dashboard_router
 from app.api.health import router as health_router
@@ -29,23 +30,23 @@ from app.database import close_shared_db, get_shared_db, init_db
 from app.engine.alert import AlertService
 from app.engine.history_sync import init_sync_service
 from app.engine.manager import EngineManager
+from app.models.db_ops import account_platform_session_clear_locks
 from app.utils.auth import restore_sessions
+from app.utils.captcha import shutdown_shared_captcha_service
 from app.utils.response import register_exception_handlers
 
-# 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    #  +  + 
     logger = logging.getLogger(__name__)
-    logger.info(" ...")
-    
+    logger.info("starting backend")
+
     await init_db()
     db = await get_shared_db()
     await restore_sessions(db)
@@ -54,39 +55,45 @@ async def lifespan(app: FastAPI):
     engine = EngineManager(db=db, alert_service=alert_service)
     app.state.engine = engine
 
-    # 初始化历史数据同步服务
     init_sync_service(
         jnd28_db_path=BOCAI_HISTORY_DB_PATH,
         bocai_db_path=BOCAI_DB_PATH,
     )
-    
-    logger.info("  Workers...")
-    # 服务器重启后，旧 Worker 进程已不存在，清理残留的锁
-    await db.execute(
-        "UPDATE gambling_accounts SET worker_lock_token=NULL, worker_lock_ts=NULL "
-        "WHERE worker_lock_token IS NOT NULL"
-    )
-    await db.commit()
-    logger.info("已清理旧 Worker 锁")
+
+    logger.info("restoring workers")
+    await account_platform_session_clear_locks(db)
+    logger.info("cleared stale worker locks")
+
     if BOCAI_RESTORE_WORKERS_ON_STARTUP:
         restored = await engine.restore_workers_on_startup()
-        logger.info(f"  {restored}  Workers")
+        logger.info("restored_workers=%d", restored)
     else:
-        logger.info("Worker restore on startup is disabled")
-    
+        logger.info("worker restore on startup is disabled")
+
     await engine.start_health_check(admin_operator_id=1)
-    logger.info(" ")
+    logger.info("backend ready")
 
     yield
 
-    # graceful shutdown
-    logger.info(" ...")
+    logger.info("shutting down backend")
     await engine.shutdown()
+    shutdown_shared_captcha_service()
     await close_shared_db()
-    logger.info(" ")
+    logger.info("backend stopped")
 
 
 app = FastAPI(title="Bocai Backend", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def add_api_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "private, no-store, no-cache, max-age=0, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 
 if BOCAI_CORS_ORIGINS:
     app.add_middleware(
@@ -103,10 +110,8 @@ if BOCAI_TRUSTED_HOSTS:
         allowed_hosts=BOCAI_TRUSTED_HOSTS,
     )
 
-# 
 register_exception_handlers(app)
 
-# prefix 
 app.include_router(health_router, prefix="/api/v1", tags=["health"])
 app.include_router(auth_router, prefix="/api/v1", tags=["auth"])
 app.include_router(admin_router, prefix="/api/v1", tags=["admin"])

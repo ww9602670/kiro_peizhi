@@ -25,6 +25,10 @@ def _uid() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _platform_url(platform_type: str = "JND28WEB") -> str:
+    return f"https://{platform_type.lower()}.example.com"
+
+
 async def _get_admin_token() -> str:
     db = await get_shared_db()
     token, jti, _ = create_token(1, "admin")
@@ -56,33 +60,38 @@ async def client():
 
 @pytest.fixture(autouse=True)
 def mock_platform_adapter(monkeypatch):
-    async def fake_login(self, account_name, password, captcha_code=None):
-        return LoginResult(success=True, token="platform-token")
+    class FakeAdapter:
+        def __init__(self, platform_type="JND28WEB", platform_url=None):
+            self.platform_type = platform_type
+            self.platform_url = platform_url
 
-    async def fake_query_balance(self):
-        return BalanceInfo(balance=123.45)
+        async def login(self, account_name, password, captcha_code=None):
+            return LoginResult(success=True, token="platform-token")
 
-    async def fake_get_current_install(self):
-        return InstallInfo(
-            issue="3403606",
-            state=1,
-            close_countdown_sec=30,
-            pre_issue="3403605",
-            pre_result="1,2,3",
-            open_countdown_sec=40,
-        )
+        async def query_balance(self):
+            return BalanceInfo(balance=123.45)
 
-    async def fake_load_odds(self, issue):
-        return {"DX1": 20530, "DS3": 19840}
+        async def get_current_install(self):
+            return InstallInfo(
+                issue="3403606",
+                state=1,
+                close_countdown_sec=30,
+                pre_issue="3403605",
+                pre_result="1,2,3",
+                open_countdown_sec=40,
+            )
 
-    async def fake_close(self):
-        return None
+        async def load_odds(self, issue):
+            return {"DX1": 20530, "DS3": 19840}
 
-    monkeypatch.setattr(accounts_api.JNDAdapter, "login", fake_login)
-    monkeypatch.setattr(accounts_api.JNDAdapter, "query_balance", fake_query_balance)
-    monkeypatch.setattr(accounts_api.JNDAdapter, "get_current_install", fake_get_current_install)
-    monkeypatch.setattr(accounts_api.JNDAdapter, "load_odds", fake_load_odds)
-    monkeypatch.setattr(accounts_api.JNDAdapter, "close", fake_close)
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        accounts_api,
+        "create_platform_adapter",
+        lambda platform_type, platform_url=None: FakeAdapter(platform_type, platform_url),
+    )
 
 
 # 
@@ -119,7 +128,8 @@ async def test_bind_account(client):
         json={
             "account_name": f"player_{uid}",
             "password": "testpass123",
-            "platform_type": "JND28WEB",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
         },
     )
     assert resp.status_code == 200
@@ -128,10 +138,77 @@ async def test_bind_account(client):
     data = body["data"]
     assert data["account_name"] == f"player_{uid}"
     assert data["password_masked"] == "te****"
-    assert data["platform_type"] == "JND28WEB"
+    assert data["game_type"] == "JND28"
+    assert data["allowed_strategy_platform_types"] == ["JND28WEB", "JND282"]
     assert data["status"] == "inactive"
     assert data["balance"] == 0.0
     assert data["kill_switch"] is False
+
+
+@pytest.mark.asyncio
+async def test_bind_luckysb_account_uses_factory(client):
+    """LUCKYSB account payload should validate and persist as LUCKYSB."""
+    uid = _uid()
+    token, _ = await _create_operator(f"luckysb_{uid}", max_accounts=3)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"luckysb_{uid}",
+            "password": "testpass123",
+            "game_type": "LUCKYSB",
+            "platform_url": "https://member.example.com",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["game_type"] == "LUCKYSB"
+    assert body["data"]["allowed_strategy_platform_types"] == ["LUCKYSB"]
+    assert body["data"]["platform_url"] == "https://member.example.com"
+
+
+@pytest.mark.asyncio
+async def test_bind_luckysb_account_requires_platform_url(client):
+    """LUCKYSB accounts must provide the member-site URL."""
+    uid = _uid()
+    token, _ = await _create_operator(f"luckysb_url_{uid}", max_accounts=3)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"luckysb_url_{uid}",
+            "password": "testpass123",
+            "game_type": "LUCKYSB",
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_bind_jnd_account_requires_platform_url(client):
+    """JND accounts must provide the platform URL."""
+    uid = _uid()
+    token, _ = await _create_operator(f"jnd_url_{uid}", max_accounts=3)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"jnd_url_{uid}",
+            "password": "testpass123",
+            "game_type": "JND28",
+        },
+    )
+
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -143,7 +220,8 @@ async def test_bind_account_duplicate(client):
     payload = {
         "account_name": f"dup_{uid}",
         "password": "testpass",
-        "platform_type": "JND28WEB",
+        "game_type": "JND28",
+        "platform_url": _platform_url("JND28WEB"),
     }
 
     await client.post("/api/v1/accounts", headers=headers, json=payload)
@@ -164,7 +242,12 @@ async def test_bind_account_max_limit(client):
     resp1 = await client.post(
         "/api/v1/accounts",
         headers=headers,
-        json={"account_name": f"acc1_{uid}", "password": "pass1", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"acc1_{uid}",
+            "password": "pass1",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     assert resp1.json()["code"] == 0
 
@@ -172,7 +255,12 @@ async def test_bind_account_max_limit(client):
     resp2 = await client.post(
         "/api/v1/accounts",
         headers=headers,
-        json={"account_name": f"acc2_{uid}", "password": "pass2", "platform_type": "JND282"},
+        json={
+            "account_name": f"acc2_{uid}",
+            "password": "pass2",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND282"),
+        },
     )
     assert resp2.status_code == 409
     assert resp2.json()["code"] == 4002
@@ -189,7 +277,7 @@ async def test_bind_account_validation_error(client):
     resp = await client.post(
         "/api/v1/accounts",
         headers=headers,
-        json={"account_name": "", "password": "", "platform_type": "INVALID"},
+        json={"account_name": "", "password": "", "game_type": "INVALID"},
     )
     assert resp.status_code == 422
     assert resp.json()["code"] == 1001
@@ -211,7 +299,12 @@ async def test_list_accounts(client):
         await client.post(
             "/api/v1/accounts",
             headers=headers,
-            json={"account_name": f"list_{uid}_{i}", "password": "pass123", "platform_type": "JND28WEB"},
+            json={
+                "account_name": f"list_{uid}_{i}",
+                "password": "pass123",
+                "game_type": "JND28",
+                "platform_url": _platform_url("JND28WEB"),
+            },
         )
 
     resp = await client.get("/api/v1/accounts", headers=headers)
@@ -250,7 +343,12 @@ async def test_unbind_account(client):
     create_resp = await client.post(
         "/api/v1/accounts",
         headers=headers,
-        json={"account_name": f"unbind_{uid}", "password": "pass123", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"unbind_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     account_id = create_resp.json()["data"]["id"]
 
@@ -289,7 +387,12 @@ async def test_manual_login(client):
     create_resp = await client.post(
         "/api/v1/accounts",
         headers=headers,
-        json={"account_name": f"login_{uid}", "password": "pass123", "platform_type": "JND282"},
+        json={
+            "account_name": f"login_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND282"),
+        },
     )
     account_id = create_resp.json()["data"]["id"]
 
@@ -320,7 +423,7 @@ async def test_bind_account_rejects_platform_login_failure(client, monkeypatch):
         json={
             "account_name": f"bad_{uid}",
             "password": "badpass123",
-            "platform_type": "JND28WEB",
+            "game_type": "JND28",
             "platform_url": "https://merchant.example.com",
         },
     )
@@ -385,7 +488,12 @@ async def test_kill_switch_enable(client):
     create_resp = await client.post(
         "/api/v1/accounts",
         headers=headers,
-        json={"account_name": f"ks_{uid}", "password": "pass123", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"ks_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     account_id = create_resp.json()["data"]["id"]
 
@@ -408,7 +516,12 @@ async def test_kill_switch_disable(client):
     create_resp = await client.post(
         "/api/v1/accounts",
         headers=headers,
-        json={"account_name": f"ksd_{uid}", "password": "pass123", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"ksd_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     account_id = create_resp.json()["data"]["id"]
 
@@ -460,14 +573,24 @@ async def test_data_isolation_list(client):
     await client.post(
         "/api/v1/accounts",
         headers=headers_a,
-        json={"account_name": f"iso_a_{uid}", "password": "pass123", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"iso_a_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
 
     # B 
     await client.post(
         "/api/v1/accounts",
         headers=headers_b,
-        json={"account_name": f"iso_b_{uid}", "password": "pass456", "platform_type": "JND282"},
+        json={
+            "account_name": f"iso_b_{uid}",
+            "password": "pass456",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND282"),
+        },
     )
 
     # A 
@@ -494,7 +617,12 @@ async def test_data_isolation_delete(client):
     create_resp = await client.post(
         "/api/v1/accounts",
         headers=headers_b,
-        json={"account_name": f"isodel_{uid}", "password": "pass123", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"isodel_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     b_account_id = create_resp.json()["data"]["id"]
 
@@ -519,7 +647,12 @@ async def test_data_isolation_login(client):
     create_resp = await client.post(
         "/api/v1/accounts",
         headers=headers_b,
-        json={"account_name": f"isologin_{uid}", "password": "pass123", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"isologin_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     b_account_id = create_resp.json()["data"]["id"]
 
@@ -540,7 +673,12 @@ async def test_data_isolation_kill_switch(client):
     create_resp = await client.post(
         "/api/v1/accounts",
         headers=headers_b,
-        json={"account_name": f"isoks_{uid}", "password": "pass123", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"isoks_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     b_account_id = create_resp.json()["data"]["id"]
 

@@ -27,7 +27,10 @@ def _uid() -> str:
 
 
 async def _create_operator_with_account(
-    username: str, max_accounts: int = 3
+    username: str,
+    max_accounts: int = 3,
+    game_type: str = "JND28",
+    platform_url: str | None = None,
 ) -> tuple[str, int, int]:
     """ +  (token, operator_id, account_id)"""
     db = await get_shared_db()
@@ -44,7 +47,8 @@ async def _create_operator_with_account(
         operator_id=op["id"],
         account_name=f"acc_{username}",
         password="accpass",
-        platform_type="JND28WEB",
+        game_type=game_type,
+        platform_url=platform_url,
     )
     # Set account to online so strategy start works
     await db.execute(
@@ -377,6 +381,120 @@ async def test_create_red_wave_double_rejects_invalid_direction(client):
 
 
 @pytest.mark.asyncio
+async def test_create_luckysb_flat_strategy(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"luckysb_flat_{uid}",
+        game_type="LUCKYSB",
+        platform_url="https://member.example.com",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "lucky_flat",
+            "type": "flat",
+            "play_code": "LUCKYSB_B1_01",
+            "base_amount": 5.0,
+            "platform_type": "LUCKYSB",
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["platform_type"] == "LUCKYSB"
+    assert data["play_code"] == "LUCKYSB_B1_01"
+    assert data["play_code_name"] == "冠军 01"
+
+
+@pytest.mark.asyncio
+async def test_luckysb_rejects_red_wave_strategy(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"luckysb_red_{uid}",
+        game_type="LUCKYSB",
+        platform_url="https://member.example.com",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "lucky_red",
+            "type": "red_wave_double_martin",
+            "play_code": "DS4",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+            "platform_type": "LUCKYSB",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1002
+
+
+@pytest.mark.asyncio
+async def test_luckysb_account_rejects_platform_type_mismatch(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"luckysb_mismatch_{uid}",
+        game_type="LUCKYSB",
+        platform_url="https://member.example.com",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "lucky_wrong_platform",
+            "type": "red_wave_double_martin",
+            "play_code": "DS4",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+            "platform_type": "JND28WEB",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1002
+    assert "platform_type" in resp.json()["message"]
+
+
+@pytest.mark.asyncio
+async def test_luckysb_rejects_multi_play_code(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"luckysb_multi_{uid}",
+        game_type="LUCKYSB",
+        platform_url="https://member.example.com",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "lucky_multi",
+            "type": "flat",
+            "play_code": "LUCKYSB_B1_01,LUCKYSB_B2_02",
+            "base_amount": 5.0,
+            "platform_type": "LUCKYSB",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1002
+
+
+@pytest.mark.asyncio
 async def test_create_strategy_invalid_account(client):
     """ 404"""
     uid = _uid()
@@ -440,7 +558,7 @@ async def test_list_strategies(client):
                 "account_id": acc_id,
                 "name": f"{i}",
                 "type": "flat",
-                "play_code": "DX1",
+                "play_code": "DX1" if i == 0 else "DX2",
                 "base_amount": 10.0,
             },
         )
@@ -449,6 +567,228 @@ async def test_list_strategies(client):
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
     assert len(resp.json()["data"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_create_strategy_auto_adjusts_same_direction_timing_for_non_dw3(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"conflict_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "first",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 30,
+        },
+    )
+    assert first_resp.status_code == 200
+    first_id = first_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute("UPDATE strategies SET status='running' WHERE id=?", (first_id,))
+    await db.commit()
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "second",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 45,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["bet_timing"] == 50
+
+
+@pytest.mark.asyncio
+async def test_create_strategy_rejects_when_no_valid_non_dw3_timing_slot(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"no_slot_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    db = await get_shared_db()
+    occupied_timings = [19, 39, 59, 79, 99, 119, 139, 159, 179]
+    for idx, timing in enumerate(occupied_timings):
+        create_resp = await client.post(
+            "/api/v1/strategies",
+            headers=headers,
+            json={
+                "account_id": acc_id,
+                "name": f"occupied_{idx}",
+                "type": "flat",
+                "play_code": "DX1",
+                "base_amount": 10.0,
+                "bet_timing": timing,
+            },
+        )
+        assert create_resp.status_code == 200
+        strategy_id = create_resp.json()["data"]["id"]
+        await db.execute("UPDATE strategies SET status='running' WHERE id=?", (strategy_id,))
+    await db.commit()
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "candidate",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 60,
+        },
+    )
+
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == 1003
+    assert body["data"]["reason"] == "NO_AVAILABLE_BET_TIMING"
+    assert body["data"]["bet_timing_window"] == {"min": 19, "max": 180}
+
+
+@pytest.mark.asyncio
+async def test_dw3_save_keeps_requested_timing_under_policy_a(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"dw3_policy_a_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "dw3_first",
+            "type": "flat",
+            "play_code": "DW3_BS_BBB,DW3_OE_OOO",
+            "gate_window_issues": 3,
+            "base_amount": 10.0,
+            "bet_timing": 30,
+        },
+    )
+    assert first_resp.status_code == 200
+    first_id = first_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute("UPDATE strategies SET status='running' WHERE id=?", (first_id,))
+    await db.commit()
+
+    second_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "dw3_second",
+            "type": "flat",
+            "play_code": "DW3_BS_BBB,DW3_OE_OOO",
+            "gate_window_issues": 3,
+            "base_amount": 10.0,
+            "bet_timing": 35,
+        },
+    )
+
+    assert second_resp.status_code == 200
+    assert second_resp.json()["data"]["bet_timing"] == 35
+
+
+@pytest.mark.asyncio
+async def test_start_strategy_allows_minimum_20s_gap(client, mock_engine):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"start_conflict_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "first",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 30,
+        },
+    )
+    second_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "second",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 50,
+        },
+    )
+    first_id = first_resp.json()["data"]["id"]
+    second_id = second_resp.json()["data"]["id"]
+
+    start_first = await client.post(f"/api/v1/strategies/{first_id}/start", headers=headers)
+    assert start_first.status_code == 200
+
+    mock_engine.start_worker.reset_mock()
+    start_second = await client.post(f"/api/v1/strategies/{second_id}/start", headers=headers)
+
+    assert start_second.status_code == 200
+    assert start_second.json()["code"] == 0
+    mock_engine.start_worker.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_start_strategy_auto_adjusts_same_direction_timing(client, mock_engine):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"start_adjust_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "first",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 30,
+        },
+    )
+    second_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "second",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 45,
+        },
+    )
+    first_id = first_resp.json()["data"]["id"]
+    second_id = second_resp.json()["data"]["id"]
+
+    start_first = await client.post(f"/api/v1/strategies/{first_id}/start", headers=headers)
+    assert start_first.status_code == 200
+
+    mock_engine.start_worker.reset_mock()
+    start_second = await client.post(f"/api/v1/strategies/{second_id}/start", headers=headers)
+
+    assert start_second.status_code == 200
+    assert start_second.json()["data"]["bet_timing"] == 50
+    mock_engine.start_worker.assert_called_once()
 
 
 # 
@@ -513,6 +853,76 @@ async def test_update_red_wave_strategy_play_code(client):
     )
     assert resp.status_code == 200
     assert resp.json()["data"]["play_code"] == "B2LM_S,DS4"
+
+
+@pytest.mark.asyncio
+async def test_update_luckysb_strategy_play_code(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"updlucky_{uid}",
+        game_type="LUCKYSB",
+        platform_url="https://member.example.com",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "upd_lucky_orig",
+            "type": "flat",
+            "play_code": "LUCKYSB_B1_01",
+            "base_amount": 10.0,
+            "platform_type": "LUCKYSB",
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    resp = await client.put(
+        f"/api/v1/strategies/{sid}",
+        headers=headers,
+        json={"play_code": "LUCKYSB_B2_10"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["data"]["play_code"] == "LUCKYSB_B2_10"
+    assert resp.json()["data"]["play_code_name"] == "亚军 10"
+
+
+@pytest.mark.asyncio
+async def test_update_luckysb_strategy_rejects_platform_type_mismatch(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"updlucky_platform_{uid}",
+        game_type="LUCKYSB",
+        platform_url="https://member.example.com",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "upd_lucky_platform",
+            "type": "flat",
+            "play_code": "LUCKYSB_B1_01",
+            "base_amount": 10.0,
+            "platform_type": "LUCKYSB",
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    resp = await client.put(
+        f"/api/v1/strategies/{sid}",
+        headers=headers,
+        json={"platform_type": "JND28WEB"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["code"] == 1002
+    assert "platform_type" in resp.json()["message"]
 
 
 @pytest.mark.asyncio
@@ -907,3 +1317,93 @@ async def test_no_auth_returns_401(client):
     resp = await client.get("/api/v1/strategies")
     assert resp.status_code == 401
     assert resp.json()["code"] == 2002
+
+
+def test_schema_rejects_dw3_without_gate_window_issues():
+    from app.schemas.strategy import StrategyCreate
+
+    with pytest.raises(Exception):
+        StrategyCreate(
+            account_id=1,
+            name="dw3_without_gate",
+            type="flat",
+            play_code="DW3_BS_BBB,DW3_OE_OOO",
+            base_amount=10.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_dw3_strategy_persists_gate_window_issues(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"dw3create_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "dw3_flat",
+            "type": "flat",
+            "play_code": "DW3_BS_BBB,DW3_OE_OOO",
+            "gate_window_issues": 3,
+            "base_amount": 10.0,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["play_code"] == "DW3_BS_BBB,DW3_OE_OOO"
+    assert body["data"]["gate_window_issues"] == 3
+
+    db = await get_shared_db()
+    row = await (
+        await db.execute(
+            "SELECT gate_window_issues FROM strategies WHERE id=?",
+            (body["data"]["id"],),
+        )
+    ).fetchone()
+    assert row["gate_window_issues"] == 3
+
+
+@pytest.mark.asyncio
+async def test_update_dw3_flat_strategy_play_code_allowed(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"dw3update_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "dw3_flat_update",
+            "type": "flat",
+            "play_code": "DW3_BS_BBB,DW3_OE_OOO",
+            "gate_window_issues": 2,
+            "base_amount": 10.0,
+        },
+    )
+    assert create_resp.status_code == 200
+    strategy_id = create_resp.json()["data"]["id"]
+
+    update_resp = await client.put(
+        f"/api/v1/strategies/{strategy_id}",
+        headers=headers,
+        json={
+            "play_code": "DW3_BS_SSS,DW3_OE_EEE",
+            "gate_window_issues": 5,
+        },
+    )
+    assert update_resp.status_code == 200
+    data = update_resp.json()["data"]
+    assert data["play_code"] == "DW3_BS_SSS,DW3_OE_EEE"
+    assert data["gate_window_issues"] == 5
+
+
+@pytest.mark.asyncio
+async def test_strategies_table_has_gate_window_issues_column():
+    db = await get_shared_db()
+    rows = await (await db.execute("PRAGMA table_info(strategies)")).fetchall()
+    column_names = {row["name"] for row in rows}
+    assert "gate_window_issues" in column_names

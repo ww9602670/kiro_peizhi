@@ -1,28 +1,26 @@
 """
-
-GET    /accounts               
-POST   /accounts                 max_accounts 
-DELETE /accounts/{id}          
-POST   /accounts/{id}/login    
-POST   /accounts/{id}/kill-switch  
+Account binding and account-level validation endpoints.
 """
+
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
-_BJT = timezone(timedelta(hours=8))
-
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.dependencies import get_current_operator, get_db_conn
 from app.engine.adapters.base import LoginResult, PlatformAdapter
-from app.engine.adapters.jnd import JNDAdapter
+from app.engine.adapters.factory import create_platform_adapter
 from app.models.db_ops import (
     account_create,
     account_delete,
     account_get_by_id,
     account_list_by_operator,
+    account_platform_session_delete,
+    account_platform_session_list,
+    account_platform_session_upsert,
     account_update,
     alert_create,
     odds_batch_upsert,
@@ -32,37 +30,73 @@ from app.schemas.account import (
     AccountCreate,
     AccountInfo,
     KillSwitchUpdate,
+    get_allowed_platform_types,
+    get_default_platform_type,
     mask_password,
 )
 from app.schemas.common import ApiResponse
-from app.utils.captcha import CaptchaError, CaptchaService
+from app.utils.captcha import CaptchaError, CaptchaService, get_shared_captcha_service
 from app.utils.response import BizError
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_BJT = timezone(timedelta(hours=8))
 CAPTCHA_LOGIN_ATTEMPTS = 3
 
 
-def _to_account_info(row: dict) -> AccountInfo:
-    """ DB  AccountInfo schema + """
+@dataclass(frozen=True)
+class OddsSyncStatus:
+    odds_synced: bool
+    odds_count: int
+    odds_message: str
+
+
+def _resolve_account_platform_type(account: dict, requested_platform_type: str | None = None) -> str:
+    if requested_platform_type:
+        return requested_platform_type
+    return get_default_platform_type(account["game_type"])
+
+
+def _validate_account_platform_type(account: dict, platform_type: str) -> str:
+    normalized = (platform_type or "").strip().upper()
+    allowed = get_allowed_platform_types(account["game_type"])
+    if normalized not in allowed:
+        raise BizError(
+            1002,
+            f"platform_type is not allowed for game_type={account['game_type']}",
+            status_code=400,
+        )
+    return normalized
+
+
+def _to_account_info(
+    row: dict,
+    *,
+    odds_synced: bool | None = None,
+    odds_count: int | None = None,
+    odds_message: str | None = None,
+) -> AccountInfo:
+    game_type = row["game_type"]
     return AccountInfo(
         id=row["id"],
         account_name=row["account_name"],
         password_masked=mask_password(row["password"]),
-        platform_type=row["platform_type"],
+        game_type=game_type,
+        allowed_strategy_platform_types=get_allowed_platform_types(game_type),
         platform_url=row.get("platform_url"),
         status=row["status"],
-        balance=row["balance"] / 100,  #   
+        balance=row["balance"] / 100,
         kill_switch=bool(row["kill_switch"]),
         last_login_at=row.get("last_login_at"),
+        odds_synced=odds_synced,
+        odds_count=odds_count,
+        odds_message=odds_message,
     )
 
 
 def _should_retry_captcha_login(result: LoginResult) -> bool:
-    """Retry OCR login only for captcha-like or token bootstrap failures."""
     if result.success:
         return False
-
     message = (result.message or "").lower()
     retry_markers = ("captcha", "verify", "vcode", "token")
     return result.captcha_required or any(marker in message for marker in retry_markers) or not message
@@ -76,7 +110,6 @@ async def _login_platform_account(
     captcha_service: CaptchaService | None = None,
     max_captcha_attempts: int = CAPTCHA_LOGIN_ATTEMPTS,
 ) -> LoginResult:
-    """Attempt direct login first, then fall back to OCR captcha retries."""
     result = await adapter.login(account_name, password)
     if result.success:
         return result
@@ -85,80 +118,131 @@ async def _login_platform_account(
     if not callable(get_captcha):
         return result
 
-    own_captcha_service = captcha_service is None
-    captcha_service = captcha_service or CaptchaService()
-    try:
-        last_result = result
-        for attempt in range(max_captcha_attempts):
-            captcha_image = await get_captcha()
-            captcha_code = (await captcha_service.recognize(captcha_image)).strip()
-            if not captcha_code:
-                raise CaptchaError("OCR returned empty captcha result")
+    captcha_service = captcha_service or get_shared_captcha_service()
+    last_result = result
+    for attempt in range(max_captcha_attempts):
+        captcha_image = await get_captcha()
+        captcha_code = (await captcha_service.recognize(captcha_image)).strip()
+        if not captcha_code:
+            raise CaptchaError("OCR returned empty captcha result")
 
-            logger.info(
-                "platform login using captcha attempt=%d account=%s",
-                attempt + 1,
-                account_name,
-            )
-            last_result = await adapter.login(
-                account_name,
-                password,
-                captcha_code=captcha_code,
-            )
-            if last_result.success:
-                return last_result
-            if not _should_retry_captcha_login(last_result):
-                break
+        logger.info(
+            "platform login using captcha attempt=%d account=%s",
+            attempt + 1,
+            account_name,
+        )
+        last_result = await adapter.login(
+            account_name,
+            password,
+            captcha_code=captcha_code,
+        )
+        if last_result.success:
+            return last_result
+        if not _should_retry_captcha_login(last_result):
+            break
 
-        return last_result
-    finally:
-        if own_captcha_service:
-            captcha_service.shutdown()
+    return last_result
 
 
 async def _sync_odds(
     db,
     account_id: int,
     operator_id: int,
+    platform_type: str,
     new_odds: dict[str, int],
 ) -> None:
-    """赔率同步逻辑：比较 + 写入 + 告警。"""
-    existing = await odds_list_by_account(db, account_id=account_id)
-
+    existing = await odds_list_by_account(
+        db,
+        account_id=account_id,
+        platform_type=platform_type,
+    )
     if not existing:
-        # 首次获取：confirmed=True，不告警
-        await odds_batch_upsert(db, account_id=account_id, odds_map=new_odds, confirmed=True)
+        await odds_batch_upsert(
+            db,
+            account_id=account_id,
+            platform_type=platform_type,
+            odds_map=new_odds,
+            confirmed=True,
+        )
         return
 
     old_map = {row["key_code"]: row["odds_value"] for row in existing}
-
     if old_map == new_odds:
-        # 完全相同：不修改，不告警
         return
 
-    # 有变动：全量写入 confirmed=False + 告警
-    await odds_batch_upsert(db, account_id=account_id, odds_map=new_odds, confirmed=False)
+    await odds_batch_upsert(
+        db,
+        account_id=account_id,
+        platform_type=platform_type,
+        odds_map=new_odds,
+        confirmed=False,
+    )
 
-    # 构建变动详情
-    changes = []
-    all_keys = sorted(set(old_map.keys()) | set(new_odds.keys()))
-    for key in all_keys:
+    changes: list[str] = []
+    for key in sorted(set(old_map) | set(new_odds)):
         old_val = old_map.get(key)
         new_val = new_odds.get(key)
         if old_val != new_val:
-            old_str = str(old_val) if old_val is not None else "无"
-            new_str = str(new_val) if new_val is not None else "已删除"
-            changes.append(f"{key}: {old_str} → {new_str}")
+            changes.append(f"{key}: {old_val} -> {new_val}")
 
-    detail = "\n".join(changes)
     await alert_create(
         db,
         operator_id=operator_id,
         type="odds_changed",
         level="warning",
-        title=f"赔率变动（账号 {account_id}）",
-        detail=detail,
+        title=f"odds changed account_id={account_id} platform={platform_type}",
+        detail="\n".join(changes),
     )
+
+
+def _state_label(state: int) -> str:
+    return {1: "open", 2: "closed", 3: "waiting"}.get(state, f"unknown({state})")
+
+
+async def _sync_odds_after_login(
+    *,
+    adapter: PlatformAdapter,
+    db,
+    account_id: int,
+    operator_id: int,
+    platform_type: str,
+) -> OddsSyncStatus:
+    try:
+        install = await adapter.get_current_install()
+    except Exception as exc:
+        logger.warning("get_current_install failed account_id=%d: %s", account_id, exc)
+        return OddsSyncStatus(False, 0, f"login ok, but issue fetch failed: {exc}")
+
+    if install.state != 1:
+        return OddsSyncStatus(
+            False,
+            0,
+            f"login ok, current state is {_state_label(install.state)}, odds not synced",
+        )
+
+    try:
+        raw_odds = await adapter.load_odds(install.issue)
+    except Exception as exc:
+        logger.warning("load_odds failed account_id=%d issue=%s: %s", account_id, install.issue, exc)
+        return OddsSyncStatus(False, 0, f"login ok, but odds fetch failed: {exc}")
+
+    non_zero_odds = {key: value for key, value in raw_odds.items() if value > 0}
+    if not non_zero_odds:
+        return OddsSyncStatus(False, 0, "login ok, but platform returned empty odds")
+
+    try:
+        await _sync_odds(
+            db,
+            account_id=account_id,
+            operator_id=operator_id,
+            platform_type=platform_type,
+            new_odds=non_zero_odds,
+        )
+    except Exception as exc:
+        logger.error("persist odds failed account_id=%d: %s", account_id, exc)
+        return OddsSyncStatus(False, len(non_zero_odds), f"login ok, but odds save failed: {exc}")
+
+    return OddsSyncStatus(True, len(non_zero_odds), f"odds synced: {len(non_zero_odds)} items")
 
 
 @router.get("/accounts")
@@ -166,10 +250,8 @@ async def list_accounts(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """"""
     rows = await account_list_by_operator(db, operator_id=operator["id"])
-    items = [_to_account_info(r) for r in rows]
-    return ApiResponse[list[AccountInfo]](data=items)
+    return ApiResponse[list[AccountInfo]](data=[_to_account_info(row) for row in rows])
 
 
 @router.post("/accounts")
@@ -178,57 +260,48 @@ async def bind_account(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """
-
-    
-    1.   max_accounts
-    2. UNIQUE(operator_id, account_name, platform_type) 
-    3. 
-    """
-    # 1. 
     existing = await account_list_by_operator(db, operator_id=operator["id"])
     if len(existing) >= operator["max_accounts"]:
-        raise BizError(4002, "", status_code=409)
+        raise BizError(4002, "max account limit reached", status_code=409)
 
-    # 2. 
-    adapter = JNDAdapter(
-        base_url=body.platform_url or None,
-        platform_type=body.platform_type,
-    )
+    validation_platform_type = get_default_platform_type(body.game_type)
+    adapter = create_platform_adapter(validation_platform_type, body.platform_url)
     try:
         login_result = await _login_platform_account(
             adapter,
             body.account_name,
             body.password,
         )
-    except CaptchaError as e:
-        raise BizError(4003, f"账号登录失败: {e}", status_code=400)
+    except CaptchaError as exc:
+        raise BizError(4003, f"account login failed: {exc}", status_code=400)
     finally:
         await adapter.close()
 
     if not login_result.success:
-        raise BizError(
-            4003,
-            f"账号登录失败: {login_result.message}",
-            status_code=400,
-        )
+        raise BizError(4003, f"account login failed: {login_result.message}", status_code=400)
 
-    # 3. UNIQUE 
     try:
         row = await account_create(
             db,
             operator_id=operator["id"],
             account_name=body.account_name,
             password=body.password,
-            platform_type=body.platform_type,
+            game_type=body.game_type,
             platform_url=body.platform_url,
         )
-    except Exception as e:
-        if "UNIQUE constraint failed" in str(e):
-            raise BizError(4002, "", status_code=409)
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise BizError(4002, "account already bound", status_code=409)
         raise
 
-    return ApiResponse[AccountInfo](data=_to_account_info(row))
+    return ApiResponse[AccountInfo](
+        data=_to_account_info(
+            row,
+            odds_synced=False,
+            odds_count=0,
+            odds_message="account bound, validate a platform session before using odds",
+        )
+    )
 
 
 @router.delete("/accounts/{account_id}")
@@ -237,126 +310,79 @@ async def unbind_account(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """解绑账号（级联删除关联策略和投注记录）"""
-    try:
-        deleted = await account_delete(db, account_id=account_id, operator_id=operator["id"])
-    except Exception as e:
-        logger.error("解绑账号失败 account_id=%d: %s", account_id, e)
-        raise BizError(5001, f"解绑失败: {e}", status_code=500)
+    deleted = await account_delete(db, account_id=account_id, operator_id=operator["id"])
     if not deleted:
-        raise BizError(4001, "账号不存在", status_code=404)
+        raise BizError(4001, "account not found", status_code=404)
     return ApiResponse(data=None)
 
 
 @router.post("/accounts/{account_id}/login")
 async def manual_login(
     account_id: int,
+    platform_type: str | None = Query(default=None),
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """
-
-    
-    """
     account = await account_get_by_id(db, account_id=account_id, operator_id=operator["id"])
     if not account:
-        raise BizError(4001, "", status_code=404)
+        raise BizError(4001, "account not found", status_code=404)
 
-    adapter = JNDAdapter(
-        base_url=account.get("platform_url") or None,
-        platform_type=account.get("platform_type", "JND28WEB"),
+    resolved_platform_type = _validate_account_platform_type(
+        account,
+        _resolve_account_platform_type(account, platform_type),
     )
-    
+    adapter = create_platform_adapter(resolved_platform_type, account.get("platform_url"))
+
     try:
-        # 
         login_result = await _login_platform_account(
             adapter,
             account["account_name"],
             account["password"],
         )
-        logger.info(
-            "account_id=%d success=%s message=%s",
-            account_id,
-            login_result.success,
-            login_result.message,
-        )
-        
         if not login_result.success:
-            raise BizError(4003, f": {login_result.message}", status_code=400)
-        
-        # 
+            raise BizError(4003, f"account login failed: {login_result.message}", status_code=400)
+
         balance_info = await adapter.query_balance()
-        balance_cents = int(balance_info.balance * 100)  #   
-        logger.info(
-            "account_id=%d balance=%.2f balance_cents=%d",
-            account_id,
-            balance_info.balance,
-            balance_cents,
-        )
-        
-        # 
+        balance_cents = int(balance_info.balance * 100)
         now = datetime.now(_BJT).strftime("%Y-%m-%d %H:%M:%S")
+
         row = await account_update(
             db,
             account_id=account_id,
             operator_id=operator["id"],
             status="online",
-            session_token=login_result.token,
             balance=balance_cents,
             last_login_at=now,
             login_fail_count=0,
         )
-        logger.info(
-            "account_id=%d balance=%d",
-            account_id,
-            row["balance"],
+        await account_platform_session_upsert(
+            db,
+            account_id=account_id,
+            platform_type=resolved_platform_type,
+            status="online",
+            session_token=login_result.token,
+            last_login_at=now,
+            login_fail_count=0,
         )
-        
-        # 赔率获取（不阻断登录）
-        try:
-            install = await adapter.get_current_install()
-            logger.info(
-                "期号信息 account_id=%d issue=%s state=%d close=%d open=%d",
-                account_id, install.issue, install.state,
-                install.close_countdown_sec, install.open_countdown_sec,
+
+        odds_status = await _sync_odds_after_login(
+            adapter=adapter,
+            db=db,
+            account_id=account_id,
+            operator_id=operator["id"],
+            platform_type=resolved_platform_type,
+        )
+        return ApiResponse[AccountInfo](
+            data=_to_account_info(
+                row,
+                odds_synced=odds_status.odds_synced,
+                odds_count=odds_status.odds_count,
+                odds_message=odds_status.odds_message,
             )
-            if install.state != 1:
-                logger.info(
-                    "平台未开盘(state=%d)，跳过赔率获取 account_id=%d",
-                    install.state, account_id,
-                )
-            else:
-                new_odds = await adapter.load_odds(install.issue)
-                # 过滤全零赔率（封盘状态可能返回全0）
-                non_zero = {k: v for k, v in new_odds.items() if v > 0}
-                if not non_zero:
-                    logger.info(
-                        "赔率全为0，平台可能处于封盘状态 account_id=%d (raw count=%d)",
-                        account_id, len(new_odds),
-                    )
-                elif non_zero:
-                    try:
-                        await _sync_odds(db, account_id, operator["id"], non_zero)
-                        logger.info(
-                            "赔率同步完成 account_id=%d count=%d",
-                            account_id, len(non_zero),
-                        )
-                    except Exception as e:
-                        logger.error("赔率写入失败 account_id=%d: %s", account_id, e)
-        except Exception as e:
-            logger.warning("赔率获取失败 account_id=%d: %s", account_id, e)
-        
-        return ApiResponse[AccountInfo](data=_to_account_info(row))
-        
-    except CaptchaError as e:
-        raise BizError(4003, f"验证码识别失败: {e}", status_code=400)
-    except BizError:
-        raise
-    except Exception as e:
-        logger.exception("account_id=%d", account_id)
-        raise BizError(5001, f": {str(e)}", status_code=500)
+        )
+    except CaptchaError as exc:
+        raise BizError(4003, f"captcha recognition failed: {exc}", status_code=400)
     finally:
-        #  adapter session
         await adapter.close()
 
 
@@ -367,22 +393,21 @@ async def manual_logout(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """手动退出登录：将账号状态改为 inactive，停止关联 Worker"""
     account = await account_get_by_id(db, account_id=account_id, operator_id=operator["id"])
     if not account:
-        raise BizError(4001, "账号不存在", status_code=404)
+        raise BizError(4001, "account not found", status_code=404)
 
-    if account["status"] != "online":
-        raise BizError(4003, "账号未登录", status_code=400)
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        await engine.stop_worker(account_id=account_id)
 
-    # 停止关联的 Worker（如果有）
-    try:
-        engine = getattr(request.app.state, "engine", None)
-        if engine:
-            await engine.stop_worker(account_id=account_id)
-            logger.info("退出登录：已停止 Worker account_id=%d", account_id)
-    except Exception as e:
-        logger.warning("退出登录：停止 Worker 异常 account_id=%d: %s", account_id, e)
+    sessions = await account_platform_session_list(db, account_id=account_id)
+    for session in sessions:
+        await account_platform_session_delete(
+            db,
+            account_id=account_id,
+            platform_type=session["platform_type"],
+        )
 
     row = await account_update(
         db,
@@ -391,7 +416,6 @@ async def manual_logout(
         status="inactive",
         session_token=None,
     )
-    logger.info("退出登录成功 account_id=%d", account_id)
     return ApiResponse[AccountInfo](data=_to_account_info(row))
 
 
@@ -402,10 +426,9 @@ async def toggle_kill_switch(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """"""
     account = await account_get_by_id(db, account_id=account_id, operator_id=operator["id"])
     if not account:
-        raise BizError(4001, "", status_code=404)
+        raise BizError(4001, "account not found", status_code=404)
 
     row = await account_update(
         db,
@@ -414,3 +437,4 @@ async def toggle_kill_switch(
         kill_switch=1 if body.enabled else 0,
     )
     return ApiResponse[AccountInfo](data=_to_account_info(row))
+

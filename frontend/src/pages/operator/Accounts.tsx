@@ -18,12 +18,13 @@ import {
   updateKillSwitch,
 } from '@/api/accounts';
 import { getAccountOdds, confirmAccountOdds, refreshAccountOdds } from '@/api/odds';
-import type { AccountCreate, AccountInfo } from '@/types/api/account';
+import type { AccountCreate, AccountGameType, AccountInfo } from '@/types/api/account';
 import type { OddsItem, OddsRefreshResponse, PeriodInfo } from '@/types/api/odds';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import Toast from '@/components/Toast';
 import { useConfirm } from '@/hooks/useConfirm';
 import { useToast } from '@/hooks/useToast';
+import { getPlatformLabel } from '@/utils/platformLabels';
 import './Accounts.css';
 
 function getStatusBadgeClass(status: string): string {
@@ -46,9 +47,9 @@ function getStatusLabel(status: string): string {
     case 'online':
       return '在线';
     case 'inactive':
-      return '未登录';
+      return '未验证';
     case 'login_error':
-      return '登录异常';
+      return '验证异常';
     case 'disabled':
       return '已禁用';
     default:
@@ -56,7 +57,42 @@ function getStatusLabel(status: string): string {
   }
 }
 
-export default function Accounts() {
+const ACCOUNT_GAME_OPTIONS: { value: AccountGameType; label: string }[] = [
+  { value: 'JND28', label: '加拿大28' },
+  { value: 'LUCKYSB', label: getPlatformLabel('LUCKYSB') },
+];
+
+function resolveAccountGameType(account: Pick<AccountInfo, 'game_type' | 'platform_type'>): string {
+  if (account.game_type) return account.game_type;
+  if (account.platform_type === 'LUCKYSB') return 'LUCKYSB';
+  if (account.platform_type === 'JND28WEB' || account.platform_type === 'JND282') return 'JND28';
+  return 'JND28';
+}
+
+function getGameTypeLabel(gameType: string): string {
+  if (gameType === 'JND28') return '加拿大28';
+  if (gameType === 'LUCKYSB') return getPlatformLabel('LUCKYSB');
+  return gameType;
+}
+
+function resolveAccountPlatformOptions(
+  account: Pick<AccountInfo, 'allowed_strategy_platform_types' | 'game_type' | 'platform_type'>
+): string[] {
+  const explicit = Array.from(
+    new Set((account.allowed_strategy_platform_types ?? []).map((item) => `${item}`.toUpperCase()))
+  );
+  if (explicit.length > 0) return explicit;
+
+  const gameType = resolveAccountGameType(account);
+  if (gameType === 'LUCKYSB') return ['LUCKYSB'];
+  return ['JND28WEB', 'JND282'];
+}
+
+interface AccountsProps {
+  onCreateStrategy?: (accountId: number) => void;
+}
+
+export default function Accounts({ onCreateStrategy }: AccountsProps) {
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -65,6 +101,7 @@ export default function Accounts() {
   // Bind form state
   const [formName, setFormName] = useState('');
   const [formPassword, setFormPassword] = useState('');
+  const [formGameType, setFormGameType] = useState<AccountGameType>('JND28');
   const [formPlatformUrl, setFormPlatformUrl] = useState('');
   const [formError, setFormError] = useState('');
   const [formLoading, setFormLoading] = useState(false);
@@ -105,19 +142,24 @@ export default function Accounts() {
       return;
     }
 
+    if (!formPlatformUrl.trim()) {
+      setFormError('平台地址不能为空');
+      return;
+    }
+
     setFormLoading(true);
     try {
       const data: AccountCreate = {
         account_name: formName.trim(),
         password: formPassword,
+        game_type: formGameType,
+        platform_url: formPlatformUrl.trim(),
       };
-      if (formPlatformUrl.trim()) {
-        data.platform_url = formPlatformUrl.trim();
-      }
       await createAccount(data);
       // Reset form & refresh list
       setFormName('');
       setFormPassword('');
+      setFormGameType('JND28');
       setFormPlatformUrl('');
       setShowForm(false);
       await fetchAccounts();
@@ -138,7 +180,7 @@ export default function Accounts() {
       await loginAccount(id);
       await fetchAccounts();
     } catch (err) {
-      showToast(isApiError(err) ? err.message : '登录失败');
+      showToast(isApiError(err) ? err.message : '验证失败');
     } finally {
       setActionLoading((prev) => {
         const next = { ...prev };
@@ -265,11 +307,30 @@ export default function Accounts() {
             </div>
 
             <div className="bind-field">
+              <label htmlFor="bind-game-type" className="bind-label">
+                游戏类型
+              </label>
+              <select
+                id="bind-game-type"
+                className="bind-input"
+                value={formGameType}
+                onChange={(e) => {
+                  const nextGameType = e.target.value as AccountGameType;
+                  setFormGameType(nextGameType);
+                }}
+                disabled={formLoading}
+              >
+                {ACCOUNT_GAME_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="bind-field">
               <label htmlFor="bind-platform-url" className="bind-label">
-                平台地址
-                <span style={{ fontSize: 11, color: '#999', fontWeight: 400, marginLeft: 4 }}>
-                  留空使用默认
-                </span>
+                {formGameType === 'LUCKYSB' ? '会员站地址' : '平台地址'}
               </label>
               <input
                 id="bind-platform-url"
@@ -277,7 +338,8 @@ export default function Accounts() {
                 className="bind-input"
                 value={formPlatformUrl}
                 onChange={(e) => setFormPlatformUrl(e.target.value)}
-                placeholder="https://example.com"
+                placeholder={formGameType === 'LUCKYSB' ? '请输入会员站地址' : '请输入平台地址'}
+                required
                 disabled={formLoading}
               />
             </div>
@@ -288,6 +350,8 @@ export default function Accounts() {
                 className="bind-cancel-btn"
                 onClick={() => {
                   setShowForm(false);
+                  setFormGameType('JND28');
+                  setFormPlatformUrl('');
                   setFormError('');
                 }}
                 disabled={formLoading}
@@ -330,6 +394,7 @@ export default function Accounts() {
               onLogout={handleLogout}
               onDelete={handleDelete}
               onKillSwitch={handleKillSwitch}
+              onCreateStrategy={onCreateStrategy}
               showToast={showToast}
             />
           ))}
@@ -377,6 +442,68 @@ const ODDS_GROUPS: { label: string; prefix: string }[] = [
   { label: '特码波色', prefix: 'TMBS' },
 ];
 
+interface AccountOddsSyncStatus {
+  status: OddsStatus;
+  label: string;
+  message: string;
+  oddsCount: number | null;
+}
+
+function resolveAccountOddsSyncStatus(account: AccountInfo): AccountOddsSyncStatus | null {
+  const synced = typeof account.odds_synced === 'boolean' ? account.odds_synced : null;
+  const oddsCount =
+    typeof account.odds_count === 'number' && Number.isFinite(account.odds_count)
+      ? Math.max(0, Math.trunc(account.odds_count))
+      : null;
+  const message = typeof account.odds_message === 'string' ? account.odds_message.trim() : '';
+
+  if (synced === null && oddsCount === null && !message) {
+    return null;
+  }
+
+  if (synced === true) {
+    return {
+      status: 'confirmed',
+      label: '赔率已同步',
+      message,
+      oddsCount,
+    };
+  }
+
+  return {
+    status: oddsCount !== null && oddsCount > 0 ? 'unconfirmed' : 'none',
+    label: '赔率未同步',
+    message,
+    oddsCount,
+  };
+}
+
+function resolveOddsRefreshResult(data: OddsRefreshResponse | undefined): {
+  period: PeriodInfo | null;
+  oddsCount: number;
+  synced: boolean;
+  message: string;
+} | null {
+  if (!data) return null;
+
+  const oddsCount =
+    typeof data.odds_count === 'number' && Number.isFinite(data.odds_count)
+      ? Math.max(0, Math.trunc(data.odds_count))
+      : 0;
+  const synced = typeof data.odds_synced === 'boolean' ? data.odds_synced : Boolean(data.synced);
+  const message =
+    (typeof data.odds_message === 'string' && data.odds_message.trim()) ||
+    (typeof data.message === 'string' && data.message.trim()) ||
+    '赔率刷新完成';
+
+  return {
+    period: data.period ?? null,
+    oddsCount,
+    synced,
+    message,
+  };
+}
+
 function groupOdds(items: OddsItem[]): { label: string; items: OddsItem[] }[] {
   const groups: { label: string; items: OddsItem[] }[] = [];
   const used = new Set<string>();
@@ -405,6 +532,7 @@ interface AccountCardProps {
   onLogout: (id: number) => void;
   onDelete: (id: number, name: string) => void;
   onKillSwitch: (id: number, currentEnabled: boolean) => void;
+  onCreateStrategy?: (id: number) => void;
   showToast: (text: string) => void;
 }
 
@@ -415,6 +543,7 @@ function AccountCard({
   onLogout,
   onDelete,
   onKillSwitch,
+  onCreateStrategy,
   showToast,
 }: AccountCardProps) {
   const isActioning = !!actionLoading;
@@ -425,6 +554,21 @@ function AccountCard({
   const [refreshLoading, setRefreshLoading] = useState(false);
   const [refreshMsg, setRefreshMsg] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
   const [periodInfo, setPeriodInfo] = useState<PeriodInfo | null>(null);
+  const oddsPlatformOptions = resolveAccountPlatformOptions(account);
+  const oddsPlatformKey = oddsPlatformOptions.join('|');
+  const [selectedOddsPlatform, setSelectedOddsPlatform] = useState<string>(oddsPlatformOptions[0] ?? 'JND28WEB');
+  const structuredOddsSync = resolveAccountOddsSyncStatus(account);
+  const selectedPlatformLabel = getPlatformLabel(selectedOddsPlatform);
+  const useStructuredOddsStatus = oddsPlatformOptions.length === 1;
+  const displayOddsStatus = (useStructuredOddsStatus ? structuredOddsSync?.status : null) ?? oddsStatus;
+  const displayOddsLabel = (useStructuredOddsStatus ? structuredOddsSync?.label : null) ?? getOddsLabel(oddsStatus);
+  const accountGameType = resolveAccountGameType(account);
+
+  useEffect(() => {
+    setSelectedOddsPlatform((current) =>
+      oddsPlatformOptions.includes(current) ? current : (oddsPlatformOptions[0] ?? 'JND28WEB')
+    );
+  }, [oddsPlatformKey]);
 
   const fetchOddsStatus = useCallback(async () => {
     if (account.status !== 'online') {
@@ -433,7 +577,7 @@ function AccountCard({
       return;
     }
     try {
-      const res = await getAccountOdds(account.id);
+      const res = await getAccountOdds(account.id, selectedOddsPlatform);
       const data = res.data;
       if (!data || data.items.length === 0) {
         setOddsStatus('none');
@@ -449,18 +593,20 @@ function AccountCard({
       setOddsStatus('none');
       setOddsItems([]);
     }
-  }, [account.id, account.status]);
+  }, [account.id, account.status, selectedOddsPlatform]);
 
   useEffect(() => {
+    setPeriodInfo(null);
+    setRefreshMsg(null);
     fetchOddsStatus();
   }, [fetchOddsStatus]);
 
   const handleConfirmOdds = async () => {
     setOddsLoading(true);
     try {
-      await confirmAccountOdds(account.id);
+      await confirmAccountOdds(account.id, selectedOddsPlatform);
       await fetchOddsStatus();
-      setRefreshMsg({ text: '赔率已确认', type: 'success' });
+      setRefreshMsg({ text: `${selectedPlatformLabel}赔率已确认`, type: 'success' });
     } catch (err) {
       showToast(isApiError(err) ? err.message : '确认赔率失败');
     } finally {
@@ -472,17 +618,18 @@ function AccountCard({
     setRefreshLoading(true);
     setRefreshMsg(null);
     try {
-      const res = await refreshAccountOdds(account.id);
+      const res = await refreshAccountOdds(account.id, selectedOddsPlatform);
       const data = res.data as OddsRefreshResponse | undefined;
-      if (data) {
-        if (data.period) setPeriodInfo(data.period);
-        if (data.synced) {
-          setRefreshMsg({ text: data.message, type: 'success' });
+      const refreshResult = resolveOddsRefreshResult(data);
+      if (refreshResult) {
+        if (refreshResult.period) setPeriodInfo(refreshResult.period);
+        if (refreshResult.synced) {
+          setRefreshMsg({ text: refreshResult.message, type: 'success' });
           await fetchOddsStatus();
-        } else if (data.odds_count > 0) {
-          setRefreshMsg({ text: data.message, type: 'error' });
+        } else if (refreshResult.oddsCount > 0) {
+          setRefreshMsg({ text: refreshResult.message, type: 'error' });
         } else {
-          setRefreshMsg({ text: data.message, type: 'info' });
+          setRefreshMsg({ text: refreshResult.message, type: 'info' });
         }
       }
     } catch (err) {
@@ -503,7 +650,7 @@ function AccountCard({
       <div className="account-card-header">
         <h3 className="account-name">{account.account_name}</h3>
         <div className="account-badges">
-          <span className="badge badge-platform">{account.platform_type}</span>
+          <span className="badge badge-platform">{getGameTypeLabel(accountGameType)}</span>
           <span className={`badge ${getStatusBadgeClass(account.status)}`}>
             {getStatusLabel(account.status)}
           </span>
@@ -521,16 +668,20 @@ function AccountCard({
         </div>
         {account.platform_url && (
           <div className="account-info-item">
-            <span className="account-info-label">平台地址</span>
+            <span className="account-info-label">
+              {accountGameType === 'LUCKYSB' ? '会员站地址' : '平台地址'}
+            </span>
             <span className="account-info-value" style={{ fontSize: 11, wordBreak: 'break-all' }}>
               {account.platform_url}
             </span>
           </div>
         )}
         <div className="account-info-item">
-          <span className="account-info-label">赔率状态</span>
-          <span className={`badge ${getOddsBadgeClass(oddsStatus)}`}>
-            {getOddsLabel(oddsStatus)}
+          <span className="account-info-label">
+            {oddsPlatformOptions.length > 1 ? `赔率状态（${selectedPlatformLabel}）` : '赔率状态'}
+          </span>
+          <span className={`badge ${getOddsBadgeClass(displayOddsStatus)}`}>
+            {displayOddsLabel}
           </span>
         </div>
         {oddsItems.length > 0 && (
@@ -565,6 +716,26 @@ function AccountCard({
 
           {oddsExpanded && (
             <div className="odds-panel-body">
+              <div className="odds-platform-row">
+                <span className="odds-platform-label">赔率平台</span>
+                {oddsPlatformOptions.length > 1 ? (
+                  <select
+                    className="odds-platform-select"
+                    value={selectedOddsPlatform}
+                    onChange={(e) => setSelectedOddsPlatform(e.target.value)}
+                    disabled={refreshLoading || oddsLoading || isActioning}
+                  >
+                    {oddsPlatformOptions.map((platformType) => (
+                      <option key={platformType} value={platformType}>
+                        {getPlatformLabel(platformType)}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="badge badge-platform">{selectedPlatformLabel}</span>
+                )}
+              </div>
+
               {/* Period Info */}
               {periodInfo && (
                 <div className="odds-period-info">
@@ -706,7 +877,7 @@ function AccountCard({
             onClick={() => onLogin(account.id)}
             disabled={isActioning}
           >
-            {actionLoading === 'login' ? '登录中...' : '登录'}
+            {actionLoading === 'login' ? '验证中...' : '验证账号'}
           </button>
         )}
         <button
@@ -717,6 +888,16 @@ function AccountCard({
         >
           {actionLoading === 'delete' ? '解绑中...' : '解绑'}
         </button>
+        {onCreateStrategy && (
+          <button
+            type="button"
+            className="action-btn action-btn-edit"
+            onClick={() => onCreateStrategy(account.id)}
+            disabled={isActioning}
+          >
+            去创建策略
+          </button>
+        )}
       </div>
     </div>
   );

@@ -120,6 +120,7 @@ def log_bet(
     result: str,
     duration_ms: Optional[float] = None,
     trace_id: Optional[str] = None,
+    **extra_fields: Any,
 ) -> dict[str, Any]:
     """/"""
     if trace_id is not None:
@@ -134,6 +135,7 @@ def log_bet(
         amount=amount,
         result=result,
         duration_ms=duration_ms,
+        **extra_fields,
     )
 
 

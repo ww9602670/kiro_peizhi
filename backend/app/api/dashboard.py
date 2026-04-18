@@ -53,7 +53,7 @@ async def get_dashboard(
             acct = acct_map.get(s["account_id"])
             if acct:
                 info.account_name = acct.get("account_name") or acct.get("name", "")
-                info.platform_type = acct.get("platform_type", "")
+                info.platform_type = s.get("platform_type") or ""
             running_strategies.append(info)
 
     today = datetime.now(_BJT).strftime("%Y-%m-%d")

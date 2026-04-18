@@ -10,6 +10,7 @@ export interface OddsItem {
 /** 赔率列表响应，对应 OddsListResponse */
 export interface OddsListResponse {
   account_id: number;
+  platform_type: string;
   items: OddsItem[];
   has_unconfirmed: boolean;
 }
@@ -33,8 +34,13 @@ export interface PeriodInfo {
 /** 赔率刷新响应，对应 OddsRefreshResponse */
 export interface OddsRefreshResponse {
   account_id: number;
+  platform_type: string;
   period: PeriodInfo | null;
   odds_count: number;
-  synced: boolean;
-  message: string;
+  // Legacy fields kept for backward compatibility.
+  synced?: boolean;
+  message?: string;
+  // Structured fields from the timing-fix slice.
+  odds_synced?: boolean;
+  odds_message?: string;
 }

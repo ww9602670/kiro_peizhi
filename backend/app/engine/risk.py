@@ -22,6 +22,7 @@ from app.engine.alert import AlertService
 from app.engine.strategy_runner import BetSignal
 from app.models.db_ops import (
     account_get_by_id,
+    account_platform_session_get,
     operator_get_by_id,
     strategy_get_by_id,
     strategy_list_by_operator,
@@ -60,12 +61,14 @@ class RiskController:
         alert_service: AlertService,
         operator_id: int,
         account_id: int,
+        platform_type: str,
         global_kill: bool = False,
     ) -> None:
         self.db = db
         self.alert_service = alert_service
         self.operator_id = operator_id
         self.account_id = account_id
+        self.platform_type = platform_type
         self.global_kill = global_kill
 
         # account_id  
@@ -122,12 +125,14 @@ class RiskController:
     #  
     # ------------------------------------------------------------------
     async def _check_session(self, signal: BetSignal) -> RiskCheckResult:
-        account = await account_get_by_id(
-            self.db, account_id=self.account_id, operator_id=self.operator_id
+        session = await account_platform_session_get(
+            self.db,
+            account_id=self.account_id,
+            platform_type=self.platform_type,
         )
-        if not account:
+        if not session:
             return RiskCheckResult(passed=False, reason="")
-        token = account.get("session_token")
+        token = session.get("session_token")
         if not token:
             return RiskCheckResult(passed=False, reason=" session_token")
         return RiskCheckResult(passed=True)

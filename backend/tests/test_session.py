@@ -58,6 +58,12 @@ def mock_captcha_service():
     return svc
 
 
+@pytest.fixture(autouse=True)
+def mock_session_persistence(monkeypatch):
+    monkeypatch.setattr("app.engine.session.account_platform_session_upsert", AsyncMock(return_value={}))
+    monkeypatch.setattr("app.engine.session.account_update", AsyncMock(return_value={}))
+
+
 @pytest.fixture
 def session(mock_adapter, mock_alert_service, mock_captcha_service, db):
     return SessionManager(
@@ -68,6 +74,7 @@ def session(mock_adapter, mock_alert_service, mock_captcha_service, db):
         account_id=10,
         account_name="testuser",
         password="testpass",
+        platform_type="JND28WEB",
         db=db,
     )
 
@@ -231,6 +238,7 @@ async def test_5_failures_calls_on_status_change(mock_adapter, mock_alert_servic
         account_id=10,
         account_name="testuser",
         password="testpass",
+        platform_type="JND28WEB",
         db=db,
         on_status_change=on_change,
     )

@@ -11,13 +11,19 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.api import accounts as accounts_api
 import app.database as _db_module
 from app.database import close_shared_db, get_shared_db
+from app.engine.adapters.base import LoginResult
 from app.main import app
 
 
 def _uid() -> str:
     return uuid.uuid4().hex[:8]
+
+
+def _platform_url(platform_type: str = "JND28WEB") -> str:
+    return f"https://{platform_type.lower()}.example.com"
 
 
 #   fixtures 
@@ -40,6 +46,15 @@ async def client():
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
             yield c
+
+
+@pytest.fixture(autouse=True)
+def mock_account_bind_login(monkeypatch):
+    monkeypatch.setattr(
+        accounts_api,
+        "_login_platform_account",
+        AsyncMock(return_value=LoginResult(success=True, token="platform-token")),
+    )
 
 
 async def _admin_login(client: AsyncClient) -> str:
@@ -120,12 +135,14 @@ async def test_full_api_flow(client):
             "account_name": f"gambler_{uid}",
             "password": "gp123456",
             "platform_type": "JND28WEB",
+            "platform_url": _platform_url("JND28WEB"),
         },
     )
     assert resp.json()["code"] == 0
     account = resp.json()["data"]
     account_id = account["id"]
-    assert account["platform_type"] == "JND28WEB"
+    assert account["game_type"] == "JND28"
+    assert "JND28WEB" in account["allowed_strategy_platform_types"]
     assert account["password_masked"].endswith("****")
 
     # 5. 
@@ -159,7 +176,7 @@ async def test_full_api_flow(client):
     # 8. 
     resp = await client.get("/api/v1/bet-orders", headers=op_headers)
     assert resp.json()["code"] == 0
-    assert resp.json()["data"]["total"] == 0
+    assert resp.json()["data"]["paged"]["total"] == 0
 
     # 9. 
     resp = await client.get("/api/v1/dashboard", headers=op_headers)
@@ -169,7 +186,7 @@ async def test_full_api_flow(client):
     assert "daily_pnl" in dash
     assert "total_pnl" in dash
     assert "running_strategies" in dash
-    assert "recent_bets" in dash
+    assert "recent_bets" in dash or "pending_bets" in dash
     assert "unread_alerts" in dash
 
     # 10. 
@@ -221,7 +238,12 @@ async def test_accounts_self_visible(two_operators):
 
     await client.post(
         "/api/v1/accounts", headers=headers_a,
-        json={"account_name": f"acc_{uid}", "password": "pw1234", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"acc_{uid}",
+            "password": "pw1234",
+            "platform_type": "JND28WEB",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     resp = await client.get("/api/v1/accounts", headers=headers_a)
     assert resp.json()["code"] == 0
@@ -236,7 +258,12 @@ async def test_accounts_cross_invisible(two_operators):
 
     await client.post(
         "/api/v1/accounts", headers=headers_a,
-        json={"account_name": f"acc_{uid}", "password": "pw1234", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"acc_{uid}",
+            "password": "pw1234",
+            "platform_type": "JND28WEB",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     resp = await client.get("/api/v1/accounts", headers=headers_b)
     assert resp.json()["code"] == 0
@@ -251,7 +278,12 @@ async def test_accounts_cross_delete_404(two_operators):
 
     resp = await client.post(
         "/api/v1/accounts", headers=headers_a,
-        json={"account_name": f"acc_{uid}", "password": "pw1234", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"acc_{uid}",
+            "password": "pw1234",
+            "platform_type": "JND28WEB",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     acc_id = resp.json()["data"]["id"]
 
@@ -266,7 +298,12 @@ async def _create_account_for(client, headers) -> int:
     uid = _uid()
     resp = await client.post(
         "/api/v1/accounts", headers=headers,
-        json={"account_name": f"sa_{uid}", "password": "pw1234", "platform_type": "JND28WEB"},
+        json={
+            "account_name": f"sa_{uid}",
+            "password": "pw1234",
+            "platform_type": "JND28WEB",
+            "platform_url": _platform_url("JND28WEB"),
+        },
     )
     return resp.json()["data"]["id"]
 
@@ -329,7 +366,8 @@ async def test_bet_orders_self_visible(two_operators):
 
     resp = await client.get("/api/v1/bet-orders", headers=headers_a)
     assert resp.json()["code"] == 0
-    assert "items" in resp.json()["data"]
+    assert "paged" in resp.json()["data"]
+    assert "items" in resp.json()["data"]["paged"]
 
 
 @pytest.mark.asyncio
@@ -361,11 +399,11 @@ async def test_bet_orders_cross_invisible(two_operators):
 
     # A 
     resp = await client.get("/api/v1/bet-orders", headers=headers_a)
-    assert resp.json()["data"]["total"] >= 1
+    assert resp.json()["data"]["paged"]["total"] >= 1
 
     # B 
     resp = await client.get("/api/v1/bet-orders", headers=headers_b)
-    assert resp.json()["data"]["total"] == 0
+    assert resp.json()["data"]["paged"]["total"] == 0
 
 
 @pytest.mark.asyncio

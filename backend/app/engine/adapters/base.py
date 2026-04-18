@@ -42,18 +42,21 @@ class BetResult:
     def error_code(self) -> str:
         """ message  raw_response 
 
-        
-        - ""  ODDS_CHANGED
-        - "" / ""  CLOSED
-        - "" / ""  INSTALLMENTS_MISMATCH
-        -   UNKNOWN
+        Known categories:
+        - odds changed -> ODDS_CHANGED
+        - closed/stop betting -> CLOSED
+        - issue mismatch -> INSTALLMENTS_MISMATCH
+        - everything else -> UNKNOWN
         """
-        msg = self.message.lower()
-        if "" in msg and "" in msg:
+        if self.succeed == 5:
             return "ODDS_CHANGED"
-        if "" in msg or "" in msg:
+
+        msg = (self.message or "").lower()
+        if "赔率" in msg or "odds" in msg:
+            return "ODDS_CHANGED"
+        if "封盘" in msg or "截止" in msg or "closed" in msg:
             return "CLOSED"
-        if "" in msg:
+        if "期号" in msg or "installments" in msg or "mismatch" in msg:
             return "INSTALLMENTS_MISMATCH"
         return "UNKNOWN"
 
@@ -61,10 +64,10 @@ class BetResult:
     def is_retryable(self) -> bool:
         """
 
-        ODDS_CHANGED, CLOSED, INSTALLMENTS_MISMATCH
-        
+        Confirmbet may only do one controlled retry for explicit
+        odds-changed responses.
         """
-        return self.error_code not in ["ODDS_CHANGED", "CLOSED", "INSTALLMENTS_MISMATCH"]
+        return self.error_code == "ODDS_CHANGED"
 
 
 @dataclass

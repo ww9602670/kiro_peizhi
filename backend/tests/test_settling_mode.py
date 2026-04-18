@@ -188,7 +188,7 @@ class TestSettlingModeSkipsBetting:
         worker.strategies.clear()
 
         install = _make_install(issue="20250302001")
-        signals = worker._collect_signals(install)
+        signals = await worker._collect_signals(install)
 
         assert signals == []
         worker.executor.execute.assert_not_called()

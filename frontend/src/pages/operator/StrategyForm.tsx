@@ -7,26 +7,59 @@ import { isApiError } from '@/api/request';
 import { createStrategy, updateStrategy } from '@/api/strategies';
 import { listAccounts } from '@/api/accounts';
 import PlayCodeMultiSelect from '@/components/PlayCodeMultiSelect';
-import type { StrategyCreate, StrategyInfo, StrategyUpdate } from '@/types/api/strategy';
-import type { AccountInfo } from '@/types/api/account';
+import PlayCodeSelect from '@/components/PlayCodeSelect';
+import type {
+  StrategyCreate,
+  StrategyInfo,
+  StrategyPlatformType,
+  StrategyUpdate,
+} from '@/types/api/strategy';
+import type { AccountGameType, AccountInfo } from '@/types/api/account';
+import {
+  buildDw3PlayCode,
+  getDw3GroupLabel,
+  getDw3GroupTabs,
+  getDw3TheoreticalMaxStake,
+  hasOnlyDw3GroupTokens,
+  isDw3GroupToken,
+  parseDw3PlayCode,
+  type Dw3GroupTabKey,
+} from '@/utils/dw3Groups';
+import { getPlatformLabel } from '@/utils/platformLabels';
 import './StrategyForm.css';
 
 type StrategyType = 'flat' | 'martin' | 'red_wave_double_martin';
+type StrategyTypeValue = StrategyType | '';
 
 interface StrategyFormProps {
   strategy: StrategyInfo | null;
+  initialAccountId?: number;
+  existingStrategies?: StrategyInfo[];
   onDone: () => void;
   onCancel: () => void;
 }
 
 const RED_WAVE_DOUBLE_TYPE: StrategyType = 'red_wave_double_martin';
+const LUCKYSB_PLATFORM_TYPE: StrategyPlatformType = 'LUCKYSB';
+const DEFAULT_JND_PLATFORM_TYPE: StrategyPlatformType = 'JND28WEB';
+const JND_PLATFORM_TYPES: StrategyPlatformType[] = ['JND28WEB', 'JND282'];
+const DW3_DISPLAY_NAME = '三字定位';
+
 const RED_WAVE_DIRECTION_ORDER = ['B1LM_S', 'B2LM_S', 'B3LM_S', 'DS4'] as const;
 const RED_WAVE_DIRECTION_OPTIONS = [
-  { code: 'B1LM_S', label: '球1' },
-  { code: 'B2LM_S', label: '球2' },
-  { code: 'B3LM_S', label: '球3' },
-  { code: 'DS4', label: '和值' },
+  { code: 'B1LM_S', label: '一球小' },
+  { code: 'B2LM_S', label: '二球小' },
+  { code: 'B3LM_S', label: '三球小' },
+  { code: 'DS4', label: '双' },
 ] as const;
+
+const LABEL_ACCOUNT = '博彩账号';
+const LABEL_PLATFORM = '盘口类型';
+const LABEL_NAME = '策略名称';
+const LABEL_AMOUNT = '基础金额（元）';
+const BUTTON_CREATE = '创建';
+const BUTTON_RED_WAVE = '红波追双';
+const ERROR_SELECT_TYPE = '请选择策略类型';
 
 function normalizeRedWaveDirections(codes: string[]): string[] {
   const upper = codes.map((code) => code.trim().toUpperCase()).filter(Boolean);
@@ -34,23 +67,105 @@ function normalizeRedWaveDirections(codes: string[]): string[] {
   return RED_WAVE_DIRECTION_ORDER.filter((code) => deduped.includes(code));
 }
 
-function isMartinLike(type: StrategyType) {
+function isMartinLike(type: StrategyTypeValue) {
   return type === 'martin' || type === RED_WAVE_DOUBLE_TYPE;
 }
 
-export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFormProps) {
+function isRealPlatformType(platformType?: string | null): platformType is StrategyPlatformType {
+  return platformType === 'JND28WEB' || platformType === 'JND282' || platformType === 'LUCKYSB';
+}
+
+function normalizePlatformType(platformType?: string | null): StrategyPlatformType {
+  if (isRealPlatformType(platformType)) return platformType;
+  return DEFAULT_JND_PLATFORM_TYPE;
+}
+
+function isDw3Platform(platformType: string) {
+  return platformType === 'JND28WEB' || platformType === 'JND282';
+}
+
+function resolveAccountGameType(account?: AccountInfo): AccountGameType | string | undefined {
+  if (!account) return undefined;
+  if (account.game_type) return account.game_type;
+  if (account.platform_type === LUCKYSB_PLATFORM_TYPE) return 'LUCKYSB';
+  if (account.platform_type === 'JND28WEB' || account.platform_type === 'JND282') return 'JND28';
+  return undefined;
+}
+
+function getAccountGameTypeLabel(account: AccountInfo): string {
+  const gameType = resolveAccountGameType(account);
+  if (gameType === 'JND28') return 'JND28';
+  if (gameType === 'LUCKYSB') return getPlatformLabel('LUCKYSB');
+  return gameType ?? '-';
+}
+
+function resolveAllowedPlatformTypes(
+  account?: AccountInfo,
+  fallbackPlatformType?: string
+): StrategyPlatformType[] {
+  const explicit = Array.from(
+    new Set((account?.allowed_strategy_platform_types ?? []).map((item) => normalizePlatformType(item)))
+  );
+  if (explicit.length > 0) return explicit;
+
+  const gameType = resolveAccountGameType(account);
+  if (gameType === 'LUCKYSB') return ['LUCKYSB'];
+  if (gameType === 'JND28') return [...JND_PLATFORM_TYPES];
+
+  if (fallbackPlatformType) return [normalizePlatformType(fallbackPlatformType)];
+  return [...JND_PLATFORM_TYPES];
+}
+
+function pickPlatformType(
+  allowed: StrategyPlatformType[],
+  preferred?: string | null
+): StrategyPlatformType {
+  const normalizedPreferred = normalizePlatformType(preferred);
+  if (allowed.includes(normalizedPreferred)) return normalizedPreferred;
+  if (allowed.length > 0) return allowed[0];
+  return DEFAULT_JND_PLATFORM_TYPE;
+}
+
+function isStrategyTypeValidForPlatform(
+  type: StrategyTypeValue,
+  platformType: string,
+  dw3Mode: boolean
+) {
+  if (!type) return false;
+  if (dw3Mode) return type === 'flat' || type === 'martin';
+  if (platformType === LUCKYSB_PLATFORM_TYPE) return type === 'flat' || type === 'martin';
+  return true;
+}
+
+const DW3_MULTI_WARNING =
+  `同账号创建多个${DW3_DISPLAY_NAME}策略可能会造成无法下注的风险。如发现问题请截图联系管理员。`;
+
+export default function StrategyForm({
+  strategy,
+  initialAccountId,
+  existingStrategies = [],
+  onDone,
+  onCancel,
+}: StrategyFormProps) {
   const isEdit = !!strategy;
+
+  const initialStrategyPlatformType = normalizePlatformType(strategy?.platform_type);
+  const initialDw3Parsed = parseDw3PlayCode(strategy?.play_code ?? '');
+  const initialDw3Mode = Boolean(strategy && hasOnlyDw3GroupTokens(strategy.play_code));
 
   const [accounts, setAccounts] = useState<AccountInfo[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(true);
 
-  const [accountId, setAccountId] = useState<number>(strategy?.account_id ?? 0);
+  const [accountId, setAccountId] = useState<number>(strategy?.account_id ?? initialAccountId ?? 0);
   const [name, setName] = useState(strategy?.name ?? '');
-  const [type, setType] = useState<StrategyType>(
-    (strategy?.type as StrategyType) ?? 'flat'
-  );
+  const [type, setType] = useState<StrategyTypeValue>((strategy?.type as StrategyType) ?? 'flat');
   const [playCode, setPlayCode] = useState<string[]>(
-    strategy?.play_code ? strategy.play_code.split(',') : []
+    strategy?.play_code && initialStrategyPlatformType !== LUCKYSB_PLATFORM_TYPE && !initialDw3Mode
+      ? strategy.play_code.split(',')
+      : []
+  );
+  const [luckySbPlayCode, setLuckySbPlayCode] = useState(
+    initialStrategyPlatformType === LUCKYSB_PLATFORM_TYPE ? (strategy?.play_code ?? '') : ''
   );
   const [redWaveDirections, setRedWaveDirections] = useState<string[]>(
     (() => {
@@ -59,38 +174,114 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
       return normalized.length > 0 ? normalized : ['DS4'];
     })()
   );
-  const [platformType, setPlatformType] = useState<string>(
-    strategy?.platform_type ?? 'JND28WEB'
-  );
-  const [baseAmount, setBaseAmount] = useState(strategy?.base_amount?.toString() ?? '');
-  const [martinSequence, setMartinSequence] = useState(
-    strategy?.martin_sequence?.join(',') ?? '1,2,4,8,16'
-  );
+  const [platformType, setPlatformType] = useState<string>(initialStrategyPlatformType);
+  const [baseAmount, setBaseAmount] = useState(strategy?.base_amount?.toString() ?? '1');
+  const [martinSequence, setMartinSequence] = useState(strategy?.martin_sequence?.join(',') ?? '1,2,4,8,16');
   const [betTiming, setBetTiming] = useState(strategy?.bet_timing?.toString() ?? '30');
   const [simulation, setSimulation] = useState(strategy?.simulation ?? false);
   const [stopLoss, setStopLoss] = useState(strategy?.stop_loss?.toString() ?? '');
   const [takeProfit, setTakeProfit] = useState(strategy?.take_profit?.toString() ?? '');
 
+  const [dw3Mode, setDw3Mode] = useState(initialDw3Mode);
+  const [dw3ActiveTab, setDw3ActiveTab] = useState<Dw3GroupTabKey>('bs');
+  const [dw3SelectedBs, setDw3SelectedBs] = useState<string[]>(initialDw3Parsed.selectedBs);
+  const [dw3SelectedOe, setDw3SelectedOe] = useState<string[]>(initialDw3Parsed.selectedOe);
+  const [gateWindowIssues, setGateWindowIssues] = useState<string>(
+    strategy?.gate_window_issues?.toString() ?? '1'
+  );
+
   const [formError, setFormError] = useState('');
+  const [resetNotice, setResetNotice] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  const isLuckySb = platformType === LUCKYSB_PLATFORM_TYPE;
   const isRedWaveDouble = type === RED_WAVE_DOUBLE_TYPE;
+
+  const selectedAccount = accounts.find((a) => a.id === accountId);
+  const allowedPlatformTypes = resolveAllowedPlatformTypes(
+    selectedAccount,
+    strategy?.platform_type ?? platformType
+  );
+  const selectablePlatformTypes = (
+    dw3Mode ? allowedPlatformTypes.filter((item) => isDw3Platform(item)) : allowedPlatformTypes
+  );
+  const effectivePlatformTypes =
+    selectablePlatformTypes.length > 0 ? selectablePlatformTypes : [DEFAULT_JND_PLATFORM_TYPE];
+  const canUseDw3 = allowedPlatformTypes.some((item) => isDw3Platform(item)) || dw3Mode;
+  const sameAccountExistingDw3Count = existingStrategies.filter((item) => {
+    if (item.account_id !== accountId) return false;
+    if (strategy && item.id === strategy.id) return false;
+    return hasOnlyDw3GroupTokens(item.play_code);
+  }).length;
+  const showDw3MultiWarning = !isEdit && dw3Mode && sameAccountExistingDw3Count > 0;
+
+  const dw3Tabs = getDw3GroupTabs();
+  const activeDw3Tab =
+    dw3Tabs.find((tab) => tab.key === dw3ActiveTab) ??
+    ({
+      key: 'bs',
+      label: '',
+      groups: [],
+    } as const);
+
+  const dw3TheoreticalMaxStake = getDw3TheoreticalMaxStake(
+    dw3SelectedBs.length,
+    dw3SelectedOe.length,
+    Number(baseAmount)
+  );
+
+  const applyPlatformChange = (nextPlatformType: string) => {
+    if (nextPlatformType === platformType) return;
+
+    const cleared: string[] = [];
+    if (nextPlatformType === LUCKYSB_PLATFORM_TYPE) {
+      if (playCode.length > 0) cleared.push('加拿大28玩法');
+      setPlayCode([]);
+      if (!isStrategyTypeValidForPlatform(type, nextPlatformType, false)) {
+        setType('');
+        setRedWaveDirections([]);
+        cleared.push('策略类型');
+      }
+      if (dw3Mode) {
+        setDw3Mode(false);
+        setDw3SelectedBs([]);
+        setDw3SelectedOe([]);
+        cleared.push(`${DW3_DISPLAY_NAME}模式`);
+      }
+    } else if (platformType === LUCKYSB_PLATFORM_TYPE) {
+      if (luckySbPlayCode) cleared.push('极速飞艇玩法');
+      setLuckySbPlayCode('');
+    }
+
+    if (cleared.length > 0) {
+      setResetNotice(`切换到${getPlatformLabel(nextPlatformType)}后已重置：${cleared.join('、')}`);
+    } else {
+      setResetNotice(`已切换到${getPlatformLabel(nextPlatformType)}`);
+    }
+    setPlatformType(nextPlatformType);
+  };
 
   const fetchAccounts = useCallback(async () => {
     try {
       const res = await listAccounts();
       const list = res.data ?? [];
       setAccounts(list);
-      if (!isEdit && list.length > 0 && accountId === 0) {
-        setAccountId(list[0].id);
-        setPlatformType(list[0].platform_type || 'JND28WEB');
+      if (list.length > 0) {
+        const nextAccountId = accountId === 0 ? (initialAccountId ?? list[0].id) : accountId;
+        const selected = list.find((account) => account.id === nextAccountId) ?? list[0];
+        if (!isEdit) setAccountId(selected.id);
+        const nextAllowed = resolveAllowedPlatformTypes(
+          selected,
+          strategy?.platform_type
+        );
+        setPlatformType((current) => pickPlatformType(nextAllowed, current));
       }
     } catch (err) {
-      if (isApiError(err)) setFormError('加载账号列表失败: ' + err.message);
+      if (isApiError(err)) setFormError(`加载账号失败：${err.message}`);
     } finally {
       setAccountsLoading(false);
     }
-  }, [isEdit, accountId]);
+  }, [isEdit, accountId, initialAccountId, strategy?.platform_type]);
 
   useEffect(() => {
     fetchAccounts();
@@ -98,36 +289,135 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
 
   const handleAccountChange = (nextAccountId: number) => {
     setAccountId(nextAccountId);
-    const account = accounts.find((a) => a.id === nextAccountId);
-    if (account?.platform_type) {
-      setPlatformType(account.platform_type);
+    const nextAccount = accounts.find((a) => a.id === nextAccountId);
+    const nextAllowed = resolveAllowedPlatformTypes(nextAccount, strategy?.platform_type ?? platformType);
+    const nextPlatformType = pickPlatformType(nextAllowed, platformType);
+    if (dw3Mode && !isDw3Platform(nextPlatformType)) {
+      setDw3Mode(false);
     }
+    applyPlatformChange(nextPlatformType);
+  };
+
+  const toggleDw3Mode = (enabled: boolean) => {
+    if (enabled) {
+      if (!canUseDw3) return;
+      setDw3Mode(true);
+      if (type === RED_WAVE_DOUBLE_TYPE) setType('flat');
+      setPlayCode([]);
+      setLuckySbPlayCode('');
+      if (!isDw3Platform(platformType)) {
+        const dw3Platforms = allowedPlatformTypes.filter((item) => isDw3Platform(item));
+        setPlatformType(pickPlatformType(dw3Platforms, DEFAULT_JND_PLATFORM_TYPE));
+      }
+      if (dw3SelectedBs.length === 0 && dw3SelectedOe.length === 0) {
+        setDw3SelectedBs(['DW3_BS_BBB']);
+      }
+      return;
+    }
+
+    setDw3Mode(false);
+    setPlatformType((current) => pickPlatformType(allowedPlatformTypes, current));
+  };
+
+  const toggleRedWaveDirection = (code: string) => {
+    setRedWaveDirections((previous) => {
+      if (previous.includes(code)) {
+        return previous.filter((item) => item !== code);
+      }
+      return normalizeRedWaveDirections([...previous, code]);
+    });
+  };
+
+  const toggleDw3Group = (token: string) => {
+    if (!isDw3GroupToken(token)) return;
+
+    if (dw3ActiveTab === 'bs') {
+      setDw3SelectedBs((previous) =>
+        previous.includes(token) ? previous.filter((item) => item !== token) : [...previous, token]
+      );
+      return;
+    }
+
+    setDw3SelectedOe((previous) =>
+      previous.includes(token) ? previous.filter((item) => item !== token) : [...previous, token]
+    );
   };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setFormError('');
+    const submitPlatformType = normalizePlatformType(platformType);
+    const isLuckySbPlatform = submitPlatformType === LUCKYSB_PLATFORM_TYPE;
 
-    if (!name.trim()) { setFormError('请输入策略名称'); return; }
-    if (!baseAmount || Number(baseAmount) <= 0) { setFormError('基础金额必须大于 0'); return; }
+    if (!type) {
+      setFormError(ERROR_SELECT_TYPE);
+      return;
+    }
+    if (!allowedPlatformTypes.includes(submitPlatformType)) {
+      setFormError('Selected account does not support the chosen platform type');
+      return;
+    }
+    if (!isStrategyTypeValidForPlatform(type, submitPlatformType, dw3Mode)) {
+      setFormError('当前平台与策略类型不匹配');
+      return;
+    }
+
+    if (!name.trim()) {
+      setFormError('请输入策略名称');
+      return;
+    }
+    if (!baseAmount || Number(baseAmount) <= 0) {
+      setFormError('基础金额必须大于 0');
+      return;
+    }
     if (!betTiming || Number(betTiming) < 5 || Number(betTiming) > 180) {
-      setFormError('下注时机须在 5-180 秒之间'); return;
+      setFormError('下注时机必须在 5 到 180 秒之间');
+      return;
     }
-    if (!isRedWaveDouble && playCode.length === 0) {
-      setFormError('请选择玩法'); return;
+
+    if (dw3Mode && !isDw3Platform(submitPlatformType)) {
+      setFormError(`${DW3_DISPLAY_NAME}平台必须是网页版或 2.0版`);
+      return;
     }
+    if (isLuckySbPlatform && !dw3Mode && !luckySbPlayCode) {
+      setFormError('请选择极速飞艇玩法');
+      return;
+    }
+    if (!isLuckySbPlatform && !dw3Mode && !isRedWaveDouble && playCode.length === 0) {
+      setFormError('请选择玩法');
+      return;
+    }
+
     const selectedDirections = normalizeRedWaveDirections(redWaveDirections);
     if (isRedWaveDouble && selectedDirections.length === 0) {
-      setFormError('红波追双至少选择一个方向'); return;
+      setFormError('请选择红波方向');
+      return;
+    }
+
+    const dw3PlayCode = buildDw3PlayCode(dw3SelectedBs, dw3SelectedOe);
+    const parsedGateWindowIssues = Number(gateWindowIssues);
+    if (dw3Mode) {
+      if (!dw3PlayCode) {
+        setFormError(`请选择${DW3_DISPLAY_NAME}组合`);
+        return;
+      }
+      if (!Number.isInteger(parsedGateWindowIssues) || parsedGateWindowIssues < 1) {
+        setFormError('最近期数必须是大于等于 1 的整数');
+        return;
+      }
     }
 
     let parsedSequence: number[] | null = null;
     if (isMartinLike(type)) {
       const parts = martinSequence.split(',').map((s) => s.trim()).filter(Boolean);
-      if (parts.length === 0) { setFormError('马丁序列不能为空'); return; }
+      if (parts.length === 0) {
+        setFormError('请输入马丁序列');
+        return;
+      }
       parsedSequence = parts.map(Number);
       if (parsedSequence.some((n) => Number.isNaN(n) || n <= 0)) {
-        setFormError('马丁序列必须为正数，逗号分隔'); return;
+        setFormError('马丁序列必须全部是大于 0 的数字');
+        return;
       }
     }
 
@@ -142,18 +432,27 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
           simulation,
           stop_loss: stopLoss ? Number(stopLoss) : null,
           take_profit: takeProfit ? Number(takeProfit) : null,
-          platform_type: platformType,
+          platform_type: submitPlatformType,
         };
-        if (isRedWaveDouble) {
+
+        if (dw3Mode) {
+          updatePayload.play_code = dw3PlayCode;
+          updatePayload.gate_window_issues = parsedGateWindowIssues;
+        } else if (isRedWaveDouble) {
           updatePayload.play_code = selectedDirections.join(',');
         }
+
         await updateStrategy(strategy.id, updatePayload);
       } else {
         const data: StrategyCreate = {
           account_id: accountId,
           name: name.trim(),
           type,
-          play_code: isRedWaveDouble
+          play_code: dw3Mode
+            ? dw3PlayCode
+            : isLuckySbPlatform
+            ? luckySbPlayCode
+            : isRedWaveDouble
             ? selectedDirections.join(',')
             : playCode.join(','),
           base_amount: Number(baseAmount),
@@ -162,7 +461,8 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
           simulation,
           stop_loss: stopLoss ? Number(stopLoss) : null,
           take_profit: takeProfit ? Number(takeProfit) : null,
-          platform_type: platformType,
+          platform_type: submitPlatformType,
+          gate_window_issues: dw3Mode ? parsedGateWindowIssues : null,
         };
         await createStrategy(data);
       }
@@ -175,15 +475,6 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
     }
   };
 
-  const toggleRedWaveDirection = (code: string) => {
-    setRedWaveDirections((previous) => {
-      if (previous.includes(code)) {
-        return previous.filter((item) => item !== code);
-      }
-      return normalizeRedWaveDirections([...previous, code]);
-    });
-  };
-
   return (
     <div className="strategy-form-page">
       <form className="strategy-form" onSubmit={handleSubmit}>
@@ -192,14 +483,20 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
         </div>
 
         {formError && <div role="alert" className="form-error">{formError}</div>}
+        {resetNotice && <div role="status" className="form-hint form-hint-warn">{resetNotice}</div>}
+        {showDw3MultiWarning && (
+          <div role="status" className="form-warning">
+            {DW3_MULTI_WARNING}
+          </div>
+        )}
 
         {!isEdit && (
           <div className="form-field">
-            <label htmlFor="sf-account" className="form-label">博彩账号</label>
+            <label htmlFor="sf-account" className="form-label">{LABEL_ACCOUNT}</label>
             {accountsLoading ? (
-              <div className="form-hint">加载账号中...</div>
+              <div className="form-hint">正在加载账号...</div>
             ) : accounts.length === 0 ? (
-              <div className="form-hint form-hint-warn">请先绑定博彩账号</div>
+              <div className="form-hint form-hint-warn">暂无可用账号</div>
             ) : (
               <select
                 id="sf-account"
@@ -210,7 +507,7 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
               >
                 {accounts.map((a) => (
                   <option key={a.id} value={a.id}>
-                    {a.account_name} ({a.platform_type})
+                    {a.account_name}（{getAccountGameTypeLabel(a)}）
                   </option>
                 ))}
               </select>
@@ -219,18 +516,42 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
         )}
 
         <div className="form-field">
-          <label htmlFor="sf-name" className="form-label">策略名称</label>
+          <label htmlFor="sf-name" className="form-label">{LABEL_NAME}</label>
           <input
             id="sf-name"
             type="text"
             className="form-input"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="例如：红波追双"
+            placeholder="请输入策略名称"
             disabled={submitting}
             autoComplete="off"
           />
         </div>
+
+        {!isEdit && canUseDw3 && (
+          <div className="form-field">
+            <span className="form-label">{DW3_DISPLAY_NAME}模式</span>
+            <div className="type-toggle">
+              <button
+                type="button"
+                className={`type-toggle-btn ${!dw3Mode ? 'type-toggle-active' : ''}`}
+                onClick={() => toggleDw3Mode(false)}
+                disabled={submitting}
+              >
+                普通模式
+              </button>
+              <button
+                type="button"
+                className={`type-toggle-btn ${dw3Mode ? 'type-toggle-active' : ''}`}
+                onClick={() => toggleDw3Mode(true)}
+                disabled={submitting}
+              >
+                {DW3_DISPLAY_NAME}
+              </button>
+            </div>
+          </div>
+        )}
 
         {!isEdit && (
           <div className="form-field">
@@ -252,26 +573,91 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
               >
                 马丁
               </button>
-              <button
-                type="button"
-                className={`type-toggle-btn ${isRedWaveDouble ? 'type-toggle-active' : ''}`}
-                onClick={() => {
-                  setType(RED_WAVE_DOUBLE_TYPE);
-                  setRedWaveDirections((current) => (
-                    current.length > 0 ? current : ['DS4']
-                  ));
-                }}
-                disabled={submitting}
-              >
-                红波追双
-              </button>
+              {!isLuckySb && !dw3Mode && (
+                <button
+                  type="button"
+                  className={`type-toggle-btn ${isRedWaveDouble ? 'type-toggle-active' : ''}`}
+                  onClick={() => {
+                    setType(RED_WAVE_DOUBLE_TYPE);
+                    setRedWaveDirections((current) => (current.length > 0 ? current : ['DS4']));
+                  }}
+                  disabled={submitting}
+                >
+                  {BUTTON_RED_WAVE}
+                </button>
+              )}
             </div>
           </div>
         )}
 
-        {isRedWaveDouble && (
+        {dw3Mode && (
+          <>
+            <div className="form-field">
+              <span className="form-label">{DW3_DISPLAY_NAME}组合</span>
+              <div className="type-toggle">
+                {dw3Tabs.map((tab) => (
+                  <button
+                    key={tab.key}
+                    type="button"
+                    className={`type-toggle-btn ${dw3ActiveTab === tab.key ? 'type-toggle-active' : ''}`}
+                    onClick={() => setDw3ActiveTab(tab.key)}
+                    disabled={submitting}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              <div className="direction-grid">
+                {activeDw3Tab.groups.map((group) => {
+                  const checked = dw3ActiveTab === 'bs'
+                    ? dw3SelectedBs.includes(group.token)
+                    : dw3SelectedOe.includes(group.token);
+                  return (
+                    <label key={group.token} className="direction-option">
+                      <input
+                        type="checkbox"
+                        className="direction-checkbox"
+                        checked={checked}
+                        onChange={() => toggleDw3Group(group.token)}
+                        disabled={submitting}
+                      />
+                      <span className="direction-text">{group.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+              <div className="form-hint">
+                已选大小组合：{dw3SelectedBs.map(getDw3GroupLabel).join('、') || '-'}
+              </div>
+              <div className="form-hint">
+                已选单双组合：{dw3SelectedOe.map(getDw3GroupLabel).join('、') || '-'}
+              </div>
+              <div className="form-hint">
+                理论最大投注额：{dw3TheoreticalMaxStake.toFixed(2)}
+              </div>
+            </div>
+
+            <div className="form-field">
+              <label htmlFor="sf-gate-window-issues" className="form-label">最近期数</label>
+              <input
+                id="sf-gate-window-issues"
+                type="number"
+                className="form-input"
+                inputMode="numeric"
+                value={gateWindowIssues}
+                onChange={(e) => setGateWindowIssues(e.target.value)}
+                min="1"
+                step="1"
+                disabled={submitting}
+              />
+              <div className="form-hint">最近 N 期用于{DW3_DISPLAY_NAME}阀门过滤。</div>
+            </div>
+          </>
+        )}
+
+        {isRedWaveDouble && !dw3Mode && (
           <div className="form-field">
-            <span className="form-label">检测方向</span>
+            <span className="form-label">红波方向</span>
             <div className="direction-grid">
               {RED_WAVE_DIRECTION_OPTIONS.map((option) => {
                 const checked = redWaveDirections.includes(option.code);
@@ -289,11 +675,22 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
                 );
               })}
             </div>
-            <div className="form-hint">至少选择一个方向，默认和值。</div>
           </div>
         )}
 
-        {!isEdit && !isRedWaveDouble && (
+        {!isEdit && isLuckySb && !dw3Mode && (
+          <div className="form-field">
+            <label className="form-label">极速飞艇玩法</label>
+            <PlayCodeSelect
+              value={luckySbPlayCode}
+              onChange={setLuckySbPlayCode}
+              disabled={submitting}
+              platformType={LUCKYSB_PLATFORM_TYPE}
+            />
+          </div>
+        )}
+
+        {!isEdit && !isLuckySb && !isRedWaveDouble && !dw3Mode && (
           <div className="form-field">
             <label className="form-label">玩法</label>
             <PlayCodeMultiSelect
@@ -305,21 +702,24 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
         )}
 
         <div className="form-field">
-          <label htmlFor="sf-platform" className="form-label">盘口类型</label>
+          <label htmlFor="sf-platform" className="form-label">{LABEL_PLATFORM}</label>
           <select
             id="sf-platform"
             className="form-select"
             value={platformType}
-            onChange={(e) => setPlatformType(e.target.value)}
-            disabled={submitting}
+            onChange={(e) => applyPlatformChange(e.target.value)}
+            disabled={submitting || effectivePlatformTypes.length <= 1}
           >
-            <option value="JND28WEB">JND28WEB</option>
-            <option value="JND282">JND282</option>
+            {effectivePlatformTypes.map((item) => (
+              <option key={item} value={item}>
+                {getPlatformLabel(item)}
+              </option>
+            ))}
           </select>
         </div>
 
         <div className="form-field">
-          <label htmlFor="sf-amount" className="form-label">基础金额（元）</label>
+          <label htmlFor="sf-amount" className="form-label">{LABEL_AMOUNT}</label>
           <input
             id="sf-amount"
             type="number"
@@ -327,8 +727,8 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
             inputMode="decimal"
             value={baseAmount}
             onChange={(e) => setBaseAmount(e.target.value)}
-            placeholder="例如：10"
-            min="0.01"
+            placeholder="1"
+            min="1"
             step="0.01"
             disabled={submitting}
           />
@@ -336,18 +736,17 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
 
         {isMartinLike(type) && (
           <div className="form-field">
-            <label htmlFor="sf-martin" className="form-label">马丁倍率序列</label>
+            <label htmlFor="sf-martin" className="form-label">马丁序列</label>
             <input
               id="sf-martin"
               type="text"
               className="form-input"
               value={martinSequence}
               onChange={(e) => setMartinSequence(e.target.value)}
-              placeholder="逗号分隔，例如：1,2,4,8,16"
+              placeholder="1,2,4,8,16"
               disabled={submitting}
               autoComplete="off"
             />
-            <div className="form-hint">实际金额 = 基础金额 × 当前倍率</div>
           </div>
         )}
 
@@ -364,7 +763,6 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
             max="180"
             disabled={submitting}
           />
-          <div className="form-hint">开盘后多少秒下注（5-180）</div>
         </div>
 
         <div className="form-field">
@@ -381,11 +779,10 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
               <span className="sim-switch-knob" />
             </button>
           </div>
-          <div className="form-hint">模拟模式不实际下注，仅记录虚拟注单</div>
         </div>
 
         <div className="form-field">
-          <label htmlFor="sf-stoploss" className="form-label">止损线（元，可选）</label>
+          <label htmlFor="sf-stoploss" className="form-label">止损金额</label>
           <input
             id="sf-stoploss"
             type="number"
@@ -393,7 +790,7 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
             inputMode="decimal"
             value={stopLoss}
             onChange={(e) => setStopLoss(e.target.value)}
-            placeholder="留空表示不设置"
+            placeholder="选填"
             min="0.01"
             step="0.01"
             disabled={submitting}
@@ -401,7 +798,7 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
         </div>
 
         <div className="form-field">
-          <label htmlFor="sf-takeprofit" className="form-label">止盈线（元，可选）</label>
+          <label htmlFor="sf-takeprofit" className="form-label">止盈金额</label>
           <input
             id="sf-takeprofit"
             type="number"
@@ -409,7 +806,7 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
             inputMode="decimal"
             value={takeProfit}
             onChange={(e) => setTakeProfit(e.target.value)}
-            placeholder="留空表示不设置"
+            placeholder="选填"
             min="0.01"
             step="0.01"
             disabled={submitting}
@@ -421,7 +818,7 @@ export default function StrategyForm({ strategy, onDone, onCancel }: StrategyFor
             取消
           </button>
           <button type="submit" className="form-submit-btn" disabled={submitting || (accounts.length === 0 && !isEdit)}>
-            {submitting ? '提交中...' : isEdit ? '保存' : '创建'}
+            {submitting ? '提交中...' : isEdit ? '更新' : BUTTON_CREATE}
           </button>
         </div>
       </form>

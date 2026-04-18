@@ -34,10 +34,24 @@ from app.models.db_ops import (
     strategy_update,
 )
 
+PLATFORM_TYPE = "JND28WEB"
+
 
 # 
 # Fixtures
 # 
+
+
+class TestBetResultClassification:
+    def test_odds_changed_is_retryable(self):
+        result = BetResult(succeed=5, message="赔率已经改变，是否继续投注？", raw_response={})
+        assert result.error_code == "ODDS_CHANGED"
+        assert result.is_retryable is True
+
+    def test_unknown_error_is_not_retryable(self):
+        result = BetResult(succeed=10, message="参数不正确", raw_response={})
+        assert result.error_code == "UNKNOWN"
+        assert result.is_retryable is False
 
 @pytest.fixture
 async def db():
@@ -86,6 +100,7 @@ async def setup_data(db):
     # 写入已确认赔率到 account_odds 表
     await odds_batch_upsert(
         db, account_id=acct["id"],
+        platform_type=PLATFORM_TYPE,
         odds_map={"DX1": 19800, "DX2": 19800, "DS3": 19800, "DS4": 19800,
                   "ZH7": 42930, "ZH8": 47250},
         confirmed=True,
@@ -129,6 +144,7 @@ async def executor(db, mock_adapter, mock_risk, alert_service, setup_data):
         alert_service=alert_service,
         operator_id=setup_data["operator"]["id"],
         account_id=setup_data["account"]["id"],
+        platform_type=PLATFORM_TYPE,
     )
 
 
@@ -190,6 +206,7 @@ class TestBetExecutorSkeleton:
         )
         assert s.martin_level == 0
         assert s.simulation is False
+        assert s.metadata == {}
 
     def test_executor_init(self, executor, setup_data):
         """BetExecutor """
@@ -377,6 +394,7 @@ class TestRedWaveAtomicBalanceGuard:
         await odds_batch_upsert(
             db,
             account_id=setup_data["account"]["id"],
+            platform_type=PLATFORM_TYPE,
             odds_map={"B1LM_S": 19800, "DS4": 19800},
             confirmed=True,
         )
@@ -426,6 +444,7 @@ class TestRedWaveAtomicBalanceGuard:
         await odds_batch_upsert(
             db,
             account_id=setup_data["account"]["id"],
+            platform_type=PLATFORM_TYPE,
             odds_map={"B1LM_S": 19800, "DS4": 19800},
             confirmed=True,
         )
@@ -917,6 +936,62 @@ class TestEmptySignals:
         executor.risk.check.assert_not_called()
 
 
+class TestRequestLogging:
+    @pytest.mark.asyncio
+    async def test_logs_dw3_request_summary(self, executor, setup_data):
+        issue = "20240101001"
+        dw3_metadata = {
+            "strategy_kind": "dw3",
+            "effective_groups": ["DW3_BS_SSS", "DW3_OE_OEO"],
+            "blocked_groups": ["DW3_BS_BBB", "DW3_OE_EEE"],
+            "unique_key_count": 2,
+            "total_amount": 1000,
+            "submit_mode": "single_request_required",
+        }
+        signals = [
+            BetSignal(
+                strategy_id=setup_data["strategy"]["id"],
+                key_code="DW3_001",
+                amount=500,
+                idempotent_id=f"{issue}-dw3-1",
+                metadata=dw3_metadata,
+            ),
+            BetSignal(
+                strategy_id=setup_data["strategy"]["id"],
+                key_code="DW3_002",
+                amount=500,
+                idempotent_id=f"{issue}-dw3-2",
+                metadata=dw3_metadata,
+            ),
+        ]
+
+        await odds_batch_upsert(
+            executor.db,
+            account_id=setup_data["account"]["id"],
+            platform_type=PLATFORM_TYPE,
+            odds_map={"DW3_001": 19800, "DW3_002": 19800},
+            confirmed=True,
+        )
+
+        with patch("app.engine.executor.log_bet") as mock_log_bet:
+            await executor.execute(make_install(issue=issue), signals)
+
+        mock_log_bet.assert_called_once()
+        kwargs = mock_log_bet.call_args.kwargs
+        assert kwargs["operator_id"] == setup_data["operator"]["id"]
+        assert kwargs["account_id"] == setup_data["account"]["id"]
+        assert kwargs["issue"] == issue
+        assert kwargs["key_code"] == "DW3_BATCH"
+        assert kwargs["amount"] == 1000
+        assert kwargs["result"] == "request_submit"
+        assert kwargs["effective_groups"] == ["DW3_BS_SSS", "DW3_OE_OEO"]
+        assert kwargs["blocked_groups"] == ["DW3_BS_BBB", "DW3_OE_EEE"]
+        assert kwargs["unique_key_count"] == 2
+        assert kwargs["dw3_request_item_count"] == 2
+        assert kwargs["request_item_count"] == 2
+        assert kwargs["total_amount"] == 1000
+
+
 # 
 # PBT: hypothesis
 # 
@@ -1004,6 +1079,7 @@ class TestPBT_P12_BetMergeNoSignalLoss:
         # Insert confirmed odds into DB
         await odds_batch_upsert(
             conn, account_id=acct["id"],
+            platform_type=PLATFORM_TYPE,
             odds_map=odds_dict,
             confirmed=True,
         )
@@ -1029,6 +1105,7 @@ class TestPBT_P12_BetMergeNoSignalLoss:
             db=conn, adapter=adapter, risk=risk,
             alert_service=alert_svc,
             operator_id=op["id"], account_id=acct["id"],
+            platform_type=PLATFORM_TYPE,
         )
 
         install = InstallInfo(
@@ -1198,6 +1275,7 @@ class TestPBT_P26_ConfirmbetZeroRetry:
         # Insert confirmed odds into DB
         await odds_batch_upsert(
             conn, account_id=acct["id"],
+            platform_type=PLATFORM_TYPE,
             odds_map={"DX1": 19800, "DX2": 19800, "DS3": 19800, "DS4": 19800},
             confirmed=True,
         )
@@ -1221,6 +1299,7 @@ class TestPBT_P26_ConfirmbetZeroRetry:
             db=conn, adapter=adapter, risk=risk,
             alert_service=alert_svc,
             operator_id=op["id"], account_id=acct["id"],
+            platform_type=PLATFORM_TYPE,
         )
 
         signal = BetSignal(

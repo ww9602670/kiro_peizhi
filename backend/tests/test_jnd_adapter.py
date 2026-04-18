@@ -124,65 +124,32 @@ class TestLogin:
     """ login """
 
     @pytest.mark.asyncio
-    async def test_login_success(self, adapter):
-        """mock  LoginResult"""
+    async def test_login_requires_captcha_without_code(self, adapter):
         mock_session = AsyncMock()
-        mock_resp = AsyncMock()
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=False)
-
-        #  cookie_jar  token
-        mock_cookie = MagicMock()
-        mock_cookie.value = "test_token_123"
-        mock_cookies = {"token": mock_cookie}
-
-        mock_session.get = MagicMock(return_value=mock_resp)
-        mock_session.cookie_jar = MagicMock()
-        mock_session.cookie_jar.filter_cookies = MagicMock(return_value=mock_cookies)
         mock_session.closed = False
-
-        adapter._session = mock_session
-
-        result = await adapter.login("testuser", "testpass")
-
-        assert result.success is True
-        assert result.token == "test_token_123"
-        assert "" in result.message
-
-    @pytest.mark.asyncio
-    async def test_login_no_token(self, adapter):
-        """ token cookie"""
-        mock_session = AsyncMock()
-        mock_resp = AsyncMock()
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session.get = MagicMock(return_value=mock_resp)
-        mock_session.cookie_jar = MagicMock()
-        mock_session.cookie_jar.filter_cookies = MagicMock(return_value={})
-        mock_session.closed = False
-
         adapter._session = mock_session
 
         result = await adapter.login("testuser", "testpass")
 
         assert result.success is False
-        assert "token" in result.message.lower()
+        assert result.captcha_required is True
+        assert "captcha" in result.message.lower()
+        assert not hasattr(mock_session, "get") or not mock_session.get.called
+        assert not hasattr(mock_session, "post") or not mock_session.post.called
 
     @pytest.mark.asyncio
     async def test_login_network_error(self, adapter):
-        """"""
+        """AjaxLogin network error should fail cleanly."""
         import aiohttp
 
         mock_session = AsyncMock()
-        mock_session.get = MagicMock(
+        mock_session.post = MagicMock(
             side_effect=aiohttp.ClientError("Connection refused")
         )
         mock_session.closed = False
-
         adapter._session = mock_session
 
-        result = await adapter.login("testuser", "testpass")
+        result = await adapter.login("testuser", "testpass", captcha_code="1234")
 
         assert result.success is False
         assert result.token is None
@@ -190,10 +157,6 @@ class TestLogin:
     @pytest.mark.asyncio
     async def test_login_ajax_success_with_captcha_code(self, adapter):
         mock_session = AsyncMock()
-        mock_visitor_resp = AsyncMock()
-        mock_visitor_resp.__aenter__ = AsyncMock(return_value=mock_visitor_resp)
-        mock_visitor_resp.__aexit__ = AsyncMock(return_value=False)
-
         mock_ajax_resp = AsyncMock()
         mock_ajax_resp.__aenter__ = AsyncMock(return_value=mock_ajax_resp)
         mock_ajax_resp.__aexit__ = AsyncMock(return_value=False)
@@ -201,12 +164,9 @@ class TestLogin:
 
         mock_cookie = MagicMock()
         mock_cookie.value = "ajax_token_123"
-        mock_session.get = MagicMock(return_value=mock_visitor_resp)
         mock_session.post = MagicMock(return_value=mock_ajax_resp)
         mock_session.cookie_jar = MagicMock()
-        mock_session.cookie_jar.filter_cookies = MagicMock(
-            side_effect=[{}, {"token": mock_cookie}]
-        )
+        mock_session.cookie_jar.filter_cookies = MagicMock(return_value={"token": mock_cookie})
         mock_session.closed = False
         adapter._session = mock_session
 
@@ -219,10 +179,6 @@ class TestLogin:
     @pytest.mark.asyncio
     async def test_login_ajax_captcha_required(self, adapter):
         mock_session = AsyncMock()
-        mock_visitor_resp = AsyncMock()
-        mock_visitor_resp.__aenter__ = AsyncMock(return_value=mock_visitor_resp)
-        mock_visitor_resp.__aexit__ = AsyncMock(return_value=False)
-
         mock_ajax_resp = AsyncMock()
         mock_ajax_resp.__aenter__ = AsyncMock(return_value=mock_ajax_resp)
         mock_ajax_resp.__aexit__ = AsyncMock(return_value=False)
@@ -230,7 +186,6 @@ class TestLogin:
             return_value={"State": 5, "Msg": "captcha invalid"}
         )
 
-        mock_session.get = MagicMock(return_value=mock_visitor_resp)
         mock_session.post = MagicMock(return_value=mock_ajax_resp)
         mock_session.cookie_jar = MagicMock()
         mock_session.cookie_jar.filter_cookies = MagicMock(return_value={})

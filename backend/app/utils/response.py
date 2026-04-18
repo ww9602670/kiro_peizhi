@@ -18,10 +18,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 class BizError(Exception):
     """ code + message + HTTP status_code"""
 
-    def __init__(self, code: int, message: str, status_code: int = 400):
+    def __init__(self, code: int, message: str, status_code: int = 400, data=None):
         self.code = code
         self.message = message
         self.status_code = status_code
+        self.data = data
         super().__init__(message)
 
 
@@ -84,7 +85,12 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(BizError)
     async def biz_error_handler(_request: Request, exc: BizError) -> JSONResponse:
-        return _envelope(exc.code, exc.message, status_code=exc.status_code)
+        return _envelope(
+            exc.code,
+            exc.message,
+            data=exc.data,
+            status_code=exc.status_code,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(

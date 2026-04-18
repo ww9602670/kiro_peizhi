@@ -26,6 +26,8 @@ from app.models.db_ops import (
     odds_get_confirmed_map,
     odds_has_records,
 )
+from app.utils.logger import log_bet
+from app.utils.strategy_timing import SAFE_CLOSE_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ class BetExecutor:
         alert_service: AlertService,
         operator_id: int,
         account_id: int,
+        platform_type: str,
     ) -> None:
         self.db = db
         self.adapter = adapter
@@ -55,6 +58,7 @@ class BetExecutor:
         self.alert_service = alert_service
         self.operator_id = operator_id
         self.account_id = account_id
+        self.platform_type = platform_type
 
     async def execute(
         self, install: InstallInfo, signals: list[BetSignal]
@@ -124,10 +128,18 @@ class BetExecutor:
             return report
 
         # 3. 从本地数据库读取已确认赔率（替代原 adapter.load_odds）
-        odds = await odds_get_confirmed_map(self.db, account_id=self.account_id)
+        odds = await odds_get_confirmed_map(
+            self.db,
+            account_id=self.account_id,
+            platform_type=self.platform_type,
+        )
 
         if odds is None:
-            has_records = await odds_has_records(self.db, account_id=self.account_id)
+            has_records = await odds_has_records(
+                self.db,
+                account_id=self.account_id,
+                platform_type=self.platform_type,
+            )
             if not has_records:
                 await self.alert_service.send(
                     operator_id=self.operator_id,
@@ -150,6 +162,7 @@ class BetExecutor:
         betdata: list[dict] = []
         orders_created: list[dict] = []
         simulation_signals: list[BetSignal] = []
+        request_signals: list[BetSignal] = []
 
         for signal in approved:
             signal_odds = odds.get(signal.key_code, 0)
@@ -175,6 +188,7 @@ class BetExecutor:
                     "Amount": signal.amount,
                     "Odds": signal_odds,
                 })
+                request_signals.append(signal)
 
         # 5. ?
         if simulation_signals:
@@ -195,10 +209,66 @@ class BetExecutor:
 
         # 6.  Confirmbet?
         if betdata:
+            self._log_request_summary(install.issue, request_signals, betdata)
             await self._place_and_process(
                 install, betdata, orders_created,
             )
         return report
+
+    def _log_request_summary(
+        self,
+        issue: str,
+        signals: list[BetSignal],
+        betdata: list[dict],
+    ) -> None:
+        dw3_metadata_by_strategy: dict[int, dict] = {}
+        for signal in signals:
+            metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+            if metadata.get("strategy_kind") != "dw3":
+                continue
+            dw3_metadata_by_strategy.setdefault(signal.strategy_id, metadata)
+
+        if not dw3_metadata_by_strategy:
+            return
+
+        dw3_betdata = [
+            bet
+            for bet in betdata
+            if str(bet.get("KeyCode", "")).upper().startswith("DW3_")
+        ]
+        if not dw3_betdata:
+            return
+
+        effective_groups: set[str] = set()
+        blocked_groups: set[str] = set()
+        for metadata in dw3_metadata_by_strategy.values():
+            effective_groups.update(str(item) for item in metadata.get("effective_groups", ()))
+            blocked_groups.update(str(item) for item in metadata.get("blocked_groups", ()))
+
+        unique_key_count = len(
+            {
+                str(bet.get("KeyCode", "")).upper()
+                for bet in dw3_betdata
+                if str(bet.get("KeyCode", "")).strip()
+            }
+        )
+        total_amount = sum(int(bet.get("Amount", 0) or 0) for bet in dw3_betdata)
+
+        log_bet(
+            operator_id=self.operator_id,
+            account_id=self.account_id,
+            issue=issue,
+            key_code="DW3_BATCH",
+            amount=total_amount,
+            result="request_submit",
+            strategy_ids=sorted(dw3_metadata_by_strategy),
+            effective_groups=sorted(effective_groups),
+            blocked_groups=sorted(blocked_groups),
+            unique_key_count=unique_key_count,
+            dw3_request_item_count=len(dw3_betdata),
+            request_item_count=len(betdata),
+            total_amount=total_amount,
+        )
 
     async def _apply_red_wave_atomic_balance_guard(
         self,
@@ -301,6 +371,7 @@ class BetExecutor:
                 status="pending",
                 simulation=1 if signal.simulation else 0,
                 martin_level=signal.martin_level,
+                actual_platform_type=self.platform_type,
             )
             return order
         except Exception as e:
@@ -403,6 +474,9 @@ class BetExecutor:
         self, install: InstallInfo, betdata: list[dict]
     ) -> BetResult | None:
         """从平台实时获取赔率，用新赔率重建 betdata 并重试下注。"""
+        if not await self._retry_window_is_open(install):
+            return None
+
         try:
             live_odds = await self.adapter.load_odds(install.issue)
         except Exception:
@@ -451,6 +525,72 @@ class BetExecutor:
                 install.issue, self.account_id,
             )
             return None
+
+    async def _retry_window_is_open(self, install: InstallInfo) -> bool:
+        """Revalidate issue/state/remaining before retrying odds-changed orders."""
+        fallback_open = (
+            install.state == 1 and install.close_countdown_sec > SAFE_CLOSE_THRESHOLD
+        )
+        try:
+            detail = await self.adapter.get_current_install_detail()
+        except Exception:
+            logger.exception(
+                "retry revalidation failed issue=%s account_id=%d",
+                install.issue,
+                self.account_id,
+            )
+            return fallback_open
+
+        if not isinstance(detail, dict):
+            return fallback_open
+
+        issue = self._detail_text(detail, "installments", "Installments")
+        state = self._detail_int(detail, "state", "State")
+        remaining = self._detail_int(
+            detail,
+            "close_countdown_sec",
+            "CloseCountdownSec",
+            "CloseTimeStamp",
+        )
+        if not issue and state == 0 and remaining == 0:
+            return fallback_open
+
+        is_open = (
+            issue == install.issue
+            and state == 1
+            and remaining > SAFE_CLOSE_THRESHOLD
+        )
+        if not is_open:
+            logger.info(
+                "retry window closed issue=%s current_issue=%s state=%s remaining=%s account_id=%d",
+                install.issue,
+                issue,
+                state,
+                remaining,
+                self.account_id,
+            )
+        return is_open
+
+    @staticmethod
+    def _detail_text(detail: dict, *keys: str) -> str:
+        for key in keys:
+            value = detail.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _detail_int(detail: dict, *keys: str) -> int:
+        text = BetExecutor._detail_text(detail, *keys)
+        if not text:
+            return 0
+        try:
+            return int(float(text))
+        except ValueError:
+            return 0
 
     async def _mark_all_failed(
         self,

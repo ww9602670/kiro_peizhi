@@ -50,3 +50,6 @@ async def _ensure_shared_db(request):
         from app.database import init_db
         await init_db(":memory:")
     yield
+    from app.database import close_shared_db
+
+    await close_shared_db()

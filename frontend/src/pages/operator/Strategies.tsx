@@ -21,6 +21,8 @@ import ConfirmDialog from '@/components/ConfirmDialog';
 import Toast from '@/components/Toast';
 import { useConfirm } from '@/hooks/useConfirm';
 import { useToast } from '@/hooks/useToast';
+import { getPlatformLabel } from '@/utils/platformLabels';
+import { getPlayCodeDisplay } from '@/utils/playCodeDisplay';
 import StrategyForm from './StrategyForm';
 import './Strategies.css';
 
@@ -30,12 +32,23 @@ function getTypeBadge(type: string): { label: string; className: string } {
   return { label: '平注', className: 'type-badge-flat' };
 }
 
-export default function Strategies() {
+interface StrategiesProps {
+  createIntent?: StrategyCreateIntent | null;
+  onCreateIntentConsumed?: () => void;
+}
+
+interface StrategyCreateIntent {
+  accountId: number;
+  nonce: number;
+}
+
+export default function Strategies({ createIntent, onCreateIntentConsumed }: StrategiesProps) {
   const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [editingStrategy, setEditingStrategy] = useState<StrategyInfo | null>(null);
+  const [createAccountId, setCreateAccountId] = useState<number | undefined>(undefined);
   const [actionLoading, setActionLoading] = useState<Record<number, string>>({});
   const { confirmState, confirm, handleConfirm, handleCancel } = useConfirm();
   const { messages, showToast, removeToast } = useToast();
@@ -56,6 +69,14 @@ export default function Strategies() {
   useEffect(() => {
     fetchStrategies();
   }, [fetchStrategies]);
+
+  useEffect(() => {
+    if (!createIntent) return;
+    setEditingStrategy(null);
+    setCreateAccountId(createIntent.accountId);
+    setShowForm(true);
+    onCreateIntentConsumed?.();
+  }, [createIntent, onCreateIntentConsumed]);
 
   const withActionLoading = async (id: number, action: string, fn: () => Promise<void>) => {
     setActionLoading((prev) => ({ ...prev, [id]: action }));
@@ -97,29 +118,35 @@ export default function Strategies() {
 
   const handleEdit = (strategy: StrategyInfo) => {
     setEditingStrategy(strategy);
+    setCreateAccountId(undefined);
     setShowForm(true);
   };
 
   const handleCreate = () => {
     setEditingStrategy(null);
+    setCreateAccountId(undefined);
     setShowForm(true);
   };
 
   const handleFormDone = () => {
     setShowForm(false);
     setEditingStrategy(null);
+    setCreateAccountId(undefined);
     fetchStrategies();
   };
 
   const handleFormCancel = () => {
     setShowForm(false);
     setEditingStrategy(null);
+    setCreateAccountId(undefined);
   };
 
   if (showForm) {
     return (
       <StrategyForm
         strategy={editingStrategy}
+        initialAccountId={createAccountId}
+        existingStrategies={strategies}
         onDone={handleFormDone}
         onCancel={handleFormCancel}
       />
@@ -221,11 +248,11 @@ function StrategyCard({
       <div className="strategy-info">
         <div className="strategy-info-item">
           <span className="strategy-info-label">盘口类型</span>
-          <span className="strategy-info-value">{strategy.platform_type || 'JND28WEB'}</span>
+          <span className="strategy-info-value">{getPlatformLabel(strategy.platform_type)}</span>
         </div>
         <div className="strategy-info-item">
           <span className="strategy-info-label">玩法</span>
-          <span className="strategy-info-value">{strategy.play_code_name || strategy.play_code}</span>
+          <span className="strategy-info-value">{getPlayCodeDisplay(strategy.play_code_name, strategy.play_code)}</span>
         </div>
         <div className="strategy-info-item">
           <span className="strategy-info-label">基础金额</span>

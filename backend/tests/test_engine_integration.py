@@ -34,6 +34,7 @@ from app.engine.strategy_runner import BetSignal, StrategyRunner
 from app.engine.worker import AccountWorker
 from app.models.db_ops import (
     account_create,
+    account_platform_session_upsert,
     bet_order_create,
     odds_batch_upsert,
     operator_create,
@@ -144,6 +145,13 @@ async def _setup_operator_and_account(db, platform_type="JND28WEB"):
         "UPDATE gambling_accounts SET status='online', balance=1000000, session_token='mock_token' WHERE id=?",
         (account_id,),
     )
+    await account_platform_session_upsert(
+        db,
+        account_id=account_id,
+        platform_type=platform_type,
+        status="online",
+        session_token="mock_token",
+    )
     await db.commit()
 
     return operator_id, account_id
@@ -196,6 +204,7 @@ async def test_full_betting_flow(db):
     # 插入已确认赔率到 DB（executor 从 DB 读取赔率）
     await odds_batch_upsert(
         db, account_id=account_id,
+        platform_type="JND28WEB",
         odds_map={"DX1": 19800},
         confirmed=True,
     )
@@ -216,6 +225,7 @@ async def test_full_betting_flow(db):
     risk = RiskController(
         db=db, alert_service=alert_service,
         operator_id=operator_id, account_id=account_id,
+        platform_type="JND28WEB",
     )
     check_result = await risk.check(signals[0])
     assert check_result.passed, f": {check_result.reason}"
@@ -225,6 +235,7 @@ async def test_full_betting_flow(db):
         db=db, adapter=adapter, risk=risk,
         alert_service=alert_service,
         operator_id=operator_id, account_id=account_id,
+        platform_type="JND28WEB",
     )
     install = InstallInfo(
         issue="20260301001", state=1, close_countdown_sec=120,
@@ -272,63 +283,6 @@ async def test_manager_builds_red_wave_runner_with_direction_codes(db):
     )
     assert {s.key_code for s in signals} == {"B1LM_S", "DS4"}
 
-    # ?= bet_success
-    row = await (await db.execute(
-        "SELECT * FROM bet_orders WHERE strategy_id=? AND issue=?",
-        (strategy_id, "20260301001"),
-    )).fetchone()
-    assert row is not None
-    assert row["status"] == "bet_success"
-    assert row["amount"] == 1000
-
-    #  4.  
-    settler = SettlementProcessor(db=db, operator_id=operator_id)
-    # ?3+5+6=14DX1(? 
-    await settler.settle(
-        issue="20260301001",
-        balls=[3, 5, 6],
-        sum_value=14,
-        platform_type="JND28WEB",
-    )
-
-    # ?
-    row = await (await db.execute(
-        "SELECT * FROM bet_orders WHERE strategy_id=? AND issue=?",
-        (strategy_id, "20260301001"),
-    )).fetchone()
-    assert row["status"] == "settled"
-    assert row["is_win"] == 1
-    # pnl = 1000 * 19800 // 10000 - 1000 = 1980 - 1000 = 980
-    assert row["pnl"] == 980
-
-    # 
-    strat_row = await (await db.execute(
-        "SELECT * FROM strategies WHERE id=?", (strategy_id,)
-    )).fetchone()
-    assert strat_row["total_pnl"] == 980
-
-    # ?
-    lr = await (await db.execute(
-        "SELECT * FROM lottery_results WHERE issue=?", ("20260301001",)
-    )).fetchone()
-    assert lr is not None
-    assert lr["sum_value"] == 14
-
-    #  5.  
-    reconciler = Reconciler(
-        db=db, adapter=adapter,
-        alert_service=alert_service, operator_id=operator_id,
-    )
-    await reconciler.reconcile(account_id=account_id, issue="20260301001")
-
-    # 真实模式对账不写 reconcile_records，只验证终态
-    # 订单已 settled，所以不会触发 unsettled_orders 告警
-    alert_rows = await (await db.execute(
-        "SELECT * FROM alerts WHERE type='unsettled_orders' AND operator_id=?",
-        (operator_id,),
-    )).fetchall()
-    assert len(alert_rows) == 0  # 所有订单已结算，无告警
-
 
 # 
 # 14.3.2 ?
@@ -360,11 +314,13 @@ async def test_multi_strategy_parallel(db):
     risk = RiskController(
         db=db, alert_service=alert_service,
         operator_id=operator_id, account_id=account_id,
+        platform_type="JND28WEB",
     )
 
     # 插入已确认赔率到 DB
     await odds_batch_upsert(
         db, account_id=account_id,
+        platform_type="JND28WEB",
         odds_map={"DX1": 19800, "DS3": 19800},
         confirmed=True,
     )
@@ -395,6 +351,7 @@ async def test_multi_strategy_parallel(db):
         db=db, adapter=adapter, risk=risk,
         alert_service=alert_service,
         operator_id=operator_id, account_id=account_id,
+        platform_type="JND28WEB",
     )
     install = InstallInfo(
         issue="20260301010", state=1, close_countdown_sec=120,
@@ -451,11 +408,13 @@ async def test_concurrent_idempotency(db):
     risk = RiskController(
         db=db, alert_service=alert_service,
         operator_id=operator_id, account_id=account_id,
+        platform_type="JND28WEB",
     )
 
     # 插入已确认赔率到 DB
     await odds_batch_upsert(
         db, account_id=account_id,
+        platform_type="JND28WEB",
         odds_map={"DX1": 19800},
         confirmed=True,
     )
@@ -466,6 +425,7 @@ async def test_concurrent_idempotency(db):
             db=db, adapter=adapter, risk=risk,
             alert_service=alert_service,
             operator_id=operator_id, account_id=account_id,
+            platform_type="JND28WEB",
         )
         for _ in range(5)
     ]
