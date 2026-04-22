@@ -7,7 +7,7 @@
  * - 赔率详情面板（可展开，显示赔率明细）
  */
 
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { isApiError } from '@/api/request';
 import {
   listAccounts,
@@ -27,7 +27,7 @@ import { useToast } from '@/hooks/useToast';
 import { getPlatformLabel } from '@/utils/platformLabels';
 import './Accounts.css';
 
-function getStatusLabel(status: string): string {
+export function getStatusLabel(status: string): string {
   switch (status) {
     case 'online':
       return '在线';
@@ -44,12 +44,27 @@ function getStatusLabel(status: string): string {
 
 const ACCOUNT_GAME_OPTIONS: { value: AccountGameType; label: string }[] = [
   { value: 'JND28', label: '加拿大28' },
-  { value: 'LUCKYSB', label: getPlatformLabel('LUCKYSB') },
+  { value: 'LUCKYSB', label: '极速飞艇' },
 ];
+
+const MANUAL_RELOGIN_MESSAGE = '需要人工处理：请前往账号页重新登录后再试。';
+const MANUAL_CONFIRM_ODDS_MESSAGE = '需要人工处理：请先确认赔率后再继续。';
+const TOAST_MERGE_WINDOW_MS = 1500;
+const RELOGIN_HINTS = ['session', 'worker', 'login', 'relogin', 'auth', 'expired', '未登录', '重新登录', '登录失效', '验证'];
+const ODDS_HINTS = ['odds', '赔率', '未确认', 'unconfirmed', 'confirm'];
+
+function normalizeOperatorMessage(rawMessage: string | null | undefined, fallback: string): string {
+  const text = typeof rawMessage === 'string' ? rawMessage.trim() : '';
+  if (!text) return fallback;
+  const lowerText = text.toLowerCase();
+  if (ODDS_HINTS.some((hint) => lowerText.includes(hint))) return MANUAL_CONFIRM_ODDS_MESSAGE;
+  if (RELOGIN_HINTS.some((hint) => lowerText.includes(hint))) return MANUAL_RELOGIN_MESSAGE;
+  return text;
+}
 
 function getGameTypeLabel(gameType: string): string {
   if (gameType === 'JND28') return '加拿大28';
-  if (gameType === 'LUCKYSB') return getPlatformLabel('LUCKYSB');
+  if (gameType === 'LUCKYSB') return '极速飞艇';
   return gameType;
 }
 
@@ -92,6 +107,16 @@ function resolveVerifiedPlatformOptions(
 }
 
 function resolveSummaryState(account: AccountInfo): AccountSummaryState {
+  switch (account.frontend_signal) {
+    case 'processing':
+      return 'verifying';
+    case 'need_relogin':
+      return 'failed';
+    case 'need_confirm_odds':
+      return 'partially_available';
+    default:
+      break;
+  }
   if (account.verification_in_progress) return 'verifying';
   if (account.verification_stale) return 'stale';
 
@@ -148,23 +173,32 @@ function getSummaryLabel(summaryState: AccountSummaryState): string {
   }
 }
 
-function getSummaryStatusReasonLabel(
-  reason: AccountInfo['summary_status_reason'],
-  verificationStale: boolean | undefined
+function getOperatorSummaryStatusReasonLabel(
+  account: Pick<AccountInfo, 'frontend_signal' | 'summary_status_reason' | 'verification_stale'>
 ): string | null {
-  if (verificationStale) return '验证结果已失效，请重新验证';
+  switch (account.frontend_signal) {
+    case 'processing':
+      return '系统正在处理，请稍候。';
+    case 'need_relogin':
+      return MANUAL_RELOGIN_MESSAGE;
+    case 'need_confirm_odds':
+      return MANUAL_CONFIRM_ODDS_MESSAGE;
+    default:
+      break;
+  }
 
-  switch (reason) {
+  if (account.verification_stale) return MANUAL_RELOGIN_MESSAGE;
+  switch (account.summary_status_reason) {
     case 'not_verified':
-      return '尚未完成验证';
+      return '需要人工处理：请先在账号页完成登录验证。';
     case 'probe_partial_failure':
-      return '部分平台探测失败';
+      return '需要人工处理：请先核对账号状态并确认赔率。';
     case 'unsupported_only':
-      return '平台不支持';
+      return '需要人工处理：当前账号暂不支持自动操作，请更换账号。';
     case 'probe_failed_only':
-      return '平台探测异常';
+      return MANUAL_RELOGIN_MESSAGE;
     case 'unsupported_with_probe_failed':
-      return '平台不支持且存在探测异常';
+      return '需要人工处理：请先去账号页重新登录并确认赔率。';
     default:
       return null;
   }
@@ -194,6 +228,21 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
   // Dialog & Toast hooks
   const { confirmState, confirm, handleConfirm, handleCancel } = useConfirm();
   const { messages, showToast, removeToast } = useToast();
+  const actionLockRef = useRef<Record<number, string>>({});
+  const deleteConfirmLockRef = useRef<Set<number>>(new Set());
+  const recentToastRef = useRef<Map<string, number>>(new Map());
+
+  const showMergedToast = useCallback(
+    (rawMessage: string | null | undefined, fallback: string) => {
+      const message = normalizeOperatorMessage(rawMessage, fallback);
+      const now = Date.now();
+      const lastShownAt = recentToastRef.current.get(message) ?? 0;
+      if (now - lastShownAt < TOAST_MERGE_WINDOW_MS) return;
+      recentToastRef.current.set(message, now);
+      showToast(message);
+    },
+    [showToast]
+  );
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -214,6 +263,28 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
   useEffect(() => {
     fetchAccounts();
   }, [fetchAccounts]);
+
+  const runAccountAction = useCallback(
+    async (id: number, action: string, task: () => Promise<void>, fallbackError: string) => {
+      if (actionLockRef.current[id]) return;
+      actionLockRef.current[id] = action;
+      setActionLoading((prev) => ({ ...prev, [id]: action }));
+      try {
+        await task();
+        await fetchAccounts();
+      } catch (err) {
+        showMergedToast(isApiError(err) ? err.message : '', fallbackError);
+      } finally {
+        delete actionLockRef.current[id];
+        setActionLoading((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+      }
+    },
+    [fetchAccounts, showMergedToast]
+  );
 
   const handleBind = async (e: FormEvent) => {
     e.preventDefault();
@@ -256,71 +327,30 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
     }
   };
 
-  const handleVerify = async (id: number) => {
-    setActionLoading((prev) => ({ ...prev, [id]: 'verify' }));
+  const handleVerifySafe = (id: number) =>
+    runAccountAction(id, 'verify', () => verifyAccount(id).then(() => {}), '验证失败，请稍后重试。');
+
+  const handleLogoutSafe = (id: number) =>
+    runAccountAction(id, 'logout', () => logoutAccount(id).then(() => {}), '退出失败，请稍后重试。');
+
+  const handleDeleteSafe = async (id: number, name: string) => {
+    if (actionLockRef.current[id] || deleteConfirmLockRef.current.has(id)) return;
+    deleteConfirmLockRef.current.add(id);
     try {
-      await verifyAccount(id);
-      await fetchAccounts();
-    } catch (err) {
-      showToast(isApiError(err) ? err.message : '验证失败');
+      if (!(await confirm(`确定解绑账号「${name}」吗？`))) return;
+      await runAccountAction(id, 'delete', () => deleteAccount(id).then(() => {}), '解绑失败，请稍后重试。');
     } finally {
-      setActionLoading((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
+      deleteConfirmLockRef.current.delete(id);
     }
   };
 
-  const handleLogout = async (id: number) => {
-    setActionLoading((prev) => ({ ...prev, [id]: 'logout' }));
-    try {
-      await logoutAccount(id);
-      await fetchAccounts();
-      showToast('已退出登录');
-    } catch (err) {
-      showToast(isApiError(err) ? err.message : '退出失败');
-    } finally {
-      setActionLoading((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-    }
-  };
-
-  const handleDelete = async (id: number, name: string) => {
-    if (!(await confirm(`确定解绑账号「${name}」？`))) return;
-    setActionLoading((prev) => ({ ...prev, [id]: 'delete' }));
-    try {
-      await deleteAccount(id);
-      await fetchAccounts();
-    } catch (err) {
-      showToast(isApiError(err) ? err.message : '解绑失败');
-    } finally {
-      setActionLoading((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-    }
-  };
-
-  const handleKillSwitch = async (id: number, currentEnabled: boolean) => {
-    setActionLoading((prev) => ({ ...prev, [id]: 'kill' }));
-    try {
-      await updateKillSwitch(id, { enabled: !currentEnabled });
-      await fetchAccounts();
-    } catch (err) {
-      showToast(isApiError(err) ? err.message : '操作失败');
-    } finally {
-      setActionLoading((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-    }
-  };
+  const handleKillSwitchSafe = (id: number, currentEnabled: boolean) =>
+    runAccountAction(
+      id,
+      'kill',
+      () => updateKillSwitch(id, { enabled: !currentEnabled }).then(() => {}),
+      '操作失败，请稍后重试。'
+    );
 
   return (
     <div className="accounts-page">
@@ -333,7 +363,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
         onCancel={handleCancel}
       />
       <div className="accounts-header">
-        <h1 className="accounts-title">博彩账号</h1>
+        <h1 className="accounts-title">账号管理</h1>
       </div>
 
       {/* Bind Form */}
@@ -348,7 +378,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
           </button>
         ) : (
           <form className="bind-form" onSubmit={handleBind}>
-            <h2 className="bind-form-title">绑定博彩账号</h2>
+            <h2 className="bind-form-title">绑定账号</h2>
 
             {formError && (
               <div role="alert" className="bind-error">
@@ -358,7 +388,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
 
             <div className="bind-field">
               <label htmlFor="bind-name" className="bind-label">
-                账号名
+                账号
               </label>
               <input
                 id="bind-name"
@@ -366,7 +396,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
                 className="bind-input"
                 value={formName}
                 onChange={(e) => setFormName(e.target.value)}
-                placeholder="请输入博彩账号"
+                placeholder="请输入账号"
                 disabled={formLoading}
                 autoComplete="off"
               />
@@ -472,12 +502,12 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
               key={account.id}
               account={account}
               actionLoading={actionLoading[account.id]}
-              onVerify={handleVerify}
-              onLogout={handleLogout}
-              onDelete={handleDelete}
-              onKillSwitch={handleKillSwitch}
+              onVerify={handleVerifySafe}
+              onLogout={handleLogoutSafe}
+              onDelete={handleDeleteSafe}
+              onKillSwitch={handleKillSwitchSafe}
               onCreateStrategy={onCreateStrategy}
-              showToast={showToast}
+              showToast={(text) => showMergedToast(text, text)}
             />
           ))}
         </div>
@@ -537,7 +567,10 @@ function resolveAccountOddsSyncStatus(account: AccountInfo): AccountOddsSyncStat
     typeof account.odds_count === 'number' && Number.isFinite(account.odds_count)
       ? Math.max(0, Math.trunc(account.odds_count))
       : null;
-  const message = typeof account.odds_message === 'string' ? account.odds_message.trim() : '';
+  const message = normalizeOperatorMessage(
+    typeof account.odds_message === 'string' ? account.odds_message.trim() : '',
+    ''
+  );
 
   if (synced === null && oddsCount === null && !message) {
     return null;
@@ -578,11 +611,13 @@ function resolveOddsRefreshResult(data: OddsRefreshResponse | undefined): {
     (typeof data.message === 'string' && data.message.trim()) ||
     '赔率刷新完成';
 
+  const normalizedMessage = normalizeOperatorMessage(message, '赔率刷新完成');
+
   return {
     period: data.period ?? null,
     oddsCount,
     synced,
-    message,
+    message: normalizedMessage,
   };
 }
 
@@ -644,17 +679,28 @@ function AccountCard({
   const useStructuredOddsStatus = oddsPlatformOptions.length === 1;
   const displayOddsStatus = (useStructuredOddsStatus ? structuredOddsSync?.status : null) ?? oddsStatus;
   const displayOddsLabel = (useStructuredOddsStatus ? structuredOddsSync?.label : null) ?? getOddsLabel(oddsStatus);
+  const displayOddsMessage = structuredOddsSync?.message?.trim() ?? '';
   const accountGameType = resolveAccountGameTypeNoFallback(account);
+  const accountGameTypeLabel = getGameTypeLabel(accountGameType) || '--';
   const summaryState = resolveSummaryState(account);
-  const summaryReason = getSummaryStatusReasonLabel(account.summary_status_reason, account.verification_stale);
+  const summaryReason = getOperatorSummaryStatusReasonLabel(account);
   const hasEffectiveVerification =
     typeof account.effective_verification_run_id === 'number' && account.effective_verification_run_id > 0;
-  const platformBadgeText =
-    oddsPlatformOptions.length > 0 ? oddsPlatformOptions.map((item) => getPlatformLabel(item)).join(' / ') : '未验证平台';
-  const canRunOddsPanel = account.status === 'online' && selectedOddsPlatform.length > 0;
-  const verifyButtonLabel = hasEffectiveVerification ? '重新验证账号' : '验证账号';
+  const canRunOddsPanel =
+    account.status === 'online' &&
+    selectedOddsPlatform.length > 0 &&
+    account.frontend_signal !== 'need_relogin';
+  const verifyButtonLabel =
+    account.frontend_signal === 'need_relogin'
+      ? '重新登录账号'
+      : hasEffectiveVerification
+        ? '重新验证账号'
+        : '验证账号';
   const isVerifying = account.verification_in_progress || actionLoading === 'verify';
-  const canCreateStrategy = oddsPlatformOptions.length > 0;
+  const canCreateStrategy =
+    oddsPlatformOptions.length > 0 &&
+    account.frontend_signal !== 'need_relogin' &&
+    account.frontend_signal !== 'need_confirm_odds';
 
   useEffect(() => {
     setSelectedOddsPlatform((current) =>
@@ -693,20 +739,20 @@ function AccountCard({
     fetchOddsStatus();
   }, [fetchOddsStatus]);
 
-  const handleConfirmOdds = async () => {
+  const handleConfirmOddsSafe = async () => {
     setOddsLoading(true);
     try {
       await confirmAccountOdds(account.id, selectedOddsPlatform);
       await fetchOddsStatus();
       setRefreshMsg({ text: `${selectedPlatformLabel}赔率已确认`, type: 'success' });
     } catch (err) {
-      showToast(isApiError(err) ? err.message : '确认赔率失败');
+      showToast(isApiError(err) ? err.message : '确认赔率失败，请稍后重试。');
     } finally {
       setOddsLoading(false);
     }
   };
 
-  const handleRefreshOdds = async () => {
+  const handleRefreshOddsSafe = async () => {
     setRefreshLoading(true);
     setRefreshMsg(null);
     try {
@@ -726,7 +772,7 @@ function AccountCard({
       }
     } catch (err) {
       if (isApiError(err)) {
-        setRefreshMsg({ text: err.message, type: 'error' });
+        setRefreshMsg({ text: normalizeOperatorMessage(err.message, '赔率刷新失败'), type: 'error' });
       } else {
         setRefreshMsg({ text: '赔率刷新失败', type: 'error' });
       }
@@ -742,7 +788,7 @@ function AccountCard({
       <div className="account-card-header">
         <h3 className="account-name">{account.account_name}</h3>
         <div className="account-badges">
-          <span className="badge badge-platform">{platformBadgeText}</span>
+          <span className="badge badge-game-type">{accountGameTypeLabel}</span>
           <span className={`badge ${getSummaryBadgeClass(summaryState)}`}>
             {getSummaryLabel(summaryState)}
           </span>
@@ -774,12 +820,18 @@ function AccountCard({
         )}
         <div className="account-info-item">
           <span className="account-info-label">
-            {oddsPlatformOptions.length > 1 ? `赔率状态（${selectedPlatformLabel}）` : '赔率状态'}
+            赔率状态
           </span>
           <span className={`badge ${getOddsBadgeClass(displayOddsStatus)}`}>
             {displayOddsLabel}
           </span>
         </div>
+        {displayOddsMessage && (
+          <div className="account-info-item">
+            <span className="account-info-label">ç’§æ—‚å·¼æç¤º</span>
+            <span className="account-info-value">{displayOddsMessage}</span>
+          </div>
+        )}
         {summaryReason && (
           <div className="account-info-item">
             <span className="account-info-label">验证说明</span>
@@ -904,7 +956,7 @@ function AccountCard({
                 <button
                   type="button"
                   className="action-btn action-btn-refresh-odds"
-                  onClick={handleRefreshOdds}
+                  onClick={handleRefreshOddsSafe}
                   disabled={refreshLoading || isActioning}
                 >
                   {refreshLoading ? '获取中...' : '刷新赔率'}
@@ -913,7 +965,7 @@ function AccountCard({
                   <button
                     type="button"
                     className="action-btn action-btn-confirm-odds"
-                    onClick={handleConfirmOdds}
+                    onClick={handleConfirmOddsSafe}
                     disabled={oddsLoading || isActioning}
                     style={{ fontSize: 12, padding: '6px 12px', minHeight: 36 }}
                   >

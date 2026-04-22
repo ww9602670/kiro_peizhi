@@ -72,6 +72,28 @@ class OperatorInfo(BaseModel):
     created_at: str
 
 
+class OperatorMeInfo(BaseModel):
+    """"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "username": "operator1",
+                "expire_date": "2026-12-31",
+                "max_accounts": 5,
+                "bound_accounts": 2,
+                "remaining_accounts": 3,
+            }
+        }
+    )
+
+    username: str
+    expire_date: Optional[str] = None
+    max_accounts: int
+    bound_accounts: int
+    remaining_accounts: int
+
+
 class StatusUpdate(BaseModel):
     """/"""
 

@@ -4,30 +4,61 @@
   margin: 0 auto;
 }
 
-.dashboard-title {
-  font-size: 20px;
-  font-weight: 700;
-  margin: 0 0 16px;
+.dashboard-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
 }
 
-/* Countdown section */
+.dashboard-title {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.dashboard-subtitle {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 14px;
+}
+
+.dashboard-primary-btn,
+.section-link-btn,
+.alert-close-btn {
+  border: none;
+  border-radius: 10px;
+  background: #1677ff;
+  color: #fff;
+  padding: 10px 14px;
+  min-height: 40px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.section-link-btn,
+.alert-close-btn {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
 .countdown-section {
   margin-bottom: 24px;
 }
 
-/* Stat cards */
 .stat-cards {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 24px;
 }
 
 .stat-card {
   background: #fff;
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 16px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -35,91 +66,188 @@
 
 .stat-label {
   font-size: 12px;
-  color: #999;
+  color: #64748b;
 }
 
 .stat-value {
   font-size: 22px;
   font-weight: 700;
-  color: #1a1a1a;
+  color: #0f172a;
   font-family: 'SF Mono', 'Menlo', monospace;
 }
 
 .stat-unit {
   font-size: 12px;
-  color: #999;
+  color: #64748b;
 }
 
 .stat-alert {
-  color: #ff4d4f;
+  color: #dc2626;
 }
 
 .pnl-positive {
-  color: #52c41a;
+  color: #16a34a;
 }
 
 .pnl-negative {
-  color: #ff4d4f;
+  color: #dc2626;
 }
 
-/* Sections */
 .dashboard-section {
   margin-bottom: 24px;
+}
+
+.section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 
 .section-title {
   font-size: 16px;
   font-weight: 600;
-  margin: 0 0 12px;
-  color: #1a1a1a;
+  margin: 0;
+  color: #0f172a;
 }
 
-/* Strategy mini cards */
+.section-meta {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.update-list,
+.result-list,
+.alert-list-compact,
 .strategy-list {
+  display: grid;
+  gap: 12px;
+}
+
+.update-card,
+.result-card,
+.alert-card-compact,
+.strategy-card-mini {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+
+.update-date {
+  font-size: 12px;
+  color: #0f766e;
+  margin-bottom: 6px;
+}
+
+.update-title {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.update-items {
+  margin: 0;
+  padding-left: 18px;
+  color: #374151;
+}
+
+.update-item + .update-item {
+  margin-top: 6px;
+}
+
+.result-issue {
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.result-open {
+  margin-top: 8px;
+  font-size: 18px;
+  font-weight: 700;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.result-meta {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.alert-card-compact-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.alert-card-compact-detail,
+.alert-card-compact-time {
+  margin: 8px 0 0;
+  color: #475569;
+  font-size: 13px;
+}
+
+.alert-card-compact-time {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.alert-level-critical {
+  border-color: #fecaca;
+}
+
+.alert-level-warning {
+  border-color: #fde68a;
+}
+
+.alert-level-info {
+  border-color: #bfdbfe;
 }
 
 .strategy-card-mini {
   display: flex;
   align-items: center;
   gap: 12px;
-  background: #fff;
-  border-radius: 8px;
-  padding: 12px 16px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.strategy-account,
+.strategy-platform,
+.strategy-type {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
 .strategy-account {
-  font-size: 12px;
-  color: #1890ff;
-  background: #e6f7ff;
-  padding: 2px 8px;
-  border-radius: 4px;
-  white-space: nowrap;
+  color: #0369a1;
+  background: #e0f2fe;
 }
 
 .strategy-platform {
-  font-size: 12px;
-  color: #722ed1;
-  background: #f9f0ff;
-  padding: 2px 8px;
-  border-radius: 4px;
-  white-space: nowrap;
+  color: #7c3aed;
+  background: #f3e8ff;
+}
+
+.strategy-type {
+  color: #475569;
+  background: #e2e8f0;
 }
 
 .strategy-name {
   font-weight: 500;
-  flex: 1;
 }
 
-.strategy-type {
-  font-size: 12px;
-  color: #999;
-  background: #f5f5f5;
-  padding: 2px 8px;
-  border-radius: 4px;
+.strategy-play,
+.strategy-name {
+  flex: 1;
 }
 
 .strategy-pnl {
@@ -128,12 +256,11 @@
   font-family: 'SF Mono', 'Menlo', monospace;
 }
 
-/* 待结算投注表格 */
 .pending-table-wrap {
   overflow-x: auto;
   background: #fff;
-  border-radius: 8px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+  border-radius: 12px;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
 }
 
 .pending-table {
@@ -144,29 +271,29 @@
 }
 
 .pending-table th {
-  background: #fafafa;
+  background: #f8fafc;
   padding: 8px 10px;
   text-align: left;
   font-weight: 500;
-  color: #666;
-  border-bottom: 1px solid #f0f0f0;
+  color: #475569;
+  border-bottom: 1px solid #e2e8f0;
 }
 
 .pending-table td {
   padding: 7px 10px;
-  border-bottom: 1px solid #f5f5f5;
-  color: #333;
+  border-bottom: 1px solid #f1f5f9;
+  color: #334155;
 }
 
-.pending-table .td-bet-content {
+.td-bet-content {
   max-width: 80px;
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: default;
 }
 
-.pending-table .td-time {
-  color: #999;
+.td-time {
+  color: #64748b;
   font-size: 12px;
 }
 
@@ -175,16 +302,192 @@
 .empty-text {
   text-align: center;
   padding: 40px 0;
-  color: #999;
+  color: #64748b;
   font-size: 14px;
 }
 
 .error-text {
-  color: #ff4d4f;
+  color: #dc2626;
+}
+
+.updates-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 1100;
+}
+
+.updates-modal {
+  width: min(720px, 100%);
+  max-height: 80vh;
+  background: #f8fafc;
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.updates-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px;
+  background: #fff;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.updates-modal-body {
+  padding: 16px;
+  overflow-y: auto;
+  display: grid;
+  gap: 12px;
 }
 
 @media (min-width: 768px) {
   .stat-cards {
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
+}
+
+@media (max-width: 767px) {
+  .dashboard-hero,
+  .section-title-row,
+  .result-meta,
+  .alert-card-compact-header,
+  .strategy-card-mini {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .dashboard-primary-btn,
+  .section-link-btn,
+  .alert-close-btn {
+    width: 100%;
+  }
+}
+
+/* 平台更新关闭按钮 */
+.update-card {
+  position: relative;
+}
+
+.update-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(15, 23, 42, 0.06);
+  color: #475569;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.update-close:hover,
+.update-close:focus-visible {
+  background: rgba(15, 23, 42, 0.12);
+  color: #0f172a;
+}
+
+/* 折叠区标题按钮 */
+.section-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: none;
+  background: #f8fafc;
+  border-radius: 12px;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.section-toggle:hover,
+.section-toggle:focus-visible {
+  background: #eef2f7;
+}
+
+.section-toggle .section-title {
+  flex: 1;
+  margin: 0;
+}
+
+.section-toggle-icon {
+  display: inline-flex;
+  width: 18px;
+  justify-content: center;
+  color: #64748b;
+  transition: transform 0.18s ease;
+}
+
+.section-toggle-count {
+  display: inline-flex;
+  min-width: 28px;
+  height: 22px;
+  padding: 0 8px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 11px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.coll-body {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.24s ease;
+}
+
+.coll-body.open {
+  max-height: 4000px;
+}
+
+.coll-body > * {
+  margin-top: 12px;
+}
+
+/* 告警关闭失败 inline 提示 */
+.alert-close-error {
+  color: #dc2626;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* 告警骨架占位（首屏未加载完时） */
+.alert-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.alert-skeleton-row {
+  height: 60px;
+  border-radius: 10px;
+  background: linear-gradient(90deg, #f1f5f9 0%, #e2e8f0 50%, #f1f5f9 100%);
+  background-size: 200% 100%;
+  animation: alert-skeleton-shimmer 1.4s infinite ease-in-out;
+}
+
+@keyframes alert-skeleton-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+/* 关闭按钮 disabled 态 */
+.alert-close-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }

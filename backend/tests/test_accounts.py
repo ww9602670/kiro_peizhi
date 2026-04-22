@@ -145,6 +145,8 @@ async def test_bind_account(client):
     assert data["effective_verification_run_id"] is None
     assert data["verification_stale"] is False
     assert data["summary_status_reason"] == "not_verified"
+    assert data["frontend_signal"] == "normal"
+    assert data["frontend_signal_reason"] is None
     assert data["status"] == "inactive"
     assert data["balance"] == 0.0
     assert data["kill_switch"] is False
@@ -415,6 +417,62 @@ async def test_account_verify(client):
     assert len(body["data"]["platform_capabilities"]) == 2
     assert body["data"]["verification_stale"] is False
     assert body["data"]["summary_status_reason"] is None
+    assert body["data"]["frontend_signal"] == "normal"
+    assert body["data"]["frontend_signal_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_account_logout_invalidates_effective_verification(client):
+    uid = _uid()
+    token, _ = await _create_operator(f"logoutop_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"logout_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND282"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    verify_resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert verify_resp.status_code == 200
+    verified = verify_resp.json()["data"]
+    assert verified["effective_verification_run_id"] is not None
+    assert sorted(verified["allowed_strategy_platform_types"]) == ["JND282", "JND28WEB"]
+
+    logout_resp = await client.post(f"/api/v1/accounts/{account_id}/logout", headers=headers)
+    assert logout_resp.status_code == 200
+    body = logout_resp.json()["data"]
+    assert body["status"] == "inactive"
+    assert body["effective_verification_run_id"] is None
+    assert body["allowed_strategy_platform_types"] == []
+    assert body["summary_status_reason"] == "not_verified"
+    assert body["verification_stale"] is True
+    assert body["frontend_signal"] == "need_relogin"
+    assert body["frontend_signal_reason"] == "manual_logout"
+
+    db = await get_shared_db()
+    runs = await (
+        await db.execute(
+            "SELECT stale, stale_reason FROM account_verification_runs WHERE account_id=? ORDER BY id DESC LIMIT 1",
+            (account_id,),
+        )
+    ).fetchone()
+    assert runs["stale"] == 1
+    assert runs["stale_reason"] == "manual_logout"
+
+    session_count = await (
+        await db.execute(
+            "SELECT COUNT(*) FROM account_platform_sessions WHERE account_id=?",
+            (account_id,),
+        )
+    ).fetchone()
+    assert session_count[0] == 0
 
 
 @pytest.mark.asyncio
@@ -613,6 +671,111 @@ async def test_latest_run_failure_does_not_override_effective(client, monkeypatc
     assert account["latest_verification_run_id"] != effective_run_id
     assert account["latest_verification_run_id"] > effective_run_id
     assert sorted(account["allowed_strategy_platform_types"]) == ["JND282", "JND28WEB"]
+    assert account["frontend_signal"] == "need_relogin"
+    assert account["frontend_signal_reason"] == "verification_login_failed"
+
+
+@pytest.mark.asyncio
+async def test_account_signal_need_confirm_odds_when_unconfirmed_exists(client):
+    uid = _uid()
+    token, _ = await _create_operator(f"oddsop_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"odds_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    verify_resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert verify_resp.status_code == 200
+
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE account_odds SET confirmed=0, confirmed_at=NULL WHERE account_id=?",
+        (account_id,),
+    )
+    await db.commit()
+
+    list_resp = await client.get("/api/v1/accounts", headers=headers)
+    assert list_resp.status_code == 200
+    account = list_resp.json()["data"][0]
+    assert account["frontend_signal"] == "need_confirm_odds"
+    assert account["frontend_signal_reason"] == "odds_unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_account_signal_processing_when_session_reconnecting(client):
+    uid = _uid()
+    token, _ = await _create_operator(f"sessop_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"sess_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute(
+        """INSERT INTO account_platform_sessions
+           (account_id, platform_type, status, created_at, updated_at)
+           VALUES (?, 'JND28WEB', 'reconnecting', datetime('now', '+8 hours'), datetime('now', '+8 hours'))""",
+        (account_id,),
+    )
+    await db.commit()
+
+    list_resp = await client.get("/api/v1/accounts", headers=headers)
+    assert list_resp.status_code == 200
+    account = list_resp.json()["data"][0]
+    assert account["frontend_signal"] == "processing"
+    assert account["frontend_signal_reason"] == "session_reconnecting"
+
+
+@pytest.mark.asyncio
+async def test_account_signal_need_relogin_when_session_login_error(client):
+    uid = _uid()
+    token, _ = await _create_operator(f"relogop_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"relog_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute(
+        """INSERT INTO account_platform_sessions
+           (account_id, platform_type, status, created_at, updated_at)
+           VALUES (?, 'JND28WEB', 'login_error', datetime('now', '+8 hours'), datetime('now', '+8 hours'))""",
+        (account_id,),
+    )
+    await db.commit()
+
+    list_resp = await client.get("/api/v1/accounts", headers=headers)
+    assert list_resp.status_code == 200
+    account = list_resp.json()["data"][0]
+    assert account["frontend_signal"] == "need_relogin"
+    assert account["frontend_signal_reason"] == "session_login_error"
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ import { isApiError } from '@/api/request';
 const TOKEN_KEY = 'token';
 const EXPIRE_KEY = 'expire_at';
 const ROLE_KEY = 'role';
+const OPERATOR_ID_KEY = 'operator_id';
 /** 过期前 30 分钟开始刷新 */
 const REFRESH_WINDOW_MS = 30 * 60 * 1000;
 /** 刷新检查间隔：每 60 秒检查一次 */
@@ -50,6 +51,27 @@ function extractRoleFromToken(token: string): string | null {
   }
 }
 
+function extractSubFromToken(token: string): string | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(decodeBase64Url(parts[1]));
+    return payload.sub ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function getStoredOperatorId(): string | null {
+  const stored = localStorage.getItem(OPERATOR_ID_KEY);
+  if (stored) return stored;
+  const token = getStoredToken();
+  if (!token) return null;
+  const sub = extractSubFromToken(token);
+  if (sub) localStorage.setItem(OPERATOR_ID_KEY, sub);
+  return sub;
+}
+
 function isTokenValid(): boolean {
   const token = getStoredToken();
   const expireAt = getStoredExpireAt();
@@ -69,6 +91,7 @@ function shouldRefresh(): boolean {
 export function useAuth() {
   const [isAuthenticated, setIsAuthenticated] = useState(isTokenValid);
   const [role, setRole] = useState<string | null>(getStoredRole);
+  const [operatorId, setOperatorId] = useState<string | null>(getStoredOperatorId);
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const isRefreshingRef = useRef(false);
 
@@ -81,7 +104,15 @@ export function useAuth() {
     } else {
       localStorage.removeItem(ROLE_KEY);
     }
+    const tokenSub = extractSubFromToken(token);
+    if (tokenSub) {
+      localStorage.setItem(OPERATOR_ID_KEY, tokenSub);
+    } else {
+      localStorage.removeItem(OPERATOR_ID_KEY);
+      console.warn('operatorId not found in token');
+    }
     setRole(tokenRole);
+    setOperatorId(tokenSub);
     setIsAuthenticated(true);
     window.dispatchEvent(new Event('auth-change'));
   }, []);
@@ -90,8 +121,10 @@ export function useAuth() {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(EXPIRE_KEY);
     localStorage.removeItem(ROLE_KEY);
+    localStorage.removeItem(OPERATOR_ID_KEY);
     setIsAuthenticated(false);
     setRole(null);
+    setOperatorId(null);
     window.dispatchEvent(new Event('auth-change'));
   }, []);
 
@@ -146,6 +179,7 @@ export function useAuth() {
       const valid = isTokenValid();
       setIsAuthenticated(valid);
       setRole(getStoredRole());
+      setOperatorId(getStoredOperatorId());
     };
     window.addEventListener('auth-change', handleAuthChange);
     window.addEventListener('storage', handleAuthChange);
@@ -186,6 +220,7 @@ export function useAuth() {
   return {
     isAuthenticated,
     role,
+    operatorId,
     login,
     logout: logoutFn,
     silentRefresh,

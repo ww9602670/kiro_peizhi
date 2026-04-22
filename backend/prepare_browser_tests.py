@@ -120,7 +120,7 @@ async def prepare_environment():
         print("=" * 60)
         print("\n1. 重启后端服务:")
         print("   cd backend")
-        print("   uvicorn app.main:app --host 0.0.0.0 --port 8888")
+        print("   uvicorn app.main:app --host 0.0.0.0 --port 8888 --reload")
         print("\n2. 重启前端服务:")
         print("   cd frontend")
         print("   pnpm dev")

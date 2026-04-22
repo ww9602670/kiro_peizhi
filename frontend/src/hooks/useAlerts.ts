@@ -18,6 +18,7 @@ export function useAlerts() {
   const [alerts, setAlerts] = useState<AlertInfo[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -49,6 +50,7 @@ export function useAlerts() {
       }
     } finally {
       setLoading(false);
+      setInitialized(true);
     }
   }, []);
 
@@ -105,6 +107,7 @@ export function useAlerts() {
     alerts,
     total,
     loading,
+    initialized,
     error,
     fetchAlerts,
     fetchUnreadCount,

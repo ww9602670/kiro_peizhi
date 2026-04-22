@@ -12,6 +12,10 @@
   margin-bottom: 16px;
 }
 
+.strategies-countdown-section {
+  margin-bottom: 16px;
+}
+
 .strategies-title {
   margin: 0;
   font-size: 20px;
@@ -19,17 +23,15 @@
   color: #1a1a1a;
 }
 
+.strategies-subtitle {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 14px;
+}
+
 /* --- Create Button --- */
-.create-section {
-  margin-bottom: 20px;
-}
-
-.strategies-page .countdown-section {
-  margin-bottom: 20px;
-}
-
 .create-btn {
-  width: 100%;
+  width: auto;
   padding: 12px;
   border: 2px dashed #1677ff;
   border-radius: 8px;
@@ -43,6 +45,29 @@
 
 .create-btn:active {
   background: rgba(22, 119, 255, 0.1);
+}
+
+.strategy-workspace-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.workspace-tab {
+  min-height: 44px;
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  background: #fff;
+  color: #475569;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.workspace-tab-active {
+  background: #1677ff;
+  border-color: #1677ff;
+  color: #fff;
 }
 
 /* --- Strategy Cards --- */
@@ -85,6 +110,12 @@
   color: #1a1a1a;
   margin: 0;
   word-break: break-all;
+}
+
+.strategy-mode-line {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 13px;
 }
 
 .strategy-badges {
@@ -215,6 +246,12 @@
   border-color: #ff4d4f;
 }
 
+.action-btn-mode {
+  color: #7c3aed;
+  border-color: #c4b5fd;
+  flex-basis: 100%;
+}
+
 /* Tablet and up */
 @media (min-width: 768px) {
   .strategies-page {
@@ -229,5 +266,20 @@
 
   .strategy-card {
     padding: 20px;
+  }
+
+  .action-btn-mode {
+    flex-basis: auto;
+  }
+}
+
+@media (max-width: 767px) {
+  .strategies-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .create-btn {
+    width: 100%;
   }
 }

@@ -12,22 +12,71 @@ _BJT = timezone(timedelta(hours=8))
 from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_current_operator, get_db_conn
+from app.schemas.account import get_allowed_platform_types
 from app.models.db_ops import (
     account_list_by_operator,
     alert_get_unread_count,
+    alert_list_by_operator,
     bet_order_list_by_operator,
     bet_order_list_pending_by_operator,
+    lottery_result_list_recent,
     strategy_list_by_operator,
 )
+from app.schemas.alert import AlertInfo
 from app.schemas.bet_order import BetOrderInfo, row_to_bet_order_info
 from app.schemas.common import ApiResponse
-from app.schemas.dashboard import OperatorDashboard
+from app.schemas.dashboard import OperatorDashboard, RecentLotteryResult
 from app.schemas.strategy import StrategyInfo
 
 #  strategies 
 from app.api.strategies import _to_strategy_info
 
 router = APIRouter()
+
+DEFAULT_COUNTDOWN_PLATFORM_TYPE = "JND28WEB"
+
+
+def _to_recent_lottery_result(row: dict) -> RecentLotteryResult:
+    return RecentLotteryResult(
+        id=row["id"],
+        issue=row["issue"],
+        open_result=row["open_result"],
+        sum_value=row["sum_value"],
+        open_time=row.get("open_time"),
+        created_at=row["created_at"],
+    )
+
+
+def _resolve_countdown_platform_type(
+    accounts: list[dict],
+    strategies: list[dict],
+    running_strategies: list[StrategyInfo],
+) -> str:
+    for info in running_strategies:
+        platform_type = (getattr(info, "platform_type", None) or "").strip().upper()
+        if platform_type:
+            return platform_type
+
+    for strategy in reversed(strategies):
+        platform_type = str(strategy.get("platform_type") or "").strip().upper()
+        if platform_type:
+            return platform_type
+
+    for account in accounts:
+        if bool(account.get("verification_stale")):
+            continue
+        for platform_type in account.get("allowed_strategy_platform_types") or []:
+            normalized = str(platform_type or "").strip().upper()
+            if normalized:
+                return normalized
+
+    for account in accounts:
+        for platform_type in get_allowed_platform_types(str(account.get("game_type") or "")):
+            normalized = str(platform_type or "").strip().upper()
+            if normalized:
+                return normalized
+
+    return DEFAULT_COUNTDOWN_PLATFORM_TYPE
 
 
 @router.get("/dashboard")
@@ -71,14 +120,30 @@ async def get_dashboard(
 
     # 4. 
     unread_alerts = await alert_get_unread_count(db, operator_id=operator_id)
+    recent_result_rows = await lottery_result_list_recent(db, limit=10)
+    recent_results = [_to_recent_lottery_result(row) for row in recent_result_rows]
+    recent_alert_rows, _ = await alert_list_by_operator(
+        db,
+        operator_id=operator_id,
+        page=1,
+        page_size=10,
+    )
+    recent_alerts = [AlertInfo(**row) for row in recent_alert_rows]
 
     dashboard = OperatorDashboard(
         balance=total_balance,
         daily_pnl=daily_pnl,
         total_pnl=total_pnl,
+        countdown_platform_type=_resolve_countdown_platform_type(
+            accounts=accounts,
+            strategies=strategies,
+            running_strategies=running_strategies,
+        ),
         running_strategies=running_strategies,
         pending_bets=pending_bets,
         unread_alerts=unread_alerts,
+        recent_results=recent_results,
+        recent_alerts=recent_alerts,
     )
     return ApiResponse[OperatorDashboard](data=dashboard)
 

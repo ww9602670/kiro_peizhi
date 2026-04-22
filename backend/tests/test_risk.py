@@ -114,13 +114,14 @@ async def risk(db, setup_data, alert_service):
 
 
 def make_signal(strategy_id: int, amount: int = 1000, key_code: str = "DX1",
-                issue: str = "20240101001") -> BetSignal:
+                issue: str = "20240101001", simulation: bool = False) -> BetSignal:
     """ BetSignal"""
     return BetSignal(
         strategy_id=strategy_id,
         key_code=key_code,
         amount=amount,
         idempotent_id=f"{issue}-{strategy_id}-{key_code}",
+        simulation=simulation,
     )
 
 
@@ -403,6 +404,23 @@ class TestBalance:
             account_id=setup_data["account"]["id"],
         )
         signal = make_signal(setup_data["strategy"]["id"], amount=1000)
+        result = await risk._check_balance(signal)
+        assert result.passed is True
+
+    @pytest.mark.asyncio
+    async def test_simulation_bypasses_insufficient_balance(self, db, setup_data, alert_service):
+        """模拟模式应绕过真实余额不足风控。"""
+        await account_update(
+            db, account_id=setup_data["account"]["id"],
+            operator_id=setup_data["operator"]["id"], balance=0,
+        )
+        risk = RiskController(
+            db=db, alert_service=alert_service,
+            operator_id=setup_data["operator"]["id"],
+            account_id=setup_data["account"]["id"],
+            platform_type=TEST_PLATFORM_TYPE,
+        )
+        signal = make_signal(setup_data["strategy"]["id"], amount=1000, simulation=True)
         result = await risk._check_balance(signal)
         assert result.passed is True
 
@@ -849,6 +867,8 @@ class TestBalanceConsecutivePause:
             "SELECT * FROM alerts WHERE type='balance_low'"
         )).fetchone()
         assert row is not None
+        assert row["title"] == "Balance check failed 3 times"
+        assert "available_balance=0" in row["detail"]
 
     @pytest.mark.asyncio
     async def test_balance_ok_resets_counter(self, db, setup_data, alert_service):
@@ -1017,7 +1037,8 @@ class TestAlertTriggers:
             (setup_data["operator"]["id"],),
         )).fetchone()
         assert row is not None
-        assert "" in row["title"]
+        assert row["title"].startswith("Stop-loss triggered:")
+        assert "stop_loss_threshold=-1000" in row["detail"]
 
     @pytest.mark.asyncio
     async def test_take_profit_alert(self, db, setup_data, alert_service):
@@ -1049,7 +1070,8 @@ class TestAlertTriggers:
             (setup_data["operator"]["id"],),
         )).fetchone()
         assert row is not None
-        assert "" in row["title"]
+        assert row["title"].startswith("Take-profit reached:")
+        assert "take_profit_threshold=1000" in row["detail"]
 
     @pytest.mark.asyncio
     async def test_platform_limit_alert(self, db, setup_data, alert_service):
@@ -1070,7 +1092,8 @@ class TestAlertTriggers:
             (setup_data["operator"]["id"],),
         )).fetchone()
         assert row is not None
-        assert "" in row["title"]
+        assert row["title"] == "Bet amount exceeds platform limit"
+        assert "platform_limit=" in row["detail"]
 
 
 # 

@@ -6,8 +6,9 @@
 - 
 - 
 """
+import hashlib
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -16,8 +17,11 @@ from app.main import app
 from app.database import get_shared_db
 from app.models.db_ops import (
     account_create,
+    account_verification_run_complete,
+    account_verification_run_create,
     alert_create,
     bet_order_create,
+    lottery_result_save,
     operator_create,
     strategy_create,
     strategy_update,
@@ -74,9 +78,12 @@ async def test_operator_dashboard_empty(client):
     assert d["balance"] == 0.0
     assert d["daily_pnl"] == 0.0
     assert d["total_pnl"] == 0.0
+    assert d["countdown_platform_type"] == "JND28WEB"
     assert d["running_strategies"] == []
-    assert d["recent_bets"] == []
+    assert d["pending_bets"] == []
     assert d["unread_alerts"] == 0
+    assert d["recent_results"] == []
+    assert d["recent_alerts"] == []
 
 
 @pytest.mark.asyncio
@@ -97,7 +104,7 @@ async def test_operator_dashboard_with_data(client):
     await db.commit()
 
     # running + 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     strat = await strategy_create(
         db, operator_id=op_id, account_id=acc["id"],
         name="test", type="flat", play_code="DX1", base_amount=1000,
@@ -113,11 +120,23 @@ async def test_operator_dashboard_with_data(client):
         account_id=acc["id"], strategy_id=strat["id"],
         issue="202603021001", key_code="DX1", amount=1000,
     )
+    await db.execute(
+        "UPDATE bet_orders SET status='bet_success' WHERE operator_id=? AND idempotent_id=?",
+        (op_id, f"dash-{uid}"),
+    )
+    await db.commit()
 
     # 
     await alert_create(
         db, operator_id=op_id, type="bet_fail",
         level="warning", title="",
+    )
+    await lottery_result_save(
+        db,
+        issue="202603021001",
+        open_result="1,2,3",
+        sum_value=6,
+        open_time="2026-03-02 10:01:00",
     )
 
     headers = {"Authorization": f"Bearer {token}"}
@@ -127,10 +146,137 @@ async def test_operator_dashboard_with_data(client):
     assert d["balance"] == 100.0  # 10000  100
     assert d["daily_pnl"] == 50.0  # 5000  50
     assert d["total_pnl"] == 200.0  # 20000  200
+    assert d["countdown_platform_type"] == "JND28WEB"
     assert len(d["running_strategies"]) == 1
     assert d["running_strategies"][0]["name"] == "test"
-    assert len(d["recent_bets"]) == 1
+    assert len(d["pending_bets"]) == 1
     assert d["unread_alerts"] == 1
+    assert len(d["recent_results"]) == 1
+    assert d["recent_results"][0]["issue"] == "202603021001"
+    assert len(d["recent_alerts"]) == 1
+    assert d["recent_alerts"][0]["type"] == "bet_fail"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_recent_data_limit_to_10(client):
+    uid = _uid()
+    token, op_id = await _create_operator(f"dash_limit_{uid}")
+    db = await get_shared_db()
+
+    for i in range(12):
+        await lottery_result_save(
+            db,
+            issue=f"20260303{1000+i}",
+            open_result="1,1,1",
+            sum_value=3,
+            open_time=f"2026-03-03 10:{i:02d}:00",
+        )
+        await alert_create(
+            db,
+            operator_id=op_id,
+            type="sync_warn",
+            level="warning",
+            title=f"warn-{i}",
+        )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.get("/api/v1/dashboard", headers=headers)
+    body = resp.json()
+    d = body["data"]
+
+    assert len(d["recent_results"]) == 10
+    assert len(d["recent_alerts"]) == 10
+    assert d["recent_results"][0]["issue"] == "202603031011"
+    assert d["recent_results"][-1]["issue"] == "202603031002"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_countdown_platform_uses_latest_strategy_when_idle(client):
+    uid = _uid()
+    token, op_id = await _create_operator(f"dash_countdown_{uid}")
+    db = await get_shared_db()
+
+    acc = await account_create(
+        db,
+        operator_id=op_id,
+        account_name=f"acc_{uid}",
+        password="pwd",
+        platform_type="JND28WEB",
+    )
+    await strategy_create(
+        db,
+        operator_id=op_id,
+        account_id=acc["id"],
+        name="old_web",
+        type="flat",
+        play_code="DX1",
+        base_amount=1000,
+        platform_type="JND28WEB",
+    )
+    await strategy_create(
+        db,
+        operator_id=op_id,
+        account_id=acc["id"],
+        name="new_20",
+        type="flat",
+        play_code="DX1",
+        base_amount=1000,
+        platform_type="JND282",
+    )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.get("/api/v1/dashboard", headers=headers)
+    assert resp.status_code == 200
+    d = resp.json()["data"]
+    assert d["running_strategies"] == []
+    assert d["countdown_platform_type"] == "JND282"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_countdown_platform_uses_verified_account_when_no_strategy(client):
+    uid = _uid()
+    token, op_id = await _create_operator(f"dash_verified_{uid}")
+    db = await get_shared_db()
+
+    acc = await account_create(
+        db,
+        operator_id=op_id,
+        account_name=f"acc_{uid}",
+        password="pwd",
+        game_type="JND28",
+        platform_url="https://jnd282.example.com",
+    )
+    run = await account_verification_run_create(
+        db,
+        account_id=acc["id"],
+        snapshot_game_type="JND28",
+        snapshot_platform_url="https://jnd282.example.com",
+        snapshot_password_hash=hashlib.sha256(b"pwd").hexdigest(),
+    )
+    await account_verification_run_complete(
+        db,
+        verification_run_id=run["id"],
+        capabilities=[
+            {
+                "platform_type": "JND282",
+                "verify_status": "supported",
+                "market_state": "open",
+                "detected_issue": None,
+                "odds_synced": False,
+                "odds_count": 0,
+                "odds_message": "countdown-ready",
+                "last_error": None,
+                "last_verified_at": "2026-04-22 08:30:00",
+            }
+        ],
+    )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.get("/api/v1/dashboard", headers=headers)
+    assert resp.status_code == 200
+    d = resp.json()["data"]
+    assert d["running_strategies"] == []
+    assert d["countdown_platform_type"] == "JND282"
 
 
 # 
@@ -181,7 +327,7 @@ async def test_admin_dashboard(client):
         db, operator_id=op_id, account_name=f"acc_{uid}",
         password="pwd", platform_type="JND28WEB",
     )
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     strat = await strategy_create(
         db, operator_id=op_id, account_id=acc["id"],
         name="s", type="flat", play_code="DX1", base_amount=100,

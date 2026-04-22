@@ -34,6 +34,7 @@ function setupHook(overrides: Partial<ReturnType<typeof useAlerts>> = {}) {
     alerts: sampleAlerts,
     total: 3,
     loading: false,
+    initialized: true,
     error: '',
     fetchAlerts: vi.fn(),
     fetchUnreadCount: vi.fn(),

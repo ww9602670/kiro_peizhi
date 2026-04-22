@@ -33,6 +33,7 @@ from app.models.db_ops import (
     account_verification_run_get_latest,
     account_verification_run_get_latest_completed,
     account_verification_run_get_running,
+    account_verification_runs_mark_stale_by_account,
     account_verification_runs_refresh_stale,
     account_update,
     alert_create,
@@ -56,6 +57,41 @@ _BJT = timezone(timedelta(hours=8))
 CAPTCHA_LOGIN_ATTEMPTS = 3
 VERIFICATION_TTL_MINUTES = 30
 VERIFICATION_TIMEOUT_SECONDS = 90
+
+FRONTEND_SIGNAL_NORMAL = "normal"
+FRONTEND_SIGNAL_PROCESSING = "processing"
+FRONTEND_SIGNAL_NEED_RELOGIN = "need_relogin"
+FRONTEND_SIGNAL_NEED_CONFIRM_ODDS = "need_confirm_odds"
+_PROCESSING_SESSION_STATUSES = {"login_failed", "reconnecting"}
+_RELOGIN_SESSION_STATUSES = {"login_error"}
+_RELOGIN_REASON_MARKERS = (
+    "bad credential",
+    "invalid credential",
+    "wrong password",
+    "password error",
+    "password incorrect",
+    "password mismatch",
+    "密码错误",
+    "账号异常",
+    "重新登录",
+    "重新登入",
+    "remote login",
+)
+
+# Keep an ASCII-only marker set for stable matching across codepage environments.
+_RELOGIN_REASON_MARKERS = (
+    "bad credential",
+    "invalid credential",
+    "wrong password",
+    "password error",
+    "password incorrect",
+    "password mismatch",
+    "invalid account",
+    "account abnormal",
+    "relogin",
+    "re-login",
+    "remote login",
+)
 
 
 @dataclass(frozen=True)
@@ -120,6 +156,55 @@ def _build_summary_status_reason(
     return "not_verified"
 
 
+def _requires_manual_relogin_by_reason(reason: str | None) -> bool:
+    normalized = (reason or "").strip().lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _RELOGIN_REASON_MARKERS)
+
+
+def _resolve_frontend_signal(
+    *,
+    verification_view: dict[str, Any],
+    has_unconfirmed_odds: bool,
+) -> tuple[str, str | None]:
+    session_statuses = {
+        str(status or "").strip().lower()
+        for status in verification_view.get("platform_session_statuses") or []
+        if str(status or "").strip()
+    }
+
+    latest_run_status = str(verification_view.get("latest_run_status") or "").strip().lower()
+    latest_run_stale_reason = str(verification_view.get("latest_run_stale_reason") or "").strip()
+    latest_completed_stale_reason = str(
+        verification_view.get("latest_completed_stale_reason") or ""
+    ).strip().lower()
+
+    if session_statuses & _RELOGIN_SESSION_STATUSES:
+        return FRONTEND_SIGNAL_NEED_RELOGIN, "session_login_error"
+    if latest_completed_stale_reason == "manual_logout":
+        return FRONTEND_SIGNAL_NEED_RELOGIN, "manual_logout"
+    if latest_run_status == "failed" and _requires_manual_relogin_by_reason(latest_run_stale_reason):
+        return FRONTEND_SIGNAL_NEED_RELOGIN, "verification_login_failed"
+    if has_unconfirmed_odds:
+        return FRONTEND_SIGNAL_NEED_CONFIRM_ODDS, "odds_unconfirmed"
+    if verification_view.get("verification_in_progress"):
+        return FRONTEND_SIGNAL_PROCESSING, "verification_in_progress"
+    if session_statuses & _PROCESSING_SESSION_STATUSES:
+        return FRONTEND_SIGNAL_PROCESSING, "session_reconnecting"
+    return FRONTEND_SIGNAL_NORMAL, None
+
+
+async def _has_unconfirmed_odds(db, *, account_id: int) -> bool:
+    row = await (
+        await db.execute(
+            "SELECT 1 FROM account_odds WHERE account_id=? AND confirmed=0 LIMIT 1",
+            (account_id,),
+        )
+    ).fetchone()
+    return row is not None
+
+
 async def _collect_account_verification_view(
     db,
     row: dict,
@@ -139,6 +224,7 @@ async def _collect_account_verification_view(
     latest_completed_run = await account_verification_run_get_latest_completed(
         db, account_id=row["id"]
     )
+    platform_sessions = await account_platform_session_list(db, account_id=row["id"])
 
     capabilities: list[dict[str, Any]] = []
     if effective_run:
@@ -178,6 +264,16 @@ async def _collect_account_verification_view(
         "allowed_strategy_platform_types": allowed_strategy_platform_types,
         "platform_capabilities": capabilities,
         "summary_status_reason": summary_status_reason,
+        "latest_run_status": latest_run.get("run_status") if latest_run else None,
+        "latest_run_stale_reason": latest_run.get("stale_reason") if latest_run else None,
+        "latest_completed_stale_reason": (
+            latest_completed_run.get("stale_reason") if latest_completed_run else None
+        ),
+        "platform_session_statuses": [
+            str(session.get("status") or "").strip().lower()
+            for session in platform_sessions
+            if str(session.get("status") or "").strip()
+        ],
     }
 
 
@@ -194,6 +290,8 @@ def _to_account_info(
     odds_synced: bool | None = None,
     odds_count: int | None = None,
     odds_message: str | None = None,
+    frontend_signal: str = FRONTEND_SIGNAL_NORMAL,
+    frontend_signal_reason: str | None = None,
 ) -> AccountInfo:
     return AccountInfo(
         id=row["id"],
@@ -207,6 +305,8 @@ def _to_account_info(
         verification_in_progress=verification_in_progress,
         verification_stale=verification_stale,
         summary_status_reason=summary_status_reason,
+        frontend_signal=frontend_signal,
+        frontend_signal_reason=frontend_signal_reason,
         platform_url=row.get("platform_url"),
         status=row["status"],
         balance=row["balance"] / 100,
@@ -441,6 +541,11 @@ async def _build_account_info(
     odds_message: str | None = None,
 ) -> AccountInfo:
     verification_view = await _collect_account_verification_view(db, row)
+    has_unconfirmed_odds = await _has_unconfirmed_odds(db, account_id=row["id"])
+    frontend_signal, frontend_signal_reason = _resolve_frontend_signal(
+        verification_view=verification_view,
+        has_unconfirmed_odds=has_unconfirmed_odds,
+    )
     return _to_account_info(
         row,
         allowed_strategy_platform_types=verification_view["allowed_strategy_platform_types"],
@@ -453,6 +558,8 @@ async def _build_account_info(
         odds_synced=odds_synced,
         odds_count=odds_count,
         odds_message=odds_message,
+        frontend_signal=frontend_signal,
+        frontend_signal_reason=frontend_signal_reason,
     )
 
 
@@ -744,6 +851,11 @@ async def manual_logout(
             account_id=account_id,
             platform_type=session["platform_type"],
         )
+    await account_verification_runs_mark_stale_by_account(
+        db,
+        account_id=account_id,
+        stale_reason="manual_logout",
+    )
 
     row = await account_update(
         db,

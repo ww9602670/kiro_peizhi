@@ -33,3 +33,19 @@ class TokenResponse(BaseModel):
 
     token: str
     expire_at: str  # ISO 8601
+
+
+class OperatorChangePasswordRequest(BaseModel):
+    """"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "old_password": "pass123456",
+                "new_password": "pass1234567",
+            }
+        }
+    )
+
+    old_password: str = Field(..., min_length=6, description="")
+    new_password: str = Field(..., min_length=6, description="")

@@ -39,6 +39,8 @@ from app.models.db_ops import (
     account_update,
     bet_order_update_status,
     lottery_result_save,
+    simulation_bet_order_update,
+    simulation_strategy_stats_upsert,
     strategy_get_by_id,
     strategy_update_pnl,
 )
@@ -156,17 +158,14 @@ class SettlementProcessor:
         open_result = ",".join(str(b) for b in balls)
         await self._save_lottery_result(issue, open_result, sum_value)
 
-        # 2. 查询待结算订单（补结算模式包含可恢复终态）
-        orders = await self._get_settleable_orders(issue, include_recoverable=is_recovery)
-        if not orders:
+        # 2. 分别查询真实/模拟待结算订单（补结算模式包含可恢复终态）
+        real_orders = await self._get_settleable_orders(issue, include_recoverable=is_recovery)
+        sim_orders = await self._get_settleable_sim_orders(issue, include_recoverable=is_recovery)
+        if not real_orders and not sim_orders:
             logger.info("issue=%s 无待结算订单", issue)
             return
 
-        # 3. 按 simulation 分组
-        real_orders = [o for o in orders if o.get("simulation", 0) == 0]
-        sim_orders = [o for o in orders if o.get("simulation", 0) == 1]
-
-        # 4. 先模拟后真实，两组在独立事务中完成
+        # 3. 先模拟后真实，两组在独立事务中完成
         if sim_orders:
             await self._settle_simulated(sim_orders, balls, sum_value, platform_type, open_result)
 
@@ -175,7 +174,7 @@ class SettlementProcessor:
                 await self._settle_real(real_orders, issue, adapter, open_result, sum_value)
             else:
                 # 无 adapter 时使用本地计算（向后兼容 + 降级）
-                await self._settle_simulated(real_orders, balls, sum_value, platform_type, open_result)
+                await self._settle_real_locally(real_orders, balls, sum_value, platform_type, open_result)
 
     # ==================================================================
     # 7.3.2  key_code_map
@@ -271,7 +270,7 @@ class SettlementProcessor:
             rows = await (
                 await self.db.execute(
                     f"SELECT * FROM bet_orders WHERE issue=? AND operator_id=? "
-                    f"AND account_id=? AND status IN ({placeholders})",
+                    f"AND account_id=? AND simulation=0 AND status IN ({placeholders})",
                     (issue, self.operator_id, self.account_id, *statuses),
                 )
             ).fetchall()
@@ -279,6 +278,31 @@ class SettlementProcessor:
             rows = await (
                 await self.db.execute(
                     f"SELECT * FROM bet_orders WHERE issue=? AND operator_id=? "
+                    f"AND simulation=0 AND status IN ({placeholders})",
+                    (issue, self.operator_id, *statuses),
+                )
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def _get_settleable_sim_orders(self, issue: str, include_recoverable: bool = False) -> list[dict]:
+        """查询可结算的模拟订单。"""
+        statuses = ['bet_success', 'pending_match']
+        if include_recoverable:
+            statuses.extend(['settle_timeout', 'settle_failed'])
+
+        placeholders = ','.join('?' * len(statuses))
+        if self.account_id is not None:
+            rows = await (
+                await self.db.execute(
+                    f"SELECT * FROM simulation_bet_orders WHERE issue=? AND operator_id=? "
+                    f"AND account_id=? AND status IN ({placeholders})",
+                    (issue, self.operator_id, self.account_id, *statuses),
+                )
+            ).fetchall()
+        else:
+            rows = await (
+                await self.db.execute(
+                    f"SELECT * FROM simulation_bet_orders WHERE issue=? AND operator_id=? "
                     f"AND status IN ({placeholders})",
                     (issue, self.operator_id, *statuses),
                 )
@@ -330,10 +354,77 @@ class SettlementProcessor:
         platform_type: str,
         open_result: str,
     ) -> None:
-        """模拟投注结算：使用本地 check_win + odds 自计算
+        """模拟投注结算：读写 simulation_*，不污染真实账本。"""
+        now_str = _now_bj()
+        today_str = now_str[:10]
+        stats_delta: dict[int, dict[str, int]] = {}
+        strategy_account_map: dict[int, int] = {}
 
-        结算完成后所有订单 match_source="local"。
-        """
+        for order in orders:
+            result = self._calculate_result(order, balls, sum_value, platform_type)
+            current_status = order["status"]
+            if current_status != "settling":
+                self._transition_status(order, "settling")
+            self._transition_status(dict(order, status="settling"), "settled")
+
+            await simulation_bet_order_update(
+                self.db,
+                order_id=order["id"],
+                status="settled",
+                operator_id=self.operator_id,
+                is_win=result.is_win,
+                pnl=result.pnl,
+                open_result=open_result,
+                sum_value=sum_value,
+                settled_at=now_str,
+            )
+
+            sid = int(order["strategy_id"])
+            strategy_account_map[sid] = int(order["account_id"])
+            delta = stats_delta.setdefault(
+                sid,
+                {
+                    "daily_pnl_delta": 0,
+                    "total_pnl_delta": 0,
+                    "bet_count_delta": 0,
+                    "win_count_delta": 0,
+                    "loss_count_delta": 0,
+                },
+            )
+            delta["bet_count_delta"] += 1
+            if result.is_win == 1:
+                delta["win_count_delta"] += 1
+            elif result.is_win == 0:
+                delta["loss_count_delta"] += 1
+
+            if result.is_win != -1:
+                delta["daily_pnl_delta"] += result.pnl
+                delta["total_pnl_delta"] += result.pnl
+
+        for sid, delta in stats_delta.items():
+            await simulation_strategy_stats_upsert(
+                self.db,
+                strategy_id=sid,
+                operator_id=self.operator_id,
+                account_id=strategy_account_map[sid],
+                daily_pnl_delta=delta["daily_pnl_delta"],
+                total_pnl_delta=delta["total_pnl_delta"],
+                bet_count_delta=delta["bet_count_delta"],
+                win_count_delta=delta["win_count_delta"],
+                loss_count_delta=delta["loss_count_delta"],
+                daily_pnl_date=today_str,
+                settled_at=now_str,
+            )
+
+    async def _settle_real_locally(
+        self,
+        orders: list[dict],
+        balls: list[int],
+        sum_value: int,
+        platform_type: str,
+        open_result: str,
+    ) -> None:
+        """真实订单在无 adapter 时的本地降级结算。"""
         strategy_pnl_map: dict[int, int] = {}
         account_balance_delta: dict[int, int] = {}
 
@@ -574,9 +665,17 @@ class SettlementProcessor:
             if current_status in NON_OVERRIDABLE_TERMINAL_STATES:
                 continue
             try:
-                await self._atomic_transition(
-                    order["id"], current_status, "settle_failed",
-                )
+                if order.get("simulation"):
+                    await simulation_bet_order_update(
+                        self.db,
+                        order_id=order["id"],
+                        operator_id=self.operator_id,
+                        status="settle_failed",
+                    )
+                else:
+                    await self._atomic_transition(
+                        order["id"], current_status, "settle_failed",
+                    )
             except IllegalStateTransition:
                 logger.warning(
                     "标记 settle_failed 跳过 order_id=%d: 非法转换 %s→settle_failed",

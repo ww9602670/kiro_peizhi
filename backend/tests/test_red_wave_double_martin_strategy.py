@@ -1,9 +1,12 @@
-"""Tests for red_wave_double_martin directional behavior."""
+"""Tests for wave-trigger directional Martin strategies."""
 
 import pytest
 
 from app.engine.strategies.base import LotteryResult, StrategyContext
-from app.engine.strategies.red_wave_double import RedWaveDoubleMartinStrategy
+from app.engine.strategies.red_wave_double import (
+    GreenWaveSingleMartinStrategy,
+    RedWaveDoubleMartinStrategy,
+)
 
 
 def _ctx(balls: list[int] | None = None) -> StrategyContext:
@@ -197,3 +200,39 @@ def test_win_feedback_resets_inactive_direction_from_order_level():
 
     assert strategy.states["B2LM_S"].active is False
     assert strategy.states["B2LM_S"].level == 0
+
+
+def test_green_wave_default_direction_is_ds3():
+    strategy = GreenWaveSingleMartinStrategy(base_amount=100, sequence=[1, 2])
+    assert strategy.direction_codes == ["DS3"]
+
+
+def test_sum_green_wave_starts_ds3_chase():
+    strategy = GreenWaveSingleMartinStrategy(
+        base_amount=100, sequence=[1, 2], direction_codes=["DS3"]
+    )
+    signals = strategy.compute(_ctx([0, 0, 1]))  # sum=1 green
+    assert len(signals) == 1
+    assert signals[0].key_code == "DS3"
+    assert signals[0].amount == 100
+    assert signals[0].martin_level == 0
+    assert strategy.states["DS3"].active is True
+
+
+def test_ball_direction_green_wave_starts_chase():
+    strategy = GreenWaveSingleMartinStrategy(
+        base_amount=100, sequence=[1, 2], direction_codes=["B1LM_D"]
+    )
+    signals = strategy.compute(_ctx([7, 0, 0]))  # ball1 green
+    assert len(signals) == 1
+    assert signals[0].key_code == "B1LM_D"
+    assert signals[0].amount == 100
+    assert strategy.states["B1LM_D"].active is True
+
+
+def test_non_green_wave_skips_when_inactive():
+    strategy = GreenWaveSingleMartinStrategy(
+        base_amount=100, sequence=[1, 2], direction_codes=["DS3"]
+    )
+    assert strategy.compute(_ctx([1, 1, 1])) == []  # sum=3 red
+    assert strategy.states["DS3"].active is False

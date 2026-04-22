@@ -13,6 +13,7 @@ import tempfile
 import pytest
 import aiosqlite
 
+import app.database as database_module
 from app.database import get_db, init_db, DDL_STATEMENTS, INSERT_DEFAULT_ADMIN
 
 EXPECTED_TABLES = {
@@ -99,6 +100,91 @@ class TestDefaultAdmin:
         cursor = await db.execute("SELECT COUNT(*) as cnt FROM operators WHERE username = 'admin'")
         row = await cursor.fetchone()
         assert row["cnt"] == 1
+
+
+class TestLegacySchemaResetGuard:
+    async def test_init_db_blocks_destructive_reset_when_flag_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = str(tmp_path / "legacy_guard.db")
+        conn = await aiosqlite.connect(db_path)
+        await conn.execute(
+            """
+            CREATE TABLE gambling_accounts (
+                id INTEGER PRIMARY KEY,
+                platform_type TEXT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            "INSERT INTO gambling_accounts (id, platform_type) VALUES (1, 'JND28WEB')"
+        )
+        await conn.commit()
+        await conn.close()
+
+        monkeypatch.setattr(
+            database_module, "BOCAI_ALLOW_LEGACY_DESTRUCTIVE_RESET", False
+        )
+
+        try:
+            with pytest.raises(
+                RuntimeError, match="BOCAI_ALLOW_LEGACY_DESTRUCTIVE_RESET"
+            ):
+                await init_db(db_path)
+        finally:
+            await database_module.close_shared_db()
+
+        verify_conn = await aiosqlite.connect(db_path)
+        table_row = await (
+            await verify_conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table' AND name='gambling_accounts'
+                """
+            )
+        ).fetchone()
+        assert table_row is not None
+        count_row = await (
+            await verify_conn.execute("SELECT COUNT(*) FROM gambling_accounts")
+        ).fetchone()
+        assert count_row[0] == 1
+        await verify_conn.close()
+
+    async def test_init_db_resets_legacy_schema_when_flag_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = str(tmp_path / "legacy_reset.db")
+        conn = await aiosqlite.connect(db_path)
+        await conn.execute(
+            """
+            CREATE TABLE gambling_accounts (
+                id INTEGER PRIMARY KEY,
+                platform_type TEXT NOT NULL
+            )
+            """
+        )
+        await conn.commit()
+        await conn.close()
+
+        monkeypatch.setattr(
+            database_module, "BOCAI_ALLOW_LEGACY_DESTRUCTIVE_RESET", True
+        )
+
+        try:
+            await init_db(db_path)
+            verify_conn = await get_db(db_path)
+            cols = {
+                row[1]
+                for row in await (
+                    await verify_conn.execute("PRAGMA table_info(gambling_accounts)")
+                ).fetchall()
+            }
+            assert "game_type" in cols
+            assert "platform_type" not in cols
+            await verify_conn.close()
+        finally:
+            await database_module.close_shared_db()
 
 
 class TestTerminalStateTrigger:

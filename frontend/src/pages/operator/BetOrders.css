@@ -17,6 +17,34 @@
   margin: 0;
 }
 
+.bet-orders-subtitle {
+  margin: 4px 0 0;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.bet-orders-ledger-switch {
+  display: inline-flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ledger-tab {
+  padding: 6px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 999px;
+  background: #fff;
+  color: #4b5563;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ledger-tab-active {
+  border-color: #2563eb;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
 .refresh-btn {
   padding: 6px 14px;
   border: 1px solid #d1d5db;
@@ -154,6 +182,11 @@
 .status-pending {
   background: #fffbeb;
   color: #d97706;
+}
+
+.status-failed {
+  background: #fef2f2;
+  color: #dc2626;
 }
 
 .pnl-positive { color: #52c41a; }

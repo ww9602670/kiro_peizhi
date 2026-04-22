@@ -14,12 +14,18 @@ from fastapi import APIRouter, Depends, Request
 
 from app.api.dependencies import get_current_operator, get_db_conn
 from app.models.db_ops import (
+    account_list_by_operator,
     audit_log_create,
     operator_get_by_username,
     operator_update,
 )
-from app.schemas.auth import LoginRequest, TokenResponse
+from app.schemas.auth import (
+    LoginRequest,
+    OperatorChangePasswordRequest,
+    TokenResponse,
+)
 from app.schemas.common import ApiResponse
+from app.schemas.operator import OperatorMeInfo
 from app.utils.auth import (
     check_refresh_window,
     create_token,
@@ -40,6 +46,11 @@ def _get_client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _require_operator_role(operator: dict) -> None:
+    if operator.get("role") != "operator":
+        raise BizError(3001, "forbidden", status_code=403)
 
 
 @router.post("/auth/login")
@@ -116,6 +127,57 @@ async def _log_login_failure(
         detail=json.dumps({"ip": ip, "username": username, "reason": reason}),
         ip_address=ip,
     )
+
+
+@router.get("/operator/me")
+async def get_operator_me(
+    operator: dict = Depends(get_current_operator),
+    db=Depends(get_db_conn),
+):
+    _require_operator_role(operator)
+    accounts = await account_list_by_operator(db, operator_id=operator["id"])
+    max_accounts = int(operator.get("max_accounts") or 0)
+    bound_accounts = len(accounts)
+    me = OperatorMeInfo(
+        username=operator["username"],
+        expire_date=operator.get("expire_date"),
+        max_accounts=max_accounts,
+        bound_accounts=bound_accounts,
+        remaining_accounts=max(0, max_accounts - bound_accounts),
+    )
+    return ApiResponse[OperatorMeInfo](data=me)
+
+
+@router.put("/operator/me/password")
+async def update_operator_password(
+    body: OperatorChangePasswordRequest,
+    request: Request,
+    operator: dict = Depends(get_current_operator),
+    db=Depends(get_db_conn),
+):
+    _require_operator_role(operator)
+    if operator["password"] != body.old_password:
+        raise BizError(2002, "old password mismatch", status_code=401)
+    if body.old_password == body.new_password:
+        raise BizError(1002, "new password must be different", status_code=400)
+
+    await operator_update(
+        db,
+        operator_id=operator["id"],
+        password=body.new_password,
+    )
+
+    ip = _get_client_ip(request)
+    await audit_log_create(
+        db,
+        operator_id=operator["id"],
+        action="change_password",
+        target_type="operator",
+        target_id=operator["id"],
+        detail=json.dumps({"ip": ip}),
+        ip_address=ip,
+    )
+    return ApiResponse(data=None)
 
 
 @router.post("/auth/refresh")

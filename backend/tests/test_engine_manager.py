@@ -21,8 +21,9 @@ from app.engine.manager import (
     InMemoryWorkerRegistry,
     SessionStore,
     WorkerRegistry,
+    make_runtime_key,
 )
-from app.engine.worker import AccountWorker
+from app.engine.worker import AccountWorker, WorkerStartupError
 
 
 # 
@@ -271,7 +272,10 @@ class TestRestoreWorkersOnStartup:
             ])
             mock_ops.account_list_by_operator = AsyncMock(return_value=[
                 {"id": 100, "account_name": "acc1", "password": "pw1",
-                 "status": "online", "platform_type": "JND28WEB", "operator_id": 1},
+                 "status": "online", "platform_type": "JND28WEB", "operator_id": 1,
+                 "effective_verification_run_id": 11,
+                 "verification_stale": False,
+                 "allowed_strategy_platform_types": ["JND28WEB"]},
             ])
             mock_ops.strategy_list_by_operator = AsyncMock(return_value=[
                 {"id": 10, "account_id": 100, "status": "running",
@@ -371,9 +375,15 @@ class TestRestoreWorkersOnStartup:
             ])
             mock_ops.account_list_by_operator = AsyncMock(return_value=[
                 {"id": 100, "account_name": "acc1", "password": "pw1",
-                 "status": "online", "platform_type": "JND28WEB", "operator_id": 1},
+                 "status": "online", "platform_type": "JND28WEB", "operator_id": 1,
+                 "effective_verification_run_id": 11,
+                 "verification_stale": False,
+                 "allowed_strategy_platform_types": ["JND28WEB"]},
                 {"id": 200, "account_name": "acc2", "password": "pw2",
-                 "status": "online", "platform_type": "JND28WEB", "operator_id": 1},
+                 "status": "online", "platform_type": "JND28WEB", "operator_id": 1,
+                 "effective_verification_run_id": 22,
+                 "verification_stale": False,
+                 "allowed_strategy_platform_types": ["JND28WEB"]},
             ])
             mock_ops.strategy_list_by_operator = AsyncMock(return_value=[
                 {"id": 10, "account_id": 100, "status": "running",
@@ -387,6 +397,109 @@ class TestRestoreWorkersOnStartup:
 
         # 
         assert restored == 1
+
+
+class TestStartWorker:
+    @pytest.mark.asyncio
+    async def test_start_worker_builds_settler_without_platform_type_kwarg(self):
+        manager = _make_manager()
+        worker = _make_mock_worker(account_id=321, operator_id=9, running=False)
+
+        with (
+            patch("app.engine.manager.create_platform_adapter", return_value=MagicMock()) as mock_adapter_factory,
+            patch("app.engine.manager.SessionManager", return_value=MagicMock()) as mock_session,
+            patch("app.engine.manager.IssuePoller", return_value=MagicMock()) as mock_poller,
+            patch("app.engine.manager.RiskController", return_value=MagicMock()) as mock_risk,
+            patch("app.engine.manager.BetExecutor", return_value=MagicMock()) as mock_executor,
+            patch("app.engine.manager.SettlementProcessor", return_value=MagicMock()) as mock_settler,
+            patch("app.engine.manager.Reconciler", return_value=MagicMock()) as mock_reconciler,
+            patch("app.engine.manager.AccountWorker", return_value=worker) as mock_worker_cls,
+        ):
+            result = await manager.start_worker(
+                operator_id=9,
+                account_id=321,
+                account_name="acc321",
+                password="pw321",
+                platform_type="JND282",
+                platform_url="https://example.test",
+                strategies=[],
+            )
+
+        assert result is worker
+        assert await manager.registry.get(make_runtime_key(321, "JND282")) is worker
+        mock_adapter_factory.assert_called_once_with("JND282", "https://example.test")
+        mock_session.assert_called_once()
+        mock_poller.assert_called_once()
+        mock_risk.assert_called_once()
+        mock_executor.assert_called_once()
+        mock_reconciler.assert_called_once()
+        mock_settler.assert_called_once_with(
+            db=manager.db,
+            operator_id=9,
+            account_id=321,
+        )
+        mock_reconciler.assert_called_once_with(
+            db=manager.db,
+            adapter=mock_adapter_factory.return_value,
+            alert_service=manager.alert_service,
+            operator_id=9,
+        )
+        mock_worker_cls.assert_called_once()
+        worker.start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_worker_unregisters_failed_worker_startup(self):
+        manager = _make_manager()
+        worker = _make_mock_worker(account_id=321, operator_id=9, running=False)
+        worker.start = AsyncMock(side_effect=WorkerStartupError("startup failed"))
+
+        with (
+            patch("app.engine.manager.create_platform_adapter", return_value=MagicMock()),
+            patch("app.engine.manager.SessionManager", return_value=MagicMock()),
+            patch("app.engine.manager.IssuePoller", return_value=MagicMock()),
+            patch("app.engine.manager.RiskController", return_value=MagicMock()),
+            patch("app.engine.manager.BetExecutor", return_value=MagicMock()),
+            patch("app.engine.manager.SettlementProcessor", return_value=MagicMock()),
+            patch("app.engine.manager.Reconciler", return_value=MagicMock()),
+            patch("app.engine.manager.AccountWorker", return_value=worker),
+        ):
+            with pytest.raises(WorkerStartupError):
+                await manager.start_worker(
+                    operator_id=9,
+                    account_id=321,
+                    account_name="acc321",
+                    password="pw321",
+                    platform_type="JND282",
+                    platform_url="https://example.test",
+                    strategies=[],
+                )
+
+        assert await manager.registry.get(make_runtime_key(321, "JND282")) is None
+
+    @pytest.mark.asyncio
+    async def test_hot_update_worker_replaces_current_issue_snapshot(self):
+        manager = _make_manager()
+        worker = _make_mock_worker(account_id=321, operator_id=9, running=True)
+        worker.replace_strategy_snapshot = MagicMock()
+        runners = {1: MagicMock()}
+        profiles = {1: MagicMock()}
+
+        with patch.object(
+            manager,
+            "_build_strategy_snapshot",
+            return_value=(runners, profiles),
+        ):
+            result = await manager._hot_update_worker(
+                worker,
+                strategies=[{"id": 1, "status": "running"}],
+            )
+
+        assert result is worker
+        worker.replace_strategy_snapshot.assert_called_once_with(
+            runners,
+            profiles,
+            apply_next_issue_only=False,
+        )
 
 
 # 

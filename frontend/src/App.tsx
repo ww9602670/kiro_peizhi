@@ -1,76 +1,164 @@
-import { useEffect, useState } from 'react';
-import { useAuth } from '@/hooks/useAuth';
-import { useAlerts } from '@/hooks/useAlerts';
-import Login from '@/pages/Login';
+import { useCallback, useEffect, useState } from 'react';
+import { getRoutePath, resolveRouteKey, type AppRouteKey } from '@/appRoutes';
 import Layout, { type NavItem } from '@/components/Layout';
-import Dashboard from '@/pages/operator/Dashboard';
-import Accounts from '@/pages/operator/Accounts';
-import Strategies from '@/pages/operator/Strategies';
-import BetOrders from '@/pages/operator/BetOrders';
-import Alerts from '@/pages/operator/Alerts';
-import Backtest from '@/pages/operator/Backtest';
+import { AlertsProvider } from '@/contexts/AlertsContext';
+import { useAlertsContext } from '@/hooks/useAlertsContext';
+import { useAuth } from '@/hooks/useAuth';
+import Login from '@/pages/Login';
 import AdminDashboardPage from '@/pages/admin/Dashboard';
 import Operators from '@/pages/admin/Operators';
+import Accounts from '@/pages/operator/Accounts';
+import Dashboard from '@/pages/operator/Dashboard';
+import My from '@/pages/operator/My';
+import Strategies from '@/pages/operator/Strategies';
 import './App.css';
+
+export type StrategyCreateIntent = {
+  accountId?: number;
+  nonce: number;
+};
 
 const OPERATOR_NAV: NavItem[] = [
   { key: 'dashboard', label: '仪表盘' },
   { key: 'accounts', label: '账号' },
   { key: 'strategies', label: '策略' },
-  { key: 'bet-orders', label: '投注记录' },
-  { key: 'alerts', label: '告警' },
-  { key: 'backtest', label: '回测' },
+  { key: 'me', label: '我的' },
 ];
 
 const ADMIN_NAV: NavItem[] = [
   { key: 'admin-dashboard', label: '仪表盘' },
-  { key: 'operators', label: '操作者管理' },
+  { key: 'operators', label: '操作员' },
 ];
+
+interface AuthedAppShellProps {
+  isAdmin: boolean;
+  navItems: NavItem[];
+  activeTab: AppRouteKey;
+  onNavChange: (key: string) => void;
+  onLogout: () => Promise<void> | void;
+  strategyCreateIntent: StrategyCreateIntent | null;
+  clearStrategyIntent: () => void;
+  openStrategyCreate: (accountId?: number) => void;
+}
+
+function AuthedAppShell({
+  isAdmin,
+  navItems,
+  activeTab,
+  onNavChange,
+  onLogout,
+  strategyCreateIntent,
+  clearStrategyIntent,
+  openStrategyCreate,
+}: AuthedAppShellProps) {
+  const { unreadCount } = useAlertsContext();
+
+  return (
+    <Layout
+      navItems={navItems}
+      activeKey={activeTab}
+      onNavChange={onNavChange}
+      unreadAlerts={unreadCount}
+      onLogout={onLogout}
+    >
+      {activeTab === 'dashboard' && <Dashboard onCreateStrategy={() => openStrategyCreate()} />}
+      {activeTab === 'accounts' && <Accounts onCreateStrategy={(accountId) => openStrategyCreate(accountId)} />}
+      {activeTab === 'strategies' && (
+        <Strategies
+          createIntent={strategyCreateIntent}
+          onCreateIntentConsumed={clearStrategyIntent}
+        />
+      )}
+      {activeTab === 'me' && <My />}
+
+      {isAdmin && activeTab === 'admin-dashboard' && <AdminDashboardPage />}
+      {isAdmin && activeTab === 'operators' && <Operators />}
+    </Layout>
+  );
+}
 
 function App() {
   const { isAuthenticated, role, logout } = useAuth();
-  const { unreadCount, startPolling, stopPolling } = useAlerts();
-
   const isAdmin = role === 'admin';
   const navItems = isAdmin ? ADMIN_NAV : OPERATOR_NAV;
-  const defaultTab = isAdmin ? 'admin-dashboard' : 'dashboard';
 
-  const [activeTab, setActiveTab] = useState(defaultTab);
+  const [activeTab, setActiveTab] = useState<AppRouteKey>(() =>
+    resolveRouteKey(window.location.pathname, isAuthenticated, isAdmin),
+  );
+  const [strategyCreateIntent, setStrategyCreateIntent] = useState<StrategyCreateIntent | null>(null);
+
+  const syncRoute = useCallback(() => {
+    setActiveTab(resolveRouteKey(window.location.pathname, isAuthenticated, isAdmin));
+  }, [isAuthenticated, isAdmin]);
+
+  const navigateTo = useCallback(
+    (nextKey: AppRouteKey, options?: { replace?: boolean }) => {
+      const targetPath = getRoutePath(nextKey);
+      if (window.location.pathname !== targetPath) {
+        if (options?.replace) {
+          window.history.replaceState({}, '', targetPath);
+        } else {
+          window.history.pushState({}, '', targetPath);
+        }
+      }
+      setActiveTab(nextKey);
+    },
+    [],
+  );
 
   useEffect(() => {
-    if (isAuthenticated) {
-      startPolling();
-      setActiveTab(isAdmin ? 'admin-dashboard' : 'dashboard');
-    } else {
-      stopPolling();
+    const handlePopState = () => syncRoute();
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [syncRoute]);
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      navigateTo('login', { replace: true });
+      return;
     }
-    return () => stopPolling();
-  }, [isAuthenticated, isAdmin, startPolling, stopPolling]);
+
+    const resolvedKey = resolveRouteKey(window.location.pathname, true, isAdmin);
+    const expectedPath = getRoutePath(resolvedKey);
+    if (window.location.pathname !== expectedPath) {
+      navigateTo(resolvedKey, { replace: true });
+      return;
+    }
+    setActiveTab(resolvedKey);
+  }, [isAuthenticated, isAdmin, navigateTo]);
+
+  const handleNavChange = (key: string) => {
+    navigateTo(key as AppRouteKey);
+  };
+
+  const openStrategyCreate = (accountId?: number) => {
+    setStrategyCreateIntent({ accountId, nonce: Date.now() });
+    navigateTo('strategies');
+  };
+
+  const handleLogout = async () => {
+    await logout();
+    setStrategyCreateIntent(null);
+    navigateTo('login', { replace: true });
+  };
 
   if (!isAuthenticated) {
     return <Login />;
   }
 
   return (
-    <Layout
-      navItems={navItems}
-      activeKey={activeTab}
-      onNavChange={setActiveTab}
-      unreadAlerts={unreadCount}
-      onLogout={logout}
-    >
-      {/* Operator pages */}
-      {activeTab === 'dashboard' && <Dashboard />}
-      {activeTab === 'accounts' && <Accounts />}
-      {activeTab === 'strategies' && <Strategies />}
-      {activeTab === 'bet-orders' && <BetOrders />}
-      {activeTab === 'alerts' && <Alerts />}
-      {activeTab === 'backtest' && <Backtest />}
-
-      {/* Admin pages */}
-      {activeTab === 'admin-dashboard' && <AdminDashboardPage />}
-      {activeTab === 'operators' && <Operators />}
-    </Layout>
+    <AlertsProvider>
+      <AuthedAppShell
+        isAdmin={isAdmin}
+        navItems={navItems}
+        activeTab={activeTab}
+        onNavChange={handleNavChange}
+        onLogout={handleLogout}
+        strategyCreateIntent={strategyCreateIntent}
+        clearStrategyIntent={() => setStrategyCreateIntent(null)}
+        openStrategyCreate={openStrategyCreate}
+      />
+    </AlertsProvider>
   );
 }
 

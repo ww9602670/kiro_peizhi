@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PlatformType = Literal["JND28WEB", "JND282", "LUCKYSB"]
 GameType = Literal["JND28", "LUCKYSB"]
+FrontendSignal = Literal["normal", "processing", "need_relogin", "need_confirm_odds"]
 
 GAME_TYPE_ALLOWED_PLATFORM_TYPES: dict[str, tuple[str, ...]] = {
     "JND28": ("JND28WEB", "JND282"),
@@ -107,6 +108,8 @@ class AccountInfo(BaseModel):
                 "verification_in_progress": False,
                 "verification_stale": False,
                 "summary_status_reason": None,
+                "frontend_signal": "normal",
+                "frontend_signal_reason": None,
                 "status": "inactive",
                 "balance": 0.0,
                 "kill_switch": False,
@@ -138,6 +141,14 @@ class AccountInfo(BaseModel):
     verification_in_progress: bool = False
     verification_stale: bool = False
     summary_status_reason: Optional[str] = None
+    frontend_signal: FrontendSignal = Field(
+        default="normal",
+        description="front-end simplified status signal",
+    )
+    frontend_signal_reason: Optional[str] = Field(
+        default=None,
+        description="machine-readable reason for frontend_signal",
+    )
     platform_url: Optional[str] = None
     status: str
     balance: float

@@ -236,6 +236,11 @@
   color: #1677ff;
 }
 
+.badge-game-type {
+  background: #f6ffed;
+  color: #389e0d;
+}
+
 .badge-status-online {
   background: #f6ffed;
   color: #52c41a;

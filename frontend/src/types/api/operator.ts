@@ -22,6 +22,19 @@ export interface OperatorInfo {
   created_at: string;
 }
 
+export interface OperatorMeInfo {
+  username: string;
+  expire_date: string | null;
+  max_accounts: number;
+  bound_accounts: number;
+  remaining_accounts: number;
+}
+
+export interface OperatorChangePasswordRequest {
+  old_password: string;
+  new_password: string;
+}
+
 export interface StatusUpdate {
   status: 'active' | 'disabled';
 }

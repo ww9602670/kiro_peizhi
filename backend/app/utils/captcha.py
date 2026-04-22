@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 # 配置
 MAX_WORKERS = 4
 QUEUE_LIMIT = 100
+_shared_service: Optional["CaptchaService"] = None
+_shared_service_lock = threading.Lock()
 
 
 class CaptchaError(Exception):
@@ -163,3 +165,27 @@ class CaptchaService:
     def shutdown(self) -> None:
         """关闭线程池"""
         self._executor.shutdown(wait=False)
+
+
+def get_shared_captcha_service() -> CaptchaService:
+    """Return a lazily initialized process-wide OCR service."""
+    global _shared_service
+
+    if _shared_service is None:
+        with _shared_service_lock:
+            if _shared_service is None:
+                _shared_service = CaptchaService()
+                logger.info("Initialized shared captcha service")
+    return _shared_service
+
+
+def shutdown_shared_captcha_service() -> None:
+    """Shutdown the shared OCR service if it was created."""
+    global _shared_service
+
+    with _shared_service_lock:
+        service = _shared_service
+        _shared_service = None
+
+    if service is not None:
+        service.shutdown()

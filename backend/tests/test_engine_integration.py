@@ -284,6 +284,38 @@ async def test_manager_builds_red_wave_runner_with_direction_codes(db):
     assert {s.key_code for s in signals} == {"B1LM_S", "DS4"}
 
 
+@pytest.mark.asyncio
+async def test_manager_builds_green_wave_runner_with_direction_codes(db):
+    manager = EngineManager(db=db)
+    runner = manager._build_strategy_runner(
+        {
+            "id": 1002,
+            "type": "green_wave_single_martin",
+            "play_code": "B1LM_D,DS3",
+            "base_amount": 1000,
+            "martin_sequence": "[1,2,4]",
+            "status": "running",
+            "simulation": 0,
+        }
+    )
+    assert runner is not None
+
+    signals = runner.collect_signals(
+        StrategyContext(
+            current_issue="20260301001",
+            history=[
+                LotteryResult(
+                    issue="20260301000", balls=[7, 0, 0], sum_value=7
+                )
+            ],
+            balance=1_000_000,
+            strategy_state={},
+        ),
+        issue="20260301001",
+    )
+    assert {s.key_code for s in signals} == {"B1LM_D", "DS3"}
+
+
 # 
 # 14.3.2 ?
 # 

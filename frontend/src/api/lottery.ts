@@ -2,14 +2,26 @@
  * Lottery API
  */
 import { request } from '@/api/request';
-import type { CurrentInstall } from '@/types/api/lottery';
+import type { ApiResponse } from '@/types/api/common';
+import {
+  normalizeCurrentInstall,
+  type CurrentInstall,
+  type CurrentInstallWire,
+} from '@/types/api/lottery';
 
 /**
  * Fetch current install information (with countdown)
- * 
- * Note: Backend returns Envelope format, request layer auto-unpacks data field
  */
-export function fetchCurrentInstall(platformType: string = 'JND28WEB') {
-  const query = platformType ? `?platform_type=${encodeURIComponent(platformType)}` : '';
-  return request<CurrentInstall>(`/lottery/current-install${query}`);
+export async function fetchCurrentInstall(
+  platformType: string = 'JND28WEB',
+): Promise<ApiResponse<CurrentInstall>> {
+  const normalizedPlatformType = (platformType || 'JND28WEB').trim().toUpperCase();
+  const query = normalizedPlatformType
+    ? `?platform_type=${encodeURIComponent(normalizedPlatformType)}`
+    : '';
+  const response = await request<CurrentInstallWire>(`/lottery/current-install${query}`);
+  return {
+    ...response,
+    data: response.data ? normalizeCurrentInstall(response.data) : null,
+  };
 }

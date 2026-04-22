@@ -86,6 +86,14 @@ class LoginResult:
     captcha_required: bool = False
 
 
+class RemoteLoginRequired(RuntimeError):
+    """Raised when the platform indicates the current session is no longer valid."""
+
+    def __init__(self, *, raw_state: int, message: str = "") -> None:
+        self.raw_state = raw_state
+        super().__init__(message or f"remote login required, state={raw_state}")
+
+
 class PlatformAdapter(ABC):
     """
 

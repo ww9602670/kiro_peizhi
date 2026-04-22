@@ -15,6 +15,7 @@ export interface ListBetOrdersParams {
   strategy_id?: number;
   status?: string;
   account_id?: number;
+  ledger?: 'real' | 'simulation';
 }
 
 function buildQuery(params: ListBetOrdersParams): string {
@@ -26,6 +27,7 @@ function buildQuery(params: ListBetOrdersParams): string {
   if (params.strategy_id !== undefined) parts.push(`strategy_id=${params.strategy_id}`);
   if (params.status) parts.push(`status=${params.status}`);
   if (params.account_id !== undefined) parts.push(`account_id=${params.account_id}`);
+  if (params.ledger) parts.push(`ledger=${params.ledger}`);
   return parts.length > 0 ? `?${parts.join('&')}` : '';
 }
 
@@ -46,6 +48,6 @@ export async function listBetOrders(params: ListBetOrdersParams = {}) {
   return request<BetOrdersResponse>(`/bet-orders${buildQuery(params)}`);
 }
 
-export async function getBetOrder(id: number) {
-  return request<BetOrderInfo>(`/bet-orders/${id}`);
+export async function getBetOrder(id: number, ledger: 'real' | 'simulation' = 'real') {
+  return request<BetOrderInfo>(`/bet-orders/${id}?ledger=${ledger}`);
 }

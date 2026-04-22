@@ -5,7 +5,7 @@ GET /bet-orders/{id}    operator_id
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 
@@ -27,6 +27,7 @@ async def list_bet_orders(
     strategy_id: Optional[int] = Query(None, description=" ID "),
     status: Optional[str] = Query(None, description="筛选状态: settled/pending"),
     account_id: Optional[int] = Query(None, description="筛选账户ID"),
+    ledger: Literal["real", "simulation"] = Query("real", description="ledger: real/simulation"),
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
@@ -41,6 +42,7 @@ async def list_bet_orders(
         strategy_id=strategy_id,
         status=status,
         account_id=account_id,
+        ledger=ledger,
     )
     # 汇总统计（基于完整筛选条件，不分页）
     summary = await bet_order_summary_by_operator(
@@ -51,6 +53,7 @@ async def list_bet_orders(
         strategy_id=strategy_id,
         status=status,
         account_id=account_id,
+        ledger=ledger,
     )
     bet_orders = [row_to_bet_order_info(r) for r in items]
     paged = PagedData[BetOrderInfo](
@@ -68,11 +71,17 @@ async def list_bet_orders(
 @router.get("/bet-orders/{order_id}")
 async def get_bet_order(
     order_id: int,
+    ledger: Literal["real", "simulation"] = Query("real", description="ledger: real/simulation"),
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
     """ operator_id """
-    row = await bet_order_get_by_id(db, order_id=order_id, operator_id=operator["id"])
+    row = await bet_order_get_by_id(
+        db,
+        order_id=order_id,
+        operator_id=operator["id"],
+        ledger=ledger,
+    )
     if row is None:
         raise BizError(4001, "", status_code=404)
     return ApiResponse[BetOrderInfo](data=row_to_bet_order_info(row))

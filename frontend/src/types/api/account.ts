@@ -11,6 +11,11 @@ export type AccountSummaryStatusReason =
   | 'probe_failed_only'
   | 'unsupported_with_probe_failed'
   | (string & {});
+export type AccountFrontendSignal =
+  | 'normal'
+  | 'processing'
+  | 'need_relogin'
+  | 'need_confirm_odds';
 
 export interface AccountCreate {
   account_name: string;
@@ -41,6 +46,8 @@ export interface AccountInfo {
   verification_in_progress?: boolean;
   verification_stale?: boolean;
   summary_status_reason?: AccountSummaryStatusReason | null;
+  frontend_signal?: AccountFrontendSignal;
+  frontend_signal_reason?: string | null;
   // Legacy compatibility field.
   platform_type?: AccountPlatformType | string;
   platform_url?: string;

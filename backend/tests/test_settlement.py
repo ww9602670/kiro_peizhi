@@ -35,6 +35,8 @@ from app.models.db_ops import (
     strategy_create,
     strategy_get_by_id,
     bet_order_update_status,
+    simulation_bet_order_create,
+    simulation_bet_order_update,
 )
 
 
@@ -583,12 +585,6 @@ class TestStrategyPnlUpdate:
         await _create_bet_order(
             db, setup_data, key_code="DX1", amount=1000, odds=19800,
         )
-        #  JND282
-        await db.execute(
-            "UPDATE gambling_accounts SET platform_type='JND282' WHERE id=?",
-            (setup_data["account"]["id"],),
-        )
-        await db.commit()
 
         processor = SettlementProcessor(db, setup_data["operator"]["id"])
         await processor.settle("20240101001", [5, 5, 4], 14, "JND282")
@@ -1420,22 +1416,23 @@ class TestSettleExecutionOrder:
     @pytest.mark.asyncio
     async def test_simulated_settled_before_real(self, db, setup_data):
         """模拟订单先于真实订单结算"""
-        # 创建模拟订单（simulation=1）
+        # 创建模拟订单（新契约：写入 simulation_bet_orders）
         sim_strat = await strategy_create(
             db, operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
             name="sim_strat", type="flat", play_code="DX1",
             base_amount=1000, simulation=1,
         )
-        sim_order = await bet_order_create(
+        sim_order = await simulation_bet_order_create(
             db, idempotent_id="t2-sim-1",
             operator_id=setup_data["operator"]["id"],
             account_id=setup_data["account"]["id"],
             strategy_id=sim_strat["id"],
             issue="20240101001", key_code="DX1",
-            amount=1000, odds=19800, status="pending", simulation=1,
+            platform_type="JND28WEB",
+            amount=1000, odds=19800, status="pending",
         )
-        await bet_order_update_status(
+        await simulation_bet_order_update(
             db, order_id=sim_order["id"],
             operator_id=setup_data["operator"]["id"],
             status="bet_success",
@@ -1450,9 +1447,13 @@ class TestSettleExecutionOrder:
         await processor.settle("20240101001", [5, 5, 5], 15, "JND28WEB")
 
         # 两个订单都应该被结算
-        sim_settled = await bet_order_get_by_id(
-            db, order_id=sim_order["id"],
-            operator_id=setup_data["operator"]["id"],
+        sim_settled = dict(
+            await (
+                await db.execute(
+                    "SELECT * FROM simulation_bet_orders WHERE id=?",
+                    (sim_order["id"],),
+                )
+            ).fetchone()
         )
         real_settled = await bet_order_get_by_id(
             db, order_id=real_order["id"],
@@ -2461,6 +2462,50 @@ class TestTopbetlistAllFail:
         s2 = await bet_order_get_by_id(db, order_id=o2["id"], operator_id=oid)
         assert s1["status"] == "settle_failed"
         assert s2["status"] == "settle_failed"
+
+    @pytest.mark.asyncio
+    async def test_simulation_orders_marked_settle_failed(self, db, setup_data):
+        """妯℃嫙璁㈠崟鍦?settle_failed 鏍囪鏃朵笉搴旇琚紡鎺?"""
+        oid = setup_data["operator"]["id"]
+        processor = SettlementProcessor(db, oid)
+
+        sim_strat = await strategy_create(
+            db,
+            operator_id=oid,
+            account_id=setup_data["account"]["id"],
+            name="sim_fail",
+            type="flat",
+            play_code="DX1",
+            base_amount=1000,
+            simulation=1,
+        )
+        sim_order = await simulation_bet_order_create(
+            db,
+            idempotent_id="t4-sim-fail-1",
+            operator_id=oid,
+            account_id=setup_data["account"]["id"],
+            strategy_id=sim_strat["id"],
+            issue="20240101001",
+            key_code="DX1",
+            platform_type="JND28WEB",
+            amount=1000,
+            odds=19800,
+            status="bet_success",
+        )
+
+        await processor._mark_orders_settle_failed(
+            [{"id": sim_order["id"], "status": "bet_success", "simulation": 1}]
+        )
+
+        settled = dict(
+            await (
+                await db.execute(
+                    "SELECT * FROM simulation_bet_orders WHERE id=?",
+                    (sim_order["id"],),
+                )
+            ).fetchone()
+        )
+        assert settled["status"] == "settle_failed"
 
     @pytest.mark.asyncio
     async def test_settle_api_failed_alert_sent(self, db, setup_data):

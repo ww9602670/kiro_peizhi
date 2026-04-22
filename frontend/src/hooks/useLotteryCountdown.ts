@@ -1,60 +1,225 @@
-/**
- * Lottery countdown hook
- * 
- * Note: For production, recommend using React Query or SWR to ensure single polling source.
- * Current implementation creates separate polling instances per component.
- */
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { fetchCurrentInstall } from '@/api/lottery';
-import type { CurrentInstall } from '@/types/api/lottery';
+import { isApiError } from '@/api/request';
+import { DEFAULT_CURRENT_INSTALL, type CurrentInstall } from '@/types/api/lottery';
 
-export function useLotteryCountdown() {
-  const [data, setData] = useState<CurrentInstall | null>(null);
-  const [closeCountdown, setCloseCountdown] = useState(0);
-  const [openCountdown, setOpenCountdown] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-  const [lastUpdateTime, setLastUpdateTime] = useState<Date | null>(null);
-  
-  // Fetch latest data every 5 seconds
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const resp = await fetchCurrentInstall();
-        const result = resp.data;
-        if (!result) {
-          setError('数据为空');
-          return;
-        }
-        setData(result);
-        setCloseCountdown(result.close_countdown_sec);
-        setOpenCountdown(result.open_countdown_sec);
-        setError(null);
-        setLastUpdateTime(new Date());
-      } catch (err) {
-        console.error('Failed to fetch install info:', err);
-        setError('数据延迟');
-      }
-    };
-    
-    fetchData();
-    const interval = setInterval(fetchData, 5000);
-    return () => clearInterval(interval);
-  }, []);
-  
-  // Update countdown every second (clamp to non-negative)
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setCloseCountdown(prev => Math.max(0, prev - 1));
-      setOpenCountdown(prev => Math.max(0, prev - 1));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-  
-  return {
-    data,
-    closeCountdown,
-    openCountdown,
-    error,
-    lastUpdateTime,
+const RETRY_INTERVAL_MS = 5000;
+const POST_DRAW_REFRESH_DELAY_MS = 30000;
+const TICK_INTERVAL_MS = 1000;
+
+export interface UseLotteryCountdownOptions {
+  platformType?: string;
+}
+
+interface CountdownSnapshot {
+  data: CurrentInstall | null;
+  closeCountdown: number;
+  openCountdown: number;
+  error: string | null;
+  lastUpdateTime: Date | null;
+}
+
+type Listener = (snapshot: CountdownSnapshot) => void;
+
+class CountdownStore {
+  private snapshot: CountdownSnapshot = {
+    data: null,
+    closeCountdown: 0,
+    openCountdown: 0,
+    error: null,
+    lastUpdateTime: null,
   };
+
+  private readonly listeners = new Set<Listener>();
+  private readonly platformType: string;
+  private tickHandle: ReturnType<typeof setInterval> | null = null;
+  private refreshHandle: ReturnType<typeof setTimeout> | null = null;
+  private started = false;
+  private fetching = false;
+  private drawRefreshScheduled = false;
+
+  constructor(platformType: string) {
+    this.platformType = platformType;
+  }
+
+  destroy() {
+    if (this.tickHandle) {
+      clearInterval(this.tickHandle);
+      this.tickHandle = null;
+    }
+    if (this.refreshHandle) {
+      clearTimeout(this.refreshHandle);
+      this.refreshHandle = null;
+    }
+    this.listeners.clear();
+    this.started = false;
+    this.fetching = false;
+    this.drawRefreshScheduled = false;
+    this.snapshot = {
+      data: null,
+      closeCountdown: 0,
+      openCountdown: 0,
+      error: null,
+      lastUpdateTime: null,
+    };
+  }
+
+  subscribe(listener: Listener) {
+    this.listeners.add(listener);
+    listener(this.snapshot);
+    if (!this.started) {
+      this.start();
+    }
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private emit() {
+    for (const listener of this.listeners) {
+      listener(this.snapshot);
+    }
+  }
+
+  private setSnapshot(nextSnapshot: CountdownSnapshot) {
+    this.snapshot = nextSnapshot;
+    this.emit();
+  }
+
+  private hasUsableSnapshot(data: CurrentInstall | null): boolean {
+    if (!data) {
+      return false;
+    }
+
+    if (data.installments?.trim()) {
+      return true;
+    }
+
+    if (data.pre_installments?.trim()) {
+      return true;
+    }
+
+    return data.close_countdown_sec > 0 || data.open_countdown_sec > 0;
+  }
+
+  private start() {
+    this.started = true;
+    this.tickHandle = setInterval(() => {
+      const nextClose = Math.max(0, this.snapshot.closeCountdown - 1);
+      const nextOpen = Math.max(0, this.snapshot.openCountdown - 1);
+      const openReachedZero = this.snapshot.openCountdown > 0 && nextOpen === 0;
+
+      if (
+        nextClose !== this.snapshot.closeCountdown ||
+        nextOpen !== this.snapshot.openCountdown
+      ) {
+        this.setSnapshot({
+          ...this.snapshot,
+          closeCountdown: nextClose,
+          openCountdown: nextOpen,
+        });
+      }
+
+      if (openReachedZero && !this.fetching && !this.drawRefreshScheduled) {
+        this.scheduleFetch(POST_DRAW_REFRESH_DELAY_MS);
+        this.drawRefreshScheduled = true;
+      }
+    }, TICK_INTERVAL_MS);
+
+    void this.fetchNow();
+  }
+
+  private scheduleFetch(delayMs: number) {
+    if (this.refreshHandle) {
+      clearTimeout(this.refreshHandle);
+    }
+    this.refreshHandle = setTimeout(() => {
+      this.refreshHandle = null;
+      void this.fetchNow();
+    }, delayMs);
+  }
+
+  private async fetchNow() {
+    if (this.fetching) {
+      return;
+    }
+
+    this.fetching = true;
+    this.drawRefreshScheduled = false;
+
+    try {
+      const response = await fetchCurrentInstall(this.platformType);
+      const nextInstall = response.data ?? DEFAULT_CURRENT_INSTALL;
+      this.setSnapshot({
+        data: nextInstall,
+        closeCountdown: nextInstall.close_countdown_sec,
+        openCountdown: nextInstall.open_countdown_sec,
+        error: null,
+        lastUpdateTime: new Date(),
+      });
+      if (!this.hasUsableSnapshot(nextInstall)) {
+        this.scheduleFetch(RETRY_INTERVAL_MS);
+      } else if (nextInstall.open_countdown_sec <= 0) {
+        // Usable snapshot already at zero-countdown: draw has already finished.
+        // Schedule the post-draw refresh so the UI can advance to the next issue
+        // instead of freezing on a stale zero-countdown snapshot.
+        this.scheduleFetch(POST_DRAW_REFRESH_DELAY_MS);
+        this.drawRefreshScheduled = true;
+      }
+    } catch (err) {
+      const message = isApiError(err) ? err.message || '数据延迟' : '数据延迟';
+      this.setSnapshot({
+        ...this.snapshot,
+        error: message,
+      });
+      this.scheduleFetch(RETRY_INTERVAL_MS);
+    } finally {
+      this.fetching = false;
+    }
+  }
+}
+
+const storeRegistry = new Map<string, CountdownStore>();
+
+function getStore(platformType: string): CountdownStore {
+  const normalizedPlatformType = platformType.trim().toUpperCase() || 'JND28WEB';
+  let store = storeRegistry.get(normalizedPlatformType);
+  if (!store) {
+    store = new CountdownStore(normalizedPlatformType);
+    storeRegistry.set(normalizedPlatformType, store);
+  }
+  return store;
+}
+
+export function useLotteryCountdown(options?: UseLotteryCountdownOptions) {
+  const platformType = options?.platformType ?? 'JND28WEB';
+  const [snapshot, setSnapshot] = useState<CountdownSnapshot>({
+    data: null,
+    closeCountdown: 0,
+    openCountdown: 0,
+    error: null,
+    lastUpdateTime: null,
+  });
+
+  useEffect(() => {
+    const store = getStore(platformType);
+    return store.subscribe(setSnapshot);
+  }, [platformType]);
+
+  return {
+    data: snapshot.data,
+    closeCountdown: snapshot.closeCountdown,
+    openCountdown: snapshot.openCountdown,
+    closeTimestamp: snapshot.closeCountdown,
+    openTimestamp: snapshot.openCountdown,
+    error: snapshot.error,
+    lastUpdateTime: snapshot.lastUpdateTime,
+  };
+}
+
+export function __resetLotteryCountdownStoresForTest() {
+  for (const store of storeRegistry.values()) {
+    store.destroy();
+  }
+  storeRegistry.clear();
 }

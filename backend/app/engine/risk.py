@@ -179,6 +179,11 @@ class RiskController:
         if not account:
             return RiskCheckResult(passed=False, reason="")
 
+        # 模拟模式绕过真实余额不足风控，但保留其余风控门禁。
+        if signal.simulation:
+            self._balance_fail_count[self.account_id] = 0
+            return RiskCheckResult(passed=True)
+
         balance = account.get("balance", 0)
         if balance < signal.amount:
             # 
@@ -190,8 +195,11 @@ class RiskController:
                 await self.alert_service.send(
                     operator_id=self.operator_id,
                     alert_type="balance_low",
-                    title="3",
-                    detail=f"={balance}={signal.amount}",
+                    title="Balance check failed 3 times",
+                    detail=(
+                        f"available_balance={balance}, required_amount={signal.amount}; "
+                        "all running strategies for this account were paused"
+                    ),
                     account_id=self.account_id,
                 )
                 await self._pause_all_strategies()
@@ -229,8 +237,11 @@ class RiskController:
             await self.alert_service.send(
                 operator_id=self.operator_id,
                 alert_type="platform_limit",
-                title=f"{signal.amount} > {platform_limit}",
-                detail=f"={signal.key_code}={platform_limit}",
+                title="Bet amount exceeds platform limit",
+                detail=(
+                    f"key_code={signal.key_code}, amount={signal.amount}, "
+                    f"platform_limit={platform_limit}"
+                ),
                 account_id=self.account_id,
             )
             return RiskCheckResult(
@@ -345,8 +356,11 @@ class RiskController:
             await self.alert_service.send(
                 operator_id=self.operator_id,
                 alert_type="stop_loss",
-                title=f" {strategy['name']} ={-daily_pnl}={stop_loss}",
-                detail=f"strategy_id={signal.strategy_id}daily_pnl={daily_pnl}",
+                title=f"Stop-loss triggered: {strategy['name']}",
+                detail=(
+                    f"strategy_id={signal.strategy_id}, daily_pnl={daily_pnl}, "
+                    f"stop_loss_threshold=-{stop_loss}"
+                ),
                 account_id=self.account_id,
             )
             return RiskCheckResult(
@@ -379,8 +393,11 @@ class RiskController:
             await self.alert_service.send(
                 operator_id=self.operator_id,
                 alert_type="take_profit",
-                title=f" {strategy['name']} ={daily_pnl}={take_profit}",
-                detail=f"strategy_id={signal.strategy_id}daily_pnl={daily_pnl}",
+                title=f"Take-profit reached: {strategy['name']}",
+                detail=(
+                    f"strategy_id={signal.strategy_id}, daily_pnl={daily_pnl}, "
+                    f"take_profit_threshold={take_profit}"
+                ),
                 account_id=self.account_id,
             )
             return RiskCheckResult(

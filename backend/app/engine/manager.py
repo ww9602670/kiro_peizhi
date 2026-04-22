@@ -21,10 +21,11 @@ from app.engine.reconciler import Reconciler
 from app.engine.risk import RiskController
 from app.engine.session import SessionManager
 from app.engine.settlement import SettlementProcessor
+from app.engine.shared_market_runtime import SharedMarketRuntime
 from app.engine.strategy_runner import StrategyRunner
 from app.engine.worker import AccountWorker, StrategyRuntimeProfile
 from app.models import db_ops
-from app.utils.strategy_timing import normalize_direction_keys
+from app.utils.strategy_timing import WAVE_STRATEGY_TYPES, normalize_direction_keys
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ def _is_dw3_group_token(token: str) -> bool:
 
 def make_runtime_key(account_id: int, platform_type: str) -> RuntimeKey:
     return account_id, (platform_type or "JND28WEB").upper()
+
+
+def make_shared_market_owner_key(account_id: int, platform_type: str) -> str:
+    return f"{account_id}:{(platform_type or 'JND28WEB').upper()}"
 
 
 def _is_truthy_flag(value: object) -> bool:
@@ -209,6 +214,7 @@ class EngineManager:
         self.session_store = session_store or InMemorySessionStore()
         self.registry = worker_registry or InMemoryWorkerRegistry()
         self.alert_service = alert_service or AlertService(db)
+        self.shared_market_runtime = SharedMarketRuntime(db=self.db)
         self._account_fail_counts: dict[int, int] = {}
         self._account_consecutive_bet_fails: dict[int, int] = {}
         self._health_check_task: Optional[asyncio.Task] = None
@@ -253,7 +259,15 @@ class EngineManager:
             platform_type=runtime_key[1],
             db=self.db,
         )
-        poller = IssuePoller(adapter=adapter, rate_limiter=rate_limiter)
+        shared_owner_key = make_shared_market_owner_key(account_id, runtime_key[1])
+        poller = IssuePoller(
+            adapter=adapter,
+            rate_limiter=rate_limiter,
+            shared_market_runtime=self.shared_market_runtime,
+            shared_market_owner_key=shared_owner_key,
+            shared_market_platform_type=runtime_key[1],
+            shared_market_platform_url=platform_url or getattr(adapter, "base_url", None),
+        )
         risk = RiskController(
             db=self.db,
             alert_service=self.alert_service,
@@ -274,14 +288,12 @@ class EngineManager:
             db=self.db,
             operator_id=operator_id,
             account_id=account_id,
-            platform_type=runtime_key[1],
         )
         reconciler = Reconciler(
             db=self.db,
             adapter=adapter,
             alert_service=self.alert_service,
             operator_id=operator_id,
-            platform_type=runtime_key[1],
         )
 
         strategy_runners, strategy_profiles = self._build_strategy_snapshot(strategies)
@@ -303,7 +315,11 @@ class EngineManager:
         )
 
         await self.registry.register(runtime_key, worker)
-        await worker.start()
+        try:
+            await worker.start()
+        except Exception:
+            await self.registry.unregister(runtime_key)
+            raise
         return worker
 
     async def _hot_update_worker(
@@ -314,7 +330,11 @@ class EngineManager:
         if not strategies:
             return worker
         next_runners, next_profiles = self._build_strategy_snapshot(strategies)
-        worker.stage_strategy_snapshot(next_runners, next_profiles)
+        worker.replace_strategy_snapshot(
+            next_runners,
+            next_profiles,
+            apply_next_issue_only=False,
+        )
         return worker
 
     async def stop_worker(self, account_id: int, platform_type: str | None = None) -> bool:
@@ -350,6 +370,7 @@ class EngineManager:
 
         if has_unsettled:
             async def _on_complete(_: int, __: str = platform_type) -> None:
+                await self._release_shared_market_owner(worker)
                 await self.registry.unregister(registry_key)
                 await self.session_store.delete(registry_key)
 
@@ -358,6 +379,7 @@ class EngineManager:
         else:
             await self.registry.unregister(registry_key)
             await worker.stop()
+            await self._release_shared_market_owner(worker)
             await self.session_store.delete(registry_key)
         return True
 
@@ -367,6 +389,7 @@ class EngineManager:
         for runtime_key, worker in workers.items():
             try:
                 await worker.stop()
+                await self._release_shared_market_owner(worker)
                 await self.registry.unregister(runtime_key)
             except Exception:
                 logger.exception("failed to stop worker key=%s", runtime_key)
@@ -480,15 +503,27 @@ class EngineManager:
             await asyncio.gather(
                 *(self._stop_worker_safe(runtime_key, worker) for runtime_key, worker in workers.items())
             )
+        await self.shared_market_runtime.shutdown()
         logger.info("EngineManager stopped_workers=%d", len(workers))
 
     async def _stop_worker_safe(self, runtime_key: RuntimeKey, worker: AccountWorker) -> None:
         try:
             await worker.stop()
+            await self._release_shared_market_owner(worker)
             await self.registry.unregister(runtime_key)
             await self.session_store.delete(runtime_key)
         except Exception:
             logger.exception("failed to stop worker key=%s", runtime_key)
+
+    async def _release_shared_market_owner(self, worker: AccountWorker | None) -> None:
+        poller = getattr(worker, "poller", None)
+        owner_key = str(getattr(poller, "shared_market_owner_key", "") or "")
+        if not owner_key:
+            return
+        try:
+            await self.shared_market_runtime.release_owner(owner_key)
+        except Exception:
+            logger.exception("shared collector release failed owner=%s", owner_key)
 
     def _build_runtime_profile(
         self,
@@ -584,7 +619,7 @@ class EngineManager:
                     "key_codes": key_codes,
                     "base_amount": base_amount,
                 }
-            elif strategy_type in ("martin", "red_wave_double_martin"):
+            elif strategy_type == "martin" or strategy_type in WAVE_STRATEGY_TYPES:
                 if not seq_values:
                     logger.warning("missing martin_sequence strategy_id=%s", strategy_data.get("id"))
                     return None

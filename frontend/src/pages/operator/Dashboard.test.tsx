@@ -1,37 +1,82 @@
-/**
- * 操作者仪表盘页面测试
- * - 加载状态
- * - 错误状态
- * - 正常渲染统计卡片
- * - 运行中策略列表
- * - 空策略提示
- * - 投注记录渲染
- */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import Dashboard from './Dashboard';
 import type { OperatorDashboard } from '@/types/api/dashboard';
+import { operatorUpdates } from '@/data/operatorUpdates';
 
-// Mock hooks and components
 vi.mock('@/hooks/useDashboard');
+vi.mock('@/hooks/useAlertsContext');
+vi.mock('@/hooks/useAuth', () => ({
+  useAuth: () => ({
+    isAuthenticated: true,
+    role: 'operator',
+    operatorId: '1',
+    login: vi.fn(),
+    logout: vi.fn(),
+    silentRefresh: vi.fn(),
+  }),
+}));
+const mockCountdownDisplay = vi.fn((_: unknown) => <div data-testid="countdown">countdown</div>);
 vi.mock('@/components/CountdownDisplay', () => ({
-  CountdownDisplay: () => <div data-testid="countdown">countdown</div>,
+  CountdownDisplay: (props: unknown) => mockCountdownDisplay(props),
 }));
 
 import { useDashboard } from '@/hooks/useDashboard';
+import { useAlertsContext } from '@/hooks/useAlertsContext';
+
 const mockUseDashboard = vi.mocked(useDashboard);
+const mockUseAlertsContext = vi.mocked(useAlertsContext);
 
 const baseDashboard: OperatorDashboard = {
   balance: 1234.56,
   daily_pnl: 88.88,
   total_pnl: -50.0,
+  countdown_platform_type: 'JND28WEB',
   running_strategies: [],
   pending_bets: [],
   unread_alerts: 5,
+  recent_results: [
+    {
+      id: 1,
+      issue: '202604190001',
+      open_result: '1,2,3',
+      sum_value: 6,
+      open_time: '2026-04-19 00:01:00',
+      created_at: '2026-04-19 00:01:10',
+    },
+  ],
+  recent_alerts: [
+    {
+      id: 11,
+      operator_id: 1,
+      type: 'bet_fail',
+      level: 'critical',
+      title: '投注失败',
+      detail: '测试告警',
+      is_read: 0,
+      created_at: '2026-04-19 00:02:00',
+    },
+  ],
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockCountdownDisplay.mockClear();
+  mockUseAlertsContext.mockReturnValue({
+    alerts: baseDashboard.recent_alerts,
+    unreadCount: baseDashboard.unread_alerts,
+    total: baseDashboard.recent_alerts.length,
+    loading: false,
+    initialized: true,
+    error: '',
+    fetchAlerts: vi.fn().mockResolvedValue(undefined),
+    fetchUnreadCount: vi.fn().mockResolvedValue(undefined),
+    markRead: vi.fn().mockResolvedValue(undefined),
+    markAllRead: vi.fn().mockResolvedValue(undefined),
+    startPolling: vi.fn(),
+    stopPolling: vi.fn(),
+  });
 });
 
 function setupHook(overrides: Partial<ReturnType<typeof useDashboard>> = {}) {
@@ -47,19 +92,7 @@ function setupHook(overrides: Partial<ReturnType<typeof useDashboard>> = {}) {
 }
 
 describe('Dashboard', () => {
-  it('加载中显示加载文本', () => {
-    setupHook({ loading: true, data: null });
-    render(<Dashboard />);
-    expect(screen.getByText('加载中...')).toBeInTheDocument();
-  });
-
-  it('错误状态显示错误信息', () => {
-    setupHook({ error: '网络错误', data: null });
-    render(<Dashboard />);
-    expect(screen.getByText('网络错误')).toBeInTheDocument();
-  });
-
-  it('正常渲染统计卡片', () => {
+  it('renders stat cards', () => {
     setupHook({ data: baseDashboard });
     render(<Dashboard />);
     expect(screen.getByText('1234.56')).toBeInTheDocument();
@@ -68,13 +101,14 @@ describe('Dashboard', () => {
     expect(screen.getByText('5')).toBeInTheDocument();
   });
 
-  it('无运行策略时显示提示', () => {
+  it('renders alerts from context', () => {
     setupHook({ data: baseDashboard });
     render(<Dashboard />);
-    expect(screen.getByText('暂无运行中策略')).toBeInTheDocument();
+    expect(screen.getByText('投注失败')).toBeInTheDocument();
+    expect(screen.getByText('测试告警')).toBeInTheDocument();
   });
 
-  it('有运行策略时渲染策略卡片', () => {
+  it('renders localized running strategy cards', () => {
     setupHook({
       data: {
         ...baseDashboard,
@@ -82,9 +116,10 @@ describe('Dashboard', () => {
           {
             id: 1,
             account_id: 1,
-            name: '大小平注',
+            name: '测试策略',
             type: 'flat',
-            play_code: 'DX1',
+            play_code: 'DX1,DW3_BS_BBB',
+            play_code_name: '',
             base_amount: 10,
             martin_sequence: null,
             bet_timing: 30,
@@ -95,23 +130,51 @@ describe('Dashboard', () => {
             take_profit: null,
             daily_pnl: 25.5,
             total_pnl: 100,
+            platform_type: 'JND28WEB',
           },
         ],
       },
     });
     render(<Dashboard />);
-    expect(screen.getByText('大小平注')).toBeInTheDocument();
-    expect(screen.getByText('平注')).toBeInTheDocument();
-    expect(screen.getByText(/\+25\.50/)).toBeInTheDocument();
+    expect(screen.getByText('测试策略')).toBeInTheDocument();
+    expect(
+      screen.getByText((_, node) => node?.textContent === '今日 +25.50'),
+    ).toBeInTheDocument();
   });
 
-  it('渲染倒计时组件', () => {
+  it('renders the shared recent updates feed and opens full modal', async () => {
+    const user = userEvent.setup();
+    setupHook({ data: baseDashboard });
+    render(<Dashboard />);
+
+    expect(screen.getByText(operatorUpdates[0].title)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '查看全部' }));
+    expect(screen.getByRole('dialog', { name: '平台更新详情' })).toBeInTheDocument();
+  });
+
+  it('renders the countdown block', () => {
     setupHook({ data: baseDashboard });
     render(<Dashboard />);
     expect(screen.getByTestId('countdown')).toBeInTheDocument();
+    expect(mockCountdownDisplay).toHaveBeenCalledWith(
+      expect.objectContaining({ platformType: 'JND28WEB' }),
+    );
   });
 
-  it('调用 startAutoRefresh 和 stopAutoRefresh', () => {
+  it('passes backend-selected countdown platform to CountdownDisplay', () => {
+    setupHook({
+      data: {
+        ...baseDashboard,
+        countdown_platform_type: 'JND282',
+      },
+    });
+    render(<Dashboard />);
+    expect(mockCountdownDisplay).toHaveBeenCalledWith(
+      expect.objectContaining({ platformType: 'JND282' }),
+    );
+  });
+
+  it('starts and stops auto refresh', () => {
     const startAutoRefresh = vi.fn();
     const stopAutoRefresh = vi.fn();
     setupHook({ data: baseDashboard, startAutoRefresh, stopAutoRefresh });

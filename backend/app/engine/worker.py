@@ -1,4 +1,4 @@
-"""AccountWorker  
+﻿"""AccountWorker  
 
 Phase 10.1:  AccountWorker EngineManager 
 
@@ -29,7 +29,7 @@ from typing import Optional
 
 import aiosqlite
 
-from app.engine.adapters.base import InstallInfo, PlatformAdapter
+from app.engine.adapters.base import InstallInfo, PlatformAdapter, RemoteLoginRequired
 from app.engine.alert import AlertService
 from app.engine.executor import BetExecutor, ExecutionReport
 from app.engine.poller import IssuePoller
@@ -44,7 +44,9 @@ from app.utils.strategy_timing import (
     BET_TIMING_MAX,
     BET_TIMING_MIN,
     SAFE_CLOSE_THRESHOLD,
+    WAVE_STRATEGY_TYPES,
 )
+from app.utils.logger import log_countdown_validation
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +60,22 @@ SKIP_THRESHOLD = SAFE_CLOSE_THRESHOLD
 RESTART_DELAYS = [5, 10, 30]
 MAX_RESTART_FAILURES = 5
 
-# 倒计时驱动结算配置
+# 鍊掕鏃堕┍鍔ㄧ粨绠楅厤缃?
 SETTLEMENT_WAIT_SECONDS_DEFAULT = 30
 SETTLEMENT_WAIT_SECONDS_MIN = 10
 SETTLEMENT_WAIT_SECONDS_MAX = 120
 
-# 结算数据拉取重试
+# 缁撶畻鏁版嵁鎷夊彇閲嶈瘯
 SETTLE_DATA_RETRY_MAX = 6
 SETTLE_DATA_RETRY_INTERVAL = 5
 
-# GetCurrentInstall 网络重试
+# GetCurrentInstall 缃戠粶閲嶈瘯
 API_RETRY_DELAYS = [5, 10, 30]
 API_RETRY_MAX = 3
 
-# 跨进程互斥锁
+# 璺ㄨ繘绋嬩簰鏂ラ攣
 LOCK_TTL_MINUTES = 5
-LOCK_RENEW_INTERVAL = 60  # 秒
+LOCK_RENEW_INTERVAL = 60  # 绉?
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,10 @@ class IssueExecutionPlan:
     groups: list[TimingGroup]
     executed_strategy_ids: set[int] = field(default_factory=set)
     skipped_strategy_reasons: dict[int, str] = field(default_factory=dict)
+
+
+class WorkerStartupError(RuntimeError):
+    """Raised when a worker cannot become ready during startup."""
 
 
 def _parse_result(result_str: str) -> tuple[list[int], int]:
@@ -196,15 +202,58 @@ class AccountWorker:
         self._task: Optional[asyncio.Task] = None
         self._restart_count: int = 0
         self._lock_token: Optional[str] = None
+        self._startup_future: Optional[asyncio.Future[None]] = None
+        self._startup_ready: bool = False
 
-        # 结算模式
+        # 缁撶畻妯″紡
         self.settling_only: bool = False
         self._settling_deadline: float | None = None
-        self._on_settle_complete: Optional[asyncio.coroutines] = None  # 结算完成回调
+        self._on_settle_complete: Optional[asyncio.coroutines] = None  # 缁撶畻瀹屾垚鍥炶皟
 
     # ------------------------------------------------------------------
     # 
     # ------------------------------------------------------------------
+
+    def _resolve_startup_success(self) -> None:
+        if self._startup_future and not self._startup_future.done():
+            self._startup_future.set_result(None)
+        self._startup_ready = True
+
+    def _resolve_startup_failure(self, exc: Exception) -> None:
+        if self._startup_future and not self._startup_future.done():
+            self._startup_future.set_exception(exc)
+
+    def _iter_known_strategy_ids(self) -> set[int]:
+        staged_ids = set((self._next_issue_strategies or {}).keys())
+        return set(self.strategies.keys()) | staged_ids
+
+    async def _persist_strategy_statuses(self, status: str) -> None:
+        for strategy_id in sorted(self._iter_known_strategy_ids()):
+            try:
+                await strategy_update_status(
+                    self.db,
+                    strategy_id=strategy_id,
+                    operator_id=self.operator_id,
+                    status=status,
+                )
+            except Exception:
+                logger.exception(
+                    "strategy status persist failed strategy_id=%d account_id=%d status=%s",
+                    strategy_id,
+                    self.account_id,
+                    status,
+                )
+
+    async def _handle_startup_failure(self, exc: Exception) -> None:
+        self.status = "stopped"
+        self.running = False
+        await self._persist_strategy_statuses("stopped")
+        self._resolve_startup_failure(exc)
+
+    async def _handle_terminal_worker_error(self) -> None:
+        self.status = "error"
+        self.running = False
+        await self._persist_strategy_statuses("error")
 
     def add_strategy(
         self,
@@ -267,6 +316,68 @@ class AccountWorker:
         self._next_issue_profiles = dict(profiles)
         self._profiles_version += 1
 
+    def replace_strategy_snapshot(
+        self,
+        strategies: dict[int, StrategyRunner],
+        profiles: dict[int, StrategyRuntimeProfile],
+        *,
+        apply_next_issue_only: bool = True,
+    ) -> None:
+        """Replace the worker strategy snapshot, optionally taking effect in the current issue."""
+        if apply_next_issue_only:
+            self.stage_strategy_snapshot(strategies, profiles)
+            return
+
+        previous_plan = self._issue_execution_plan
+        executed_ids = (
+            set(previous_plan.executed_strategy_ids)
+            if previous_plan is not None
+            else set()
+        )
+        skipped_reasons = (
+            dict(previous_plan.skipped_strategy_reasons)
+            if previous_plan is not None
+            else {}
+        )
+
+        self.strategies = dict(strategies)
+        self.strategy_profiles = dict(profiles)
+        self._next_issue_strategies = None
+        self._next_issue_profiles = None
+        self._profiles_version += 1
+
+        if previous_plan is None:
+            return
+
+        rebuilt_plan = self._build_issue_execution_plan(previous_plan.issue)
+        active_strategy_ids = {
+            strategy_id
+            for group in rebuilt_plan.groups
+            for strategy_id in group.strategy_ids
+        }
+        rebuilt_plan.executed_strategy_ids = {
+            strategy_id
+            for strategy_id in executed_ids
+            if strategy_id in active_strategy_ids
+        }
+        rebuilt_plan.skipped_strategy_reasons = {
+            strategy_id: reason
+            for strategy_id, reason in skipped_reasons.items()
+            if strategy_id in active_strategy_ids
+        }
+
+        for group in rebuilt_plan.groups:
+            group.strategy_ids = [
+                strategy_id
+                for strategy_id in group.strategy_ids
+                if strategy_id not in rebuilt_plan.executed_strategy_ids
+                and strategy_id not in rebuilt_plan.skipped_strategy_reasons
+            ]
+            if not group.strategy_ids:
+                group.executed = True
+
+        self._issue_execution_plan = rebuilt_plan
+
     def _apply_staged_snapshot(self) -> None:
         if self._next_issue_strategies is None and self._next_issue_profiles is None:
             return
@@ -303,6 +414,10 @@ class AccountWorker:
         self._apply_staged_snapshot()
         self._issue_execution_plan = self._build_issue_execution_plan(issue)
         return self._issue_execution_plan
+
+    def _can_join_current_issue(self, install: InstallInfo) -> bool:
+        """Return whether a newly started strategy may still join the current issue."""
+        return install.state == 1 and install.close_countdown_sec > SKIP_THRESHOLD
 
     def _remove_strategy_from_issue_plan(self, strategy_id: int) -> None:
         if self._issue_execution_plan is None:
@@ -356,6 +471,7 @@ class AccountWorker:
         install: InstallInfo,
         *,
         bet_timing: int,
+        strategy_ids: list[int] | None = None,
     ) -> tuple[InstallInfo, str | None]:
         """Refresh the current issue snapshot before submitting one timing group."""
         try:
@@ -367,62 +483,103 @@ class AccountWorker:
                 self.account_id,
                 bet_timing,
             )
+            log_countdown_validation(
+                operator_id=self.operator_id,
+                account_id=self.account_id,
+                issue=install.issue,
+                phase="pre_submit",
+                allowed=False,
+                state=install.state,
+                close_countdown_sec=install.close_countdown_sec,
+                platform_type=self._platform_type,
+                expected_issue=install.issue,
+                current_issue=install.issue,
+                bet_timing=bet_timing,
+                reason="precheck_failed",
+                strategy_ids=sorted(strategy_ids or []),
+            )
             return install, "precheck_failed"
 
+        reason: str | None = None
         if refreshed.issue != install.issue:
-            return refreshed, "issue_changed"
-        if refreshed.state != 1:
-            return refreshed, "state_not_open"
-        if refreshed.close_countdown_sec <= SKIP_THRESHOLD:
-            return refreshed, "remaining_too_small"
-        if refreshed.close_countdown_sec > bet_timing:
-            return refreshed, "window_not_open"
-        return refreshed, None
+            reason = "issue_changed"
+        elif refreshed.state != 1:
+            reason = "state_not_open"
+        elif refreshed.close_countdown_sec <= SKIP_THRESHOLD:
+            reason = "remaining_too_small"
+        elif refreshed.close_countdown_sec > bet_timing:
+            reason = "window_not_open"
+
+        log_countdown_validation(
+            operator_id=self.operator_id,
+            account_id=self.account_id,
+            issue=install.issue,
+            phase="pre_submit",
+            allowed=reason is None,
+            state=refreshed.state,
+            close_countdown_sec=refreshed.close_countdown_sec,
+            platform_type=self._platform_type,
+            expected_issue=install.issue,
+            current_issue=refreshed.issue,
+            bet_timing=bet_timing,
+            reason=reason,
+            strategy_ids=sorted(strategy_ids or []),
+        )
+        return refreshed, reason
 
     async def _has_unsettled_orders(self) -> bool:
-        """检查是否有未结算订单（bet_success 或 pending_match）"""
+        """Return whether this worker still has unsettled orders in either ledger."""
         row = await (
             await self.db.execute(
-                "SELECT COUNT(*) as cnt FROM bet_orders "
-                "WHERE account_id=? AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match')",
-                (self.account_id, self.operator_id),
+                "SELECT ("
+                "  SELECT COUNT(*) FROM bet_orders "
+                "  WHERE account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match')"
+                ") + ("
+                "  SELECT COUNT(*) FROM simulation_bet_orders "
+                "  WHERE account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match')"
+                ") AS cnt",
+                (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
         ).fetchone()
         return (row["cnt"] if row else 0) > 0
 
     async def enter_settling_mode(self) -> None:
-        """进入结算模式：停止投注，继续结算
-
-        设置 settling_only 标志，清空策略列表，设置 10 分钟超时。
-        主循环将跳过投注阶段，仅执行结算和对账。
-        """
+        """Enter settling mode and keep the worker alive for settlement catch-up."""
         self.settling_only = True
         self.status = "settling"
-        self._settling_deadline = time.time() + 600  # 10 分钟超时
+        self._settling_deadline = time.time() + 600  # 10 鍒嗛挓瓒呮椂
 
-        # 清空策略，防止产生投注信号
+        # 娓呯┖绛栫暐锛岄槻姝骇鐢熸姇娉ㄤ俊鍙?
         self.strategies.clear()
         self.strategy_profiles.clear()
         self._issue_execution_plan = None
         self._next_issue_profiles = None
         self._next_issue_strategies = None
 
-        # 记录日志：待结算期号和订单数量
+        # 璁板綍鏃ュ織锛氬緟缁撶畻鏈熷彿鍜岃鍗曟暟閲?
         try:
             rows = await (
                 await self.db.execute(
-                    "SELECT issue, COUNT(*) as cnt FROM bet_orders "
-                    "WHERE account_id=? AND operator_id=? "
-                    "AND status IN ('bet_success', 'pending_match') "
-                    "GROUP BY issue",
-                    (self.account_id, self.operator_id),
+                    "SELECT issue, SUM(cnt) as cnt FROM ("
+                    "  SELECT issue, COUNT(*) as cnt FROM bet_orders "
+                    "  WHERE account_id=? AND operator_id=? "
+                    "  AND status IN ('bet_success', 'pending_match') "
+                    "  GROUP BY issue "
+                    "  UNION ALL "
+                    "  SELECT issue, COUNT(*) as cnt FROM simulation_bet_orders "
+                    "  WHERE account_id=? AND operator_id=? "
+                    "  AND status IN ('bet_success', 'pending_match') "
+                    "  GROUP BY issue"
+                    ") GROUP BY issue",
+                    (self.account_id, self.operator_id, self.account_id, self.operator_id),
                 )
             ).fetchall()
             issues_info = {r["issue"]: r["cnt"] for r in rows}
             total = sum(issues_info.values())
             logger.info(
-                "Worker 进入结算模式 account_id=%d 待结算期号=%s 总订单数=%d 超时=%ds",
+                "Worker 杩涘叆缁撶畻妯″紡 account_id=%d 寰呯粨绠楁湡鍙?%s 鎬昏鍗曟暟=%d 瓒呮椂=%ds",
                 self.account_id,
                 issues_info,
                 total,
@@ -430,7 +587,7 @@ class AccountWorker:
             )
         except Exception:
             logger.exception(
-                "结算模式日志记录异常 account_id=%d", self.account_id,
+                "缁撶畻妯″紡鏃ュ織璁板綍寮傚父 account_id=%d", self.account_id,
             )
 
     # ------------------------------------------------------------------
@@ -438,31 +595,36 @@ class AccountWorker:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """ Worker （含抢锁）"""
+        """Start the worker after acquiring the runtime lock."""
         if self.running:
             logger.warning("Worker account_id=%d", self.account_id)
             return
 
-        # 抢锁
+        # 鎶㈤攣
         acquired = await self._acquire_lock()
         if not acquired:
             await self.alert_service.send(
                 operator_id=self.operator_id,
                 alert_type="worker_lock_conflict",
-                title=f"Worker 抢锁冲突 account_id={self.account_id}",
-                detail="已有活跃锁，拒绝启动",
+                title=f"Worker 鎶㈤攣鍐茬獊 account_id={self.account_id}",
+                detail="宸叉湁娲昏穬閿侊紝鎷掔粷鍚姩",
                 account_id=self.account_id,
             )
             logger.error(
-                "Worker 启动失败（锁冲突） account_id=%d",
+                "Worker 鍚姩澶辫触锛堥攣鍐茬獊锛?account_id=%d",
                 self.account_id,
             )
-            return
+            raise WorkerStartupError(
+                f"worker lock conflict account_id={self.account_id} platform={self._platform_type}"
+            )
 
         self.running = True
         self.status = "running"
         self._restart_count = 0
+        self._startup_ready = False
+        self._startup_future = asyncio.get_running_loop().create_future()
         self._task = asyncio.create_task(self._run_with_restart())
+        await self._startup_future
         logger.info(
             "Worker operator_id=%d account_id=%d",
             self.operator_id,
@@ -470,9 +632,9 @@ class AccountWorker:
         )
 
     async def stop(self) -> None:
-        """强制停止 Worker（cancel task + 释放锁）
+        """寮哄埗鍋滄 Worker锛坈ancel task + 閲婃斁閿侊級
 
-        结算逻辑由结算模式的主循环处理，stop() 不再调用 _settle_before_stop()。
+        缁撶畻閫昏緫鐢辩粨绠楁ā寮忕殑涓诲惊鐜鐞嗭紝stop() 涓嶅啀璋冪敤 _settle_before_stop()銆?
         """
         self.running = False
         if self._task and not self._task.done():
@@ -486,7 +648,7 @@ class AccountWorker:
         await self._release_lock()
         self.status = "stopped"
         logger.info(
-            "Worker 已停止 operator_id=%d account_id=%d",
+            "Worker 宸插仠姝?operator_id=%d account_id=%d",
             self.operator_id,
             self.account_id,
         )
@@ -505,12 +667,33 @@ class AccountWorker:
         while self.running:
             try:
                 await self._main_loop()
+                break
             except asyncio.CancelledError:
                 logger.info(
                     "Worker account_id=%d", self.account_id
                 )
                 break
+            except WorkerStartupError as exc:
+                logger.error(
+                    "Worker startup failed account_id=%d platform=%s reason=%s",
+                    self.account_id,
+                    self._platform_type,
+                    exc,
+                )
+                await self._handle_startup_failure(exc)
+                break
             except Exception:
+                if not self._startup_ready:
+                    exc = WorkerStartupError(
+                        f"worker startup crashed account_id={self.account_id} platform={self._platform_type}"
+                    )
+                    logger.exception(
+                        "Worker startup crashed account_id=%d platform=%s",
+                        self.account_id,
+                        self._platform_type,
+                    )
+                    await self._handle_startup_failure(exc)
+                    break
                 self._restart_count += 1
                 logger.exception(
                     "Worker account_id=%d restart_count=%d",
@@ -518,8 +701,7 @@ class AccountWorker:
                     self._restart_count,
                 )
                 if self._restart_count >= MAX_RESTART_FAILURES:
-                    self.status = "error"
-                    self.running = False
+                    await self._handle_terminal_worker_error()
                     logger.error(
                         "Worker  %d  erroraccount_id=%d",
                         MAX_RESTART_FAILURES,
@@ -536,51 +718,68 @@ class AccountWorker:
                     self.account_id,
                 )
                 await asyncio.sleep(delay)
+        await self._release_lock()
+        self._task = None
 
     # ------------------------------------------------------------------
-    # 主循环（倒计时驱动模式）
+    # 涓诲惊鐜紙鍊掕鏃堕┍鍔ㄦā寮忥級
     # ------------------------------------------------------------------
 
     async def _main_loop(self) -> None:
-        """倒计时驱动主循环
+        """鍊掕鏃堕┍鍔ㄤ富寰幆
 
-        流程：login → 全新启动检测 → 补结算 → 循环(fetch → bet → sleep → settle → reconcile)
+        娴佺▼锛歭ogin 鈫?鍏ㄦ柊鍚姩妫€娴?鈫?琛ョ粨绠?鈫?寰幆(fetch 鈫?bet 鈫?sleep 鈫?settle 鈫?reconcile)
         """
         logger.info(
-            "启动 Worker operator_id=%d account_id=%d",
+            "鍚姩 Worker operator_id=%d account_id=%d",
             self.operator_id,
             self.account_id,
         )
-        await self.session.login()
+        login_ok = await self.session.login()
+        if not login_ok:
+            raise WorkerStartupError(
+                f"session login failed account_id={self.account_id} platform={self._platform_type}"
+            )
+
+        startup_install = await self._fetch_install_with_retry()
+        if startup_install is None:
+            raise WorkerStartupError(
+                f"initial runtime snapshot unavailable account_id={self.account_id} platform={self._platform_type}"
+            )
+
         self._restart_count = 0
 
-        # 全新启动检测（AC1.5）
-        await self._detect_fresh_start()
+        # 鍏ㄦ柊鍚姩妫€娴嬶紙AC1.5锛?
+        await self._detect_fresh_start(startup_install)
+        self._resolve_startup_success()
 
-        # 补结算
+        # 琛ョ粨绠?
         await self._recover_unsettled_orders()
 
         logger.info(
-            "进入倒计时循环 Worker operator_id=%d account_id=%d",
+            "杩涘叆鍊掕鏃跺惊鐜?Worker operator_id=%d account_id=%d",
             self.operator_id,
             self.account_id,
         )
 
         while self.running:
-            # 0. 锁续约（每次循环迭代开始时）
+            # 0. 閿佺画绾︼紙姣忔寰幆杩唬寮€濮嬫椂锛?
             if not await self._renew_lock():
-                break  # 失锁，退出循环
+                break  # 澶遍攣锛岄€€鍑哄惊鐜?
 
-            # 1. 获取当前期号信息
-            install = await self._fetch_install_with_retry()
+            # 1. 鑾峰彇褰撳墠鏈熷彿淇℃伅
+            install = startup_install
+            startup_install = None
+            if install is None:
+                install = await self._fetch_install_with_retry()
             if install is None:
                 await asyncio.sleep(60)
                 continue
 
-            # 2. 记录当前期号（投注的是 install.issue，结算时需要验证该期号的开奖结果）
+            # 2. 璁板綍褰撳墠鏈熷彿锛堟姇娉ㄧ殑鏄?install.issue锛岀粨绠楁椂闇€瑕侀獙璇佽鏈熷彿鐨勫紑濂栫粨鏋滐級
             pre_issue = install.issue
 
-            # 3. 投注阶段（结算模式下跳过）
+            # 3. 鎶曟敞闃舵锛堢粨绠楁ā寮忎笅璺宠繃锛?
             settlement_anchor = install
             if not self.settling_only:
                 settlement_anchor = await self._run_due_strategy_windows(install)
@@ -593,27 +792,27 @@ class AccountWorker:
                             await self._apply_execution_report(report)
                         except Exception:
                             logger.exception(
-                                "投注异常 issue=%s account_id=%d",
+                                "鎶曟敞寮傚父 issue=%s account_id=%d",
                                 install.issue,
                                 self.account_id,
                             )
 
-            # 4. 等待开奖倒计时归零
+            # 4. 绛夊緟寮€濂栧€掕鏃跺綊闆?
             if (
                 settlement_anchor.issue == pre_issue
                 and settlement_anchor.open_countdown_sec > 0
             ):
                 await asyncio.sleep(settlement_anchor.open_countdown_sec)
 
-            # 5. 额外等待 settlement_wait_seconds
+            # 5. 棰濆绛夊緟 settlement_wait_seconds
             await asyncio.sleep(self._settlement_wait_seconds)
 
-            # 6. 拉取新期号 + 上期开奖结果
+            # 6. 鎷夊彇鏂版湡鍙?+ 涓婃湡寮€濂栫粨鏋?
             new_install = await self._fetch_settlement_data(pre_issue)
             if new_install is None:
-                continue  # 已发告警，跳过本期
+                continue  # 宸插彂鍛婅锛岃烦杩囨湰鏈?
 
-            # 7. 持久化开奖结果
+            # 7. 鎸佷箙鍖栧紑濂栫粨鏋?
             balls, sum_value = _parse_result(new_install.pre_result)
             await self.settler._save_lottery_result(
                 new_install.pre_issue,
@@ -621,7 +820,7 @@ class AccountWorker:
                 sum_value,
             )
 
-            # 8. 执行结算
+            # 8. 鎵ц缁撶畻
             try:
                 await self.settler.settle(
                     issue=new_install.pre_issue,
@@ -632,15 +831,15 @@ class AccountWorker:
                 )
             except Exception:
                 logger.exception(
-                    "结算异常 issue=%s account_id=%d",
+                    "缁撶畻寮傚父 issue=%s account_id=%d",
                     new_install.pre_issue,
                     self.account_id,
                 )
 
-            # 8.5 结算结果反馈给策略（驱动马丁倍增）
+            # 8.5 缁撶畻缁撴灉鍙嶉缁欑瓥鐣ワ紙椹卞姩椹竵鍊嶅锛?
             await self._feedback_settlement_results(new_install.pre_issue)
 
-            # 9. 对账
+            # 9. 瀵硅处
             try:
                 await self.reconciler.reconcile(
                     issue=new_install.pre_issue,
@@ -648,26 +847,26 @@ class AccountWorker:
                 )
             except Exception:
                 logger.exception(
-                    "对账异常 issue=%s account_id=%d",
+                    "瀵硅处寮傚父 issue=%s account_id=%d",
                     new_install.pre_issue,
                     self.account_id,
                 )
 
-            # 10. 结算模式检查
+            # 10. 缁撶畻妯″紡妫€鏌?
             if self.settling_only:
-                # 超时检查
+                # 瓒呮椂妫€鏌?
                 if self._settling_deadline and time.time() > self._settling_deadline:
                     logger.warning(
-                        "结算模式超时 account_id=%d", self.account_id,
+                        "缁撶畻妯″紡瓒呮椂 account_id=%d", self.account_id,
                     )
                     await self._handle_settling_timeout()
                     await self._cleanup_after_settling()
                     break
 
-                # 检查是否还有未结算订单
+                # 妫€鏌ユ槸鍚﹁繕鏈夋湭缁撶畻璁㈠崟
                 if not await self._has_unsettled_orders():
                     logger.info(
-                        "结算模式完成：所有订单已结算 account_id=%d",
+                        "缁撶畻妯″紡瀹屾垚锛氭墍鏈夎鍗曞凡缁撶畻 account_id=%d",
                         self.account_id,
                     )
                     self.running = False
@@ -704,8 +903,15 @@ class AccountWorker:
                     current_install, revalidate_reason = await self._revalidate_group_window(
                         current_install,
                         bet_timing=group.bet_timing,
+                        strategy_ids=group.strategy_ids,
                     )
                     if revalidate_reason == "window_not_open":
+                        break
+                    if revalidate_reason == "precheck_failed":
+                        # Transient revalidation failures should not kill the
+                        # rest of the current issue. Keep pending groups alive,
+                        # wait for the next poll tick, and retry with a fresh
+                        # snapshot after session recovery.
                         break
                     if revalidate_reason is not None:
                         self._mark_pending_groups_skipped(revalidate_reason)
@@ -769,16 +975,21 @@ class AccountWorker:
         return current_install
 
     async def _fetch_install_with_retry(self) -> Optional[InstallInfo]:
-        """获取当前期号信息，网络异常时按 5s → 10s → 30s 重试
+        """鑾峰彇褰撳墠鏈熷彿淇℃伅锛岀綉缁滃紓甯告椂鎸?5s 鈫?10s 鈫?30s 閲嶈瘯
 
-        最多 3 次，全部失败发 api_call_failed 告警并返回 None。
+        鏈€澶?3 娆★紝鍏ㄩ儴澶辫触鍙?api_call_failed 鍛婅骞惰繑鍥?None銆?
         """
         for attempt in range(API_RETRY_MAX):
             try:
                 return await self.poller.poll()
+            except RemoteLoginRequired as exc:
+                recovered = await self._recover_remote_login(exc)
+                if not recovered:
+                    return None
+                continue
             except Exception:
                 logger.exception(
-                    "GetCurrentInstall 失败 attempt=%d/%d account_id=%d",
+                    "GetCurrentInstall 澶辫触 attempt=%d/%d account_id=%d",
                     attempt + 1,
                     API_RETRY_MAX,
                     self.account_id,
@@ -787,24 +998,60 @@ class AccountWorker:
                     delay = API_RETRY_DELAYS[attempt]
                     await asyncio.sleep(delay)
 
-        # 全部失败
+        # 鍏ㄩ儴澶辫触
         await self.alert_service.send(
             operator_id=self.operator_id,
             alert_type="api_call_failed",
-            title=f"GetCurrentInstall 调用失败 account_id={self.account_id}",
+            title=f"GetCurrentInstall 璋冪敤澶辫触 account_id={self.account_id}",
             detail=f"{API_RETRY_MAX} 次重试全部失败",
             account_id=self.account_id,
         )
         return None
+
+    async def _recover_remote_login(self, exc: RemoteLoginRequired) -> bool:
+        logger.warning(
+            "remote login detected account_id=%d state=%s message=%s",
+            self.account_id,
+            exc.raw_state,
+            str(exc),
+        )
+        await self.session._reconnect()
+
+        try:
+            session_ready = await self.session.ensure_session()
+        except Exception:
+            logger.exception(
+                "remote login recovery check failed account_id=%d state=%s",
+                self.account_id,
+                exc.raw_state,
+            )
+            session_ready = False
+
+        if session_ready:
+            return True
+
+        self.status = "error"
+        self.running = False
+        await self.alert_service.send(
+            operator_id=self.operator_id,
+            alert_type="session_lost",
+            title=f"Remote login requires manual action account_id={self.account_id}",
+            detail=(
+                f"GetCurrentInstall returned State={exc.raw_state}; "
+                "controlled reconnect failed and worker stopped"
+            ),
+            account_id=self.account_id,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # 7.3 _fetch_settlement_data
     # ------------------------------------------------------------------
 
     async def _fetch_settlement_data(self, expected_pre_issue: str) -> Optional[InstallInfo]:
-        """拉取新期号，验证 PreLotteryResult 有效性，最多重试 6 次
+        """鎷夊彇鏂版湡鍙凤紝楠岃瘉 PreLotteryResult 鏈夋晥鎬э紝鏈€澶氶噸璇?6 娆?
 
-        全部失败时：real 订单标记 settle_failed + sim 订单用 check_win 降级结算 + 发告警。
+        鍏ㄩ儴澶辫触鏃讹細real 璁㈠崟鏍囪 settle_failed + sim 璁㈠崟鐢?check_win 闄嶇骇缁撶畻 + 鍙戝憡璀︺€?
         """
         for attempt in range(SETTLE_DATA_RETRY_MAX):
             install = await self._fetch_install_with_retry()
@@ -822,9 +1069,9 @@ class AccountWorker:
             if attempt < SETTLE_DATA_RETRY_MAX - 1:
                 await asyncio.sleep(SETTLE_DATA_RETRY_INTERVAL)
 
-        # 6 次重试失败 → 降级处理
+        # 6 娆￠噸璇曞け璐?鈫?闄嶇骇澶勭悊
         logger.warning(
-            "结算数据缺失 期号=%s account_id=%d，执行降级处理",
+            "Settlement data missing issue=%s account_id=%d, downgrade path triggered",
             expected_pre_issue,
             self.account_id,
         )
@@ -833,16 +1080,16 @@ class AccountWorker:
         await self.alert_service.send(
             operator_id=self.operator_id,
             alert_type="settlement_data_missing",
-            title=f"结算数据缺失 期号 {expected_pre_issue}",
-            detail=f"重试 {SETTLE_DATA_RETRY_MAX} 次后仍无有效开奖结果",
+            title=f"缁撶畻鏁版嵁缂哄け 鏈熷彿 {expected_pre_issue}",
+            detail=f"重试 {SETTLE_DATA_RETRY_MAX} 次后仍无有效开奖数据",
             account_id=self.account_id,
         )
         return None
 
     async def _handle_settlement_data_missing(self, issue: str) -> None:
-        """结算数据缺失时的降级处理
+        """缁撶畻鏁版嵁缂哄け鏃剁殑闄嶇骇澶勭悊
 
-        real 订单标记 settle_failed，sim 订单用 check_win 降级结算。
+        real 璁㈠崟鏍囪 settle_failed锛宻im 璁㈠崟鐢?check_win 闄嶇骇缁撶畻銆?
         """
         rows = await (
             await self.db.execute(
@@ -858,27 +1105,23 @@ class AccountWorker:
         real_orders = [o for o in orders if o.get("simulation", 0) == 0]
         sim_orders = [o for o in orders if o.get("simulation", 0) == 1]
 
-        # real 订单标记 settle_failed
+        # real 璁㈠崟鏍囪 settle_failed
         if real_orders:
             await self.settler._mark_orders_settle_failed(real_orders)
 
-        # sim 订单用 check_win 降级结算（无开奖结果，无法计算，也标记 settle_failed）
-        # 注意：AC1.4 说 sim 订单使用本地 check_win 降级结算，但无开奖结果时无法计算
-        # 设计文档说 sim 订单用 check_win 降级结算，但这需要开奖结果
-        # 这里 sim 订单也标记 settle_failed（因为没有开奖数据无法计算）
+        # sim 璁㈠崟鐢?check_win 闄嶇骇缁撶畻锛堟棤寮€濂栫粨鏋滐紝鏃犳硶璁＄畻锛屼篃鏍囪 settle_failed锛?
+        # 娉ㄦ剰锛欰C1.4 璇?sim 璁㈠崟浣跨敤鏈湴 check_win 闄嶇骇缁撶畻锛屼絾鏃犲紑濂栫粨鏋滄椂鏃犳硶璁＄畻
+        # 璁捐鏂囨。璇?sim 璁㈠崟鐢?check_win 闄嶇骇缁撶畻锛屼絾杩欓渶瑕佸紑濂栫粨鏋?
+        # 杩欓噷 sim 璁㈠崟涔熸爣璁?settle_failed锛堝洜涓烘病鏈夊紑濂栨暟鎹棤娉曡绠楋級
         if sim_orders:
             await self.settler._mark_orders_settle_failed(sim_orders)
 
     # ------------------------------------------------------------------
-    # 7.4 全新启动检测（AC1.5）
+    # 7.4 鍏ㄦ柊鍚姩妫€娴嬶紙AC1.5锛?
     # ------------------------------------------------------------------
 
-    async def _detect_fresh_start(self) -> None:
-        """全新启动检测
-
-        若数据库中无该账号的 bet_orders 记录，调用 GetCurrentInstall
-        获取当前期号记录为 last_issue，从下一期开始正常循环。
-        """
+    async def _detect_fresh_start(self, install: InstallInfo | None = None) -> None:
+        """Handle first-start behavior without unnecessarily skipping a legal current issue."""
         row = await (
             await self.db.execute(
                 "SELECT COUNT(*) as cnt FROM bet_orders "
@@ -888,19 +1131,43 @@ class AccountWorker:
         ).fetchone()
 
         count = row["cnt"] if row else 0
-        if count == 0:
-            # 全新启动：记录当前期号为 last_issue
-            try:
-                install = await self.poller.poll()
-                self.poller.last_issue = install.issue
+        if count != 0:
+            return
+
+        try:
+            current_install = install or await self.poller.poll()
+            if self._can_join_current_issue(current_install):
+                self.poller.last_issue = ""
                 logger.info(
-                    "全新启动检测：无历史记录，记录 last_issue=%s account_id=%d",
-                    install.issue,
+                    "鍏ㄦ柊鍚姩妫€娴嬶細褰撳墠鏈熶粛鍦ㄥ悎娉曠獥鍙ｏ紝鍏佽鍙備笌褰撴湡 issue=%s account_id=%d remaining=%ds",
+                    current_install.issue,
+                    self.account_id,
+                    current_install.close_countdown_sec,
+                )
+            else:
+                self.poller.last_issue = current_install.issue
+                logger.info(
+                        "鍏ㄦ柊鍚姩妫€娴嬶細褰撳墠鏈熷凡涓嶅湪鍚堟硶绐楀彛锛岃褰?last_issue=%s account_id=%d",
+                        current_install.issue,
+                        self.account_id,
+                    )
+        except Exception:
+            logger.exception(
+                    "鍏ㄦ柊鍚姩妫€娴嬶細鑾峰彇褰撳墠鏈熷け璐?account_id=%d",
+                    self.account_id,
+                )
+            # 鍏ㄦ柊鍚姩锛氳褰曞綋鍓嶆湡鍙蜂负 last_issue
+            try:
+                current_install = install or await self.poller.poll()
+                self.poller.last_issue = current_install.issue
+                logger.info(
+                    "鍏ㄦ柊鍚姩妫€娴嬶細鏃犲巻鍙茶褰曪紝璁板綍 last_issue=%s account_id=%d",
+                    current_install.issue,
                     self.account_id,
                 )
             except Exception:
                 logger.exception(
-                    "全新启动检测：获取当前期号失败 account_id=%d",
+                    "鍏ㄦ柊鍚姩妫€娴嬶細鑾峰彇褰撳墠鏈熷彿澶辫触 account_id=%d",
                     self.account_id,
                 )
 
@@ -909,17 +1176,23 @@ class AccountWorker:
     # ------------------------------------------------------------------
 
     async def _recover_unsettled_orders(self) -> None:
-        """重启时补结算：扫描未结算订单，按 issue 分组，获取历史开奖结果
+        """閲嶅惎鏃惰ˉ缁撶畻锛氭壂鎻忔湭缁撶畻璁㈠崟锛屾寜 issue 鍒嗙粍锛岃幏鍙栧巻鍙插紑濂栫粨鏋?
 
-        有结果则 settle(is_recovery=True)；无结果且订单距今超过3分钟则标记 settle_failed；
-        距今不超过3分钟的新订单跳过，留给正常结算周期处理。
+        鏈夌粨鏋滃垯 settle(is_recovery=True)锛涙棤缁撴灉涓旇鍗曡窛浠婅秴杩?鍒嗛挓鍒欐爣璁?settle_failed锛?
+        璺濅粖涓嶈秴杩?鍒嗛挓鐨勬柊璁㈠崟璺宠繃锛岀暀缁欐甯哥粨绠楀懆鏈熷鐞嗐€?
         """
         rows = await (
             await self.db.execute(
-                "SELECT DISTINCT issue FROM bet_orders "
-                "WHERE account_id=? AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match', 'settle_timeout')",
-                (self.account_id, self.operator_id),
+                "SELECT DISTINCT issue FROM ("
+                "  SELECT issue FROM bet_orders "
+                "  WHERE account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
+                "  UNION "
+                "  SELECT issue FROM simulation_bet_orders "
+                "  WHERE account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout')"
+                ")",
+                (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
         ).fetchall()
         issues = [r["issue"] for r in rows]
@@ -927,17 +1200,17 @@ class AccountWorker:
             return
 
         logger.info(
-            "补结算开始：%d 个期号待处理 account_id=%d",
+            "琛ョ粨绠楀紑濮嬶細%d 涓湡鍙峰緟澶勭悊 account_id=%d",
             len(issues),
             self.account_id,
         )
 
-        # 获取历史开奖结果
+        # 鑾峰彇鍘嗗彶寮€濂栫粨鏋?
         try:
             results = await self.adapter.get_lottery_results(count=50)
         except Exception:
             logger.exception(
-                "补结算：获取历史开奖结果失败 account_id=%d", self.account_id,
+                "琛ョ粨绠楋細鑾峰彇鍘嗗彶寮€濂栫粨鏋滃け璐?account_id=%d", self.account_id,
             )
             results = []
 
@@ -946,7 +1219,7 @@ class AccountWorker:
         for issue in issues:
             open_result = result_map.get(issue)
             if open_result and open_result.strip():
-                # 有开奖结果 → 执行补结算
+                # 鏈夊紑濂栫粨鏋?鈫?鎵ц琛ョ粨绠?
                 balls, sum_value = _parse_result(open_result)
                 try:
                     await self.settler.settle(
@@ -958,45 +1231,57 @@ class AccountWorker:
                         is_recovery=True,
                     )
                     await self._feedback_settlement_results(issue)
-                    logger.info("补结算完成 issue=%s account_id=%d", issue, self.account_id)
+                    logger.info("琛ョ粨绠楀畬鎴?issue=%s account_id=%d", issue, self.account_id)
                 except Exception:
                     logger.exception(
-                        "补结算异常 issue=%s account_id=%d", issue, self.account_id,
+                        "琛ョ粨绠楀紓甯?issue=%s account_id=%d", issue, self.account_id,
                     )
             else:
-                # 无开奖结果 → 检查订单年龄，新订单跳过
+                # 鏃犲紑濂栫粨鏋?鈫?妫€鏌ヨ鍗曞勾榫勶紝鏂拌鍗曡烦杩?
                 if await self._has_recent_orders(issue, max_age_seconds=180):
                     logger.info(
-                        "补结算跳过：期号 %s 有近3分钟内的新订单，留给正常周期 account_id=%d",
+                        "琛ョ粨绠楄烦杩囷細鏈熷彿 %s 鏈夎繎3鍒嗛挓鍐呯殑鏂拌鍗曪紝鐣欑粰姝ｅ父鍛ㄦ湡 account_id=%d",
                         issue, self.account_id,
                     )
                     continue
 
-                # 老订单 → 标记 settle_failed + 发告警
+                # 鑰佽鍗?鈫?鏍囪 settle_failed + 鍙戝憡璀?
                 await self._mark_issue_orders_settle_failed(issue)
                 await self.alert_service.send(
                     operator_id=self.operator_id,
                     alert_type="settle_data_expired",
-                    title=f"补结算数据过期 期号 {issue}",
-                    detail=f"历史开奖结果中无 issue={issue} 的记录，且订单已超过3分钟",
+                    title=f"琛ョ粨绠楁暟鎹繃鏈?鏈熷彿 {issue}",
+                    detail=f"鍘嗗彶寮€濂栫粨鏋滀腑鏃?issue={issue} 鐨勮褰曪紝涓旇鍗曞凡瓒呰繃3鍒嗛挓",
                     account_id=self.account_id,
                 )
 
     async def _has_recent_orders(self, issue: str, max_age_seconds: int = 180) -> bool:
-        """检查指定期号是否有距今不超过 max_age_seconds 的订单
+        """妫€鏌ユ寚瀹氭湡鍙锋槸鍚︽湁璺濅粖涓嶈秴杩?max_age_seconds 鐨勮鍗?
 
-        用于补结算时区分"刚下注还没开奖"和"真正过期"的订单。
+        鐢ㄤ簬琛ョ粨绠楁椂鍖哄垎"鍒氫笅娉ㄨ繕娌″紑濂?鍜?鐪熸杩囨湡"鐨勮鍗曘€?
         """
         from datetime import datetime, timezone, timedelta
         _bjt = timezone(timedelta(hours=8))
 
         rows = await (
             await self.db.execute(
-                "SELECT bet_at, created_at FROM bet_orders "
-                "WHERE issue=? AND account_id=? AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
-                "ORDER BY bet_at DESC LIMIT 1",
-                (issue, self.account_id, self.operator_id),
+                "SELECT bet_at, created_at FROM ("
+                "  SELECT bet_at, created_at FROM bet_orders "
+                "  WHERE issue=? AND account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
+                "  UNION ALL "
+                "  SELECT bet_at, created_at FROM simulation_bet_orders "
+                "  WHERE issue=? AND account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout')"
+                ") ORDER BY bet_at DESC LIMIT 1",
+                (
+                    issue,
+                    self.account_id,
+                    self.operator_id,
+                    issue,
+                    self.account_id,
+                    self.operator_id,
+                ),
             )
         ).fetchall()
 
@@ -1004,7 +1289,7 @@ class AccountWorker:
             return False
 
         row = rows[0]
-        # 优先用 bet_at，其次 created_at
+        # 浼樺厛鐢?bet_at锛屽叾娆?created_at
         bet_at_str = None
         try:
             bet_at_str = row["bet_at"]
@@ -1027,15 +1312,15 @@ class AccountWorker:
             return False
 
     async def _handle_settling_timeout(self) -> None:
-        """结算模式超时处理
-
-        将所有未结算订单标记为 settle_failed，发送告警，停止 Worker。
-        """
+        """Mark lingering unsettled orders as failed when settling mode times out."""
         rows = await (
             await self.db.execute(
-                "SELECT * FROM bet_orders WHERE account_id=? AND operator_id=? "
+                "SELECT id, status, 0 as simulation FROM bet_orders WHERE account_id=? AND operator_id=? "
+                "AND status IN ('bet_success', 'pending_match') "
+                "UNION ALL "
+                "SELECT id, status, 1 as simulation FROM simulation_bet_orders WHERE account_id=? AND operator_id=? "
                 "AND status IN ('bet_success', 'pending_match')",
-                (self.account_id, self.operator_id),
+                (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
         ).fetchall()
         orders = [dict(r) for r in rows]
@@ -1043,18 +1328,18 @@ class AccountWorker:
         if orders:
             await self.settler._mark_orders_settle_failed(orders)
             logger.warning(
-                "结算模式超时：%d 笔订单标记为 settle_failed account_id=%d",
+                "缁撶畻妯″紡瓒呮椂锛?d 绗旇鍗曟爣璁颁负 settle_failed account_id=%d",
                 len(orders),
                 self.account_id,
             )
 
-        # 发送超时告警
+        # 鍙戦€佽秴鏃跺憡璀?
         elapsed = int(time.time() - (self._settling_deadline - 600)) if self._settling_deadline else 0
         await self.alert_service.send(
             operator_id=self.operator_id,
             alert_type="settling_mode_timeout",
-            title=f"结算模式超时 account_id={self.account_id}",
-            detail=f"等待 {elapsed}s 后超时，{len(orders)} 笔订单标记为 settle_failed",
+            title=f"缁撶畻妯″紡瓒呮椂 account_id={self.account_id}",
+            detail=f"绛夊緟 {elapsed}s 鍚庤秴鏃讹紝{len(orders)} 绗旇鍗曟爣璁颁负 settle_failed",
             account_id=self.account_id,
         )
 
@@ -1062,51 +1347,52 @@ class AccountWorker:
         self.status = "stopped"
 
     async def _cleanup_after_settling(self) -> None:
-        """结算模式退出后的清理：释放锁、从 registry 注销"""
+        """缁撶畻妯″紡閫€鍑哄悗鐨勬竻鐞嗭細閲婃斁閿併€佷粠 registry 娉ㄩ攢"""
         await self._release_lock()
         if self._on_settle_complete:
             try:
                 await self._on_settle_complete(self.account_id)
             except Exception:
                 logger.exception(
-                    "结算完成回调异常 account_id=%d", self.account_id,
+                    "缁撶畻瀹屾垚鍥炶皟寮傚父 account_id=%d", self.account_id,
                 )
 
     async def _settle_before_stop(self) -> None:
-        """停止前补结算：扫描所有已下注但未结算的订单，尝试结算
-
-        与 _recover_unsettled_orders 类似，但在停止时调用。
-        先尝试获取开奖结果进行正常结算，如果获取不到（还没开奖），
-        则标记为 pending_match 等待下次启动时补结算。
-        """
+        """Try to settle outstanding issues before a worker fully stops."""
         rows = await (
             await self.db.execute(
-                "SELECT DISTINCT issue FROM bet_orders "
-                "WHERE account_id=? AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match')",
-                (self.account_id, self.operator_id),
+                "SELECT DISTINCT issue FROM ("
+                "  SELECT issue FROM bet_orders "
+                "  WHERE account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match') "
+                "  UNION "
+                "  SELECT issue FROM simulation_bet_orders "
+                "  WHERE account_id=? AND operator_id=? "
+                "  AND status IN ('bet_success', 'pending_match')"
+                ")",
+                (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
         ).fetchall()
         issues = [r["issue"] for r in rows]
         if not issues:
             logger.info(
-                "停止前补结算：无待结算订单 account_id=%d",
+                "鍋滄鍓嶈ˉ缁撶畻锛氭棤寰呯粨绠楄鍗?account_id=%d",
                 self.account_id,
             )
             return
 
         logger.info(
-            "停止前补结算：%d 个期号待处理 account_id=%d",
+            "鍋滄鍓嶈ˉ缁撶畻锛?d 涓湡鍙峰緟澶勭悊 account_id=%d",
             len(issues),
             self.account_id,
         )
 
-        # 获取历史开奖结果
+        # 鑾峰彇鍘嗗彶寮€濂栫粨鏋?
         try:
             results = await self.adapter.get_lottery_results(count=50)
         except Exception:
             logger.exception(
-                "停止前补结算：获取历史开奖结果失败 account_id=%d",
+                "鍋滄鍓嶈ˉ缁撶畻锛氳幏鍙栧巻鍙插紑濂栫粨鏋滃け璐?account_id=%d",
                 self.account_id,
             )
             results = []
@@ -1116,14 +1402,14 @@ class AccountWorker:
             for r in results
         }
 
-        # 也尝试从 GetCurrentInstall 获取上期结果
+        # 涔熷皾璇曚粠 GetCurrentInstall 鑾峰彇涓婃湡缁撴灉
         try:
             install = await self.poller.poll()
             if install and install.pre_issue and install.pre_result:
                 result_map[str(install.pre_issue)] = install.pre_result
         except Exception:
             logger.warning(
-                "停止前补结算：获取当前期号失败 account_id=%d",
+                "鍋滄鍓嶈ˉ缁撶畻锛氳幏鍙栧綋鍓嶆湡鍙峰け璐?account_id=%d",
                 self.account_id,
             )
 
@@ -1132,7 +1418,7 @@ class AccountWorker:
         for issue in issues:
             open_result = result_map.get(issue)
             if open_result and open_result.strip():
-                # 有开奖结果 → 执行结算
+                # 鏈夊紑濂栫粨鏋?鈫?鎵ц缁撶畻
                 balls, sum_value = _parse_result(open_result)
                 try:
                     await self.settler.settle(
@@ -1145,37 +1431,37 @@ class AccountWorker:
                     )
                     settled_count += 1
                     logger.info(
-                        "停止前补结算完成 issue=%s account_id=%d",
+                        "鍋滄鍓嶈ˉ缁撶畻瀹屾垚 issue=%s account_id=%d",
                         issue,
                         self.account_id,
                     )
                 except Exception:
                     logger.exception(
-                        "停止前补结算异常 issue=%s account_id=%d",
+                        "鍋滄鍓嶈ˉ缁撶畻寮傚父 issue=%s account_id=%d",
                         issue,
                         self.account_id,
                     )
             else:
-                # 还没开奖 → 标记为 pending_match，下次启动时补结算
+                # 杩樻病寮€濂?鈫?鏍囪涓?pending_match锛屼笅娆″惎鍔ㄦ椂琛ョ粨绠?
                 pending_count += 1
                 logger.info(
-                    "停止前补结算：期号 %s 尚未开奖，保持待结算状态 account_id=%d",
+                    "鍋滄鍓嶈ˉ缁撶畻锛氭湡鍙?%s 灏氭湭寮€濂栵紝淇濇寔寰呯粨绠楃姸鎬?account_id=%d",
                     issue,
                     self.account_id,
                 )
 
         logger.info(
-            "停止前补结算完成：已结算=%d 待下次补结算=%d account_id=%d",
+            "鍋滄鍓嶈ˉ缁撶畻瀹屾垚锛氬凡缁撶畻=%d 寰呬笅娆¤ˉ缁撶畻=%d account_id=%d",
             settled_count,
             pending_count,
             self.account_id,
         )
 
     async def _feedback_settlement_results(self, issue: str) -> None:
-        """结算后将结果反馈给对应的 StrategyRunner
+        """缁撶畻鍚庡皢缁撴灉鍙嶉缁欏搴旂殑 StrategyRunner
 
-        查询该期号已结算订单，按 strategy_id 分发 on_result。
-        用于驱动马丁策略的 level 推进。
+        鏌ヨ璇ユ湡鍙峰凡缁撶畻璁㈠崟锛屾寜 strategy_id 鍒嗗彂 on_result銆?
+        鐢ㄤ簬椹卞姩椹竵绛栫暐鐨?level 鎺ㄨ繘銆?
         """
         rows = await (
             await self.db.execute(
@@ -1191,7 +1477,7 @@ class AccountWorker:
             runner = self.strategies.get(sid)
             if runner is None:
                 logger.debug(
-                    "结算反馈跳过：strategy_id=%d 无对应 runner account_id=%d",
+                    "缁撶畻鍙嶉璺宠繃锛歴trategy_id=%d 鏃犲搴?runner account_id=%d",
                     sid, self.account_id,
                 )
                 continue
@@ -1228,7 +1514,7 @@ class AccountWorker:
                     )
             except Exception:
                 logger.exception(
-                    "结算反馈异常 strategy_id=%d issue=%s account_id=%d",
+                    "缁撶畻鍙嶉寮傚父 strategy_id=%d issue=%s account_id=%d",
                     sid, issue, self.account_id,
                 )
 
@@ -1250,7 +1536,7 @@ class AccountWorker:
         # Red-wave double is a long-running monitor. Settlement outcomes such as
         # target hit, refund, no result, or Martin sequence cycling must never
         # stop it; risk stops are applied through ExecutionReport instead.
-        if strategy_name == "red_wave_double_martin":
+        if strategy_name in WAVE_STRATEGY_TYPES:
             return False
 
         return True
@@ -1297,13 +1583,24 @@ class AccountWorker:
         )
 
     async def _mark_issue_orders_settle_failed(self, issue: str) -> None:
-        """将指定期号下所有未结算订单标记为 settle_failed"""
+        """Mark lingering orders for a specific issue as settle_failed."""
         rows = await (
             await self.db.execute(
-                "SELECT * FROM bet_orders WHERE issue=? AND account_id=? "
+                "SELECT id, status, 0 as simulation FROM bet_orders WHERE issue=? AND account_id=? "
+                "AND operator_id=? "
+                "AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
+                "UNION ALL "
+                "SELECT id, status, 1 as simulation FROM simulation_bet_orders WHERE issue=? AND account_id=? "
                 "AND operator_id=? "
                 "AND status IN ('bet_success', 'pending_match', 'settle_timeout')",
-                (issue, self.account_id, self.operator_id),
+                (
+                    issue,
+                    self.account_id,
+                    self.operator_id,
+                    issue,
+                    self.account_id,
+                    self.operator_id,
+                ),
             )
         ).fetchall()
         orders = [dict(r) for r in rows]
@@ -1311,15 +1608,15 @@ class AccountWorker:
             await self.settler._mark_orders_settle_failed(orders)
 
     # ------------------------------------------------------------------
-    # 跨进程互斥锁
+    # 璺ㄨ繘绋嬩簰鏂ラ攣
     # ------------------------------------------------------------------
 
     async def _acquire_lock(self) -> bool:
-        """CAS 抢锁：生成 UUID4 token，写入 account_platform_sessions
+        """CAS 鎶㈤攣锛氱敓鎴?UUID4 token锛屽啓鍏?account_platform_sessions
 
-        条件：无锁（worker_lock_token IS NULL）或锁超时（worker_lock_ts < now - 5min）。
-        使用 DB 时间 datetime('now') 消除应用时钟漂移。
-        返回 True 表示抢锁成功，False 表示已有活跃锁。
+        鏉′欢锛氭棤閿侊紙worker_lock_token IS NULL锛夋垨閿佽秴鏃讹紙worker_lock_ts < now - 5min锛夈€?
+        浣跨敤 DB 鏃堕棿 datetime('now') 娑堥櫎搴旂敤鏃堕挓婕傜Щ銆?
+        杩斿洖 True 琛ㄧず鎶㈤攣鎴愬姛锛孎alse 琛ㄧず宸叉湁娲昏穬閿併€?
         """
         token = str(uuid.uuid4())
         await account_platform_session_upsert(
@@ -1339,24 +1636,24 @@ class AccountWorker:
         if cursor.rowcount > 0:
             self._lock_token = token
             logger.info(
-                "抢锁成功 account_id=%d platform=%s token=%s",
+                "鎶㈤攣鎴愬姛 account_id=%d platform=%s token=%s",
                 self.account_id,
                 self._platform_type,
                 token,
             )
             return True
         logger.warning(
-            "抢锁失败（已有活跃锁） account_id=%d platform=%s",
+            "鎶㈤攣澶辫触锛堝凡鏈夋椿璺冮攣锛?account_id=%d platform=%s",
             self.account_id,
             self._platform_type,
         )
         return False
 
     async def _renew_lock(self) -> bool:
-        """续约锁：更新 worker_lock_ts，仅当前持锁者可续约
+        """缁害閿侊細鏇存柊 worker_lock_ts锛屼粎褰撳墠鎸侀攣鑰呭彲缁害
 
-        rowcount=0 表示已失锁（token 不匹配），设置 running=False 并发告警。
-        返回 True 表示续约成功，False 表示失锁。
+        rowcount=0 琛ㄧず宸插け閿侊紙token 涓嶅尮閰嶏級锛岃缃?running=False 骞跺彂鍛婅銆?
+        杩斿洖 True 琛ㄧず缁害鎴愬姛锛孎alse 琛ㄧず澶遍攣銆?
         """
         if self._lock_token is None:
             return False
@@ -1369,9 +1666,9 @@ class AccountWorker:
         await self.db.commit()
         if cursor.rowcount > 0:
             return True
-        # 失锁：立即停止
+        # 澶遍攣锛氱珛鍗冲仠姝?
         logger.error(
-            "续约失败（已失锁） account_id=%d platform=%s token=%s",
+            "缁害澶辫触锛堝凡澶遍攣锛?account_id=%d platform=%s token=%s",
             self.account_id,
             self._platform_type,
             self._lock_token,
@@ -1380,14 +1677,14 @@ class AccountWorker:
         await self.alert_service.send(
             operator_id=self.operator_id,
             alert_type="worker_lock_lost",
-            title=f"Worker 失锁 account_id={self.account_id} platform={self._platform_type}",
-            detail=f"续约失败，platform={self._platform_type}, token={self._lock_token}",
+            title=f"Worker 澶遍攣 account_id={self.account_id} platform={self._platform_type}",
+            detail=f"缁害澶辫触锛宲latform={self._platform_type}, token={self._lock_token}",
             account_id=self.account_id,
         )
         return False
 
     async def _release_lock(self) -> None:
-        """释放锁：仅当前持锁者可释放（WHERE worker_lock_token=self._lock_token）"""
+        """Release the worker lock token from account_platform_sessions."""
         if self._lock_token is None:
             return
         try:
@@ -1399,14 +1696,14 @@ class AccountWorker:
             )
             await self.db.commit()
             logger.info(
-                "释放锁 account_id=%d platform=%s token=%s",
+                "閲婃斁閿?account_id=%d platform=%s token=%s",
                 self.account_id,
                 self._platform_type,
                 self._lock_token,
             )
         except Exception:
             logger.exception(
-                "释放锁异常 account_id=%d platform=%s token=%s",
+                "閲婃斁閿佸紓甯?account_id=%d platform=%s token=%s",
                 self.account_id,
                 self._platform_type,
                 self._lock_token,
@@ -1669,12 +1966,24 @@ class AccountWorker:
     async def _feedback_settlement_results(self, issue: str) -> None:
         rows = await (
             await self.db.execute(
-                "SELECT strategy_id, key_code, is_win, pnl, martin_level FROM bet_orders "
+                "SELECT strategy_id, key_code, is_win, pnl, martin_level, 0 as simulation FROM bet_orders "
+                "WHERE issue=? AND account_id=? AND operator_id=? "
+                "AND status='settled' "
+                "UNION ALL "
+                "SELECT strategy_id, key_code, is_win, pnl, NULL as martin_level, 1 as simulation FROM simulation_bet_orders "
                 "WHERE issue=? AND account_id=? AND operator_id=? "
                 "AND status='settled'",
-                (issue, self.account_id, self.operator_id),
+                (
+                    issue,
+                    self.account_id,
+                    self.operator_id,
+                    issue,
+                    self.account_id,
+                    self.operator_id,
+                ),
             )
         ).fetchall()
+        rows = [dict(row) for row in rows]
 
         issue_scope_rows: dict[int, list] = defaultdict(list)
         for row in rows:
@@ -1767,8 +2076,10 @@ class AccountWorker:
                 )
         except Exception:
             logger.exception(
-                "ç¼æ’¶ç•»é™å¶‰î›­å¯®å‚šçˆ¶ strategy_id=%d issue=%s account_id=%d",
+                "莽录聛忙鈥櫬睹р€⒙幻┞嶁劉氓露鈥懊€郝ヂモ€毰∶喡?strategy_id=%d issue=%s account_id=%d",
                 strategy_id,
                 issue,
                 self.account_id,
             )
+
+

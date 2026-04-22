@@ -7,6 +7,7 @@
 
 import { request } from '@/api/request';
 import type { LoginRequest, TokenResponse } from '@/types/api/auth';
+import type { OperatorChangePasswordRequest, OperatorMeInfo } from '@/types/api/operator';
 
 export async function login(data: LoginRequest) {
   return request<TokenResponse>('/auth/login', {
@@ -24,5 +25,16 @@ export async function refresh() {
 export async function logout() {
   return request<null>('/auth/logout', {
     method: 'POST',
+  });
+}
+
+export async function fetchOperatorMe() {
+  return request<OperatorMeInfo>('/operator/me');
+}
+
+export async function updateOperatorPassword(data: OperatorChangePasswordRequest) {
+  return request<null>('/operator/me/password', {
+    method: 'PUT',
+    body: JSON.stringify(data),
   });
 }

@@ -459,6 +459,47 @@ class TestRedWaveAtomicBalanceGuard:
         assert len(betdata) == 2
         assert {b["KeyCode"] for b in betdata} == {"B1LM_S", "DS4"}
 
+    @pytest.mark.asyncio
+    async def test_green_wave_group_insufficient_balance_stops_strategy(
+        self, db, executor, setup_data
+    ):
+        green = await strategy_create(
+            db,
+            operator_id=setup_data["operator"]["id"],
+            account_id=setup_data["account"]["id"],
+            name="green_guard",
+            type="green_wave_single_martin",
+            play_code="B1LM_D,DS3",
+            base_amount=100,
+            martin_sequence="[1,2,4]",
+        )
+        green = await strategy_update(
+            db,
+            strategy_id=green["id"],
+            operator_id=setup_data["operator"]["id"],
+            status="running",
+        )
+        await account_update(
+            db,
+            account_id=setup_data["account"]["id"],
+            operator_id=setup_data["operator"]["id"],
+            balance=150,
+        )
+        await odds_batch_upsert(
+            db,
+            account_id=setup_data["account"]["id"],
+            platform_type=PLATFORM_TYPE,
+            odds_map={"B1LM_D": 19800, "DS3": 19800},
+            confirmed=True,
+        )
+
+        s1 = make_signal(green["id"], key_code="B1LM_D", amount=100)
+        s2 = make_signal(green["id"], key_code="DS3", amount=100)
+        report = await executor.execute(make_install(), [s1, s2])
+
+        assert report.stop_strategy_ids == {green["id"]: "balance_insufficient"}
+        executor.adapter.place_bet.assert_not_called()
+
 # 
 # 4.  + betdata 7.2.4
 # 
@@ -734,6 +775,65 @@ class TestConfirmbetZeroRetry:
         assert row["status"] == "bet_failed"
         assert "ConnectionError" in row["fail_reason"]
 
+    @pytest.mark.asyncio
+    async def test_retry_logs_initial_and_terminal_events(self, executor, setup_data):
+        executor.adapter.place_bet = AsyncMock(side_effect=[
+            BetResult(succeed=5, message="odds changed", raw_response={}),
+            BetResult(succeed=1, message="success", raw_response={"succeed": 1}),
+        ])
+        executor.adapter.load_odds = AsyncMock(return_value={"DX1": 20530})
+        signal = make_signal(setup_data["strategy"]["id"])
+        install = make_install()
+
+        with patch.object(executor, "_log_confirmbet_terminal") as log_terminal:
+            await executor.execute(install, [signal])
+
+        assert log_terminal.call_count == 2
+        assert log_terminal.call_args_list[0].kwargs["result"] == "confirmbet_retry"
+        assert log_terminal.call_args_list[0].kwargs["terminal"] is False
+        assert log_terminal.call_args_list[1].kwargs["result"] == "confirmbet_success"
+        assert log_terminal.call_args_list[1].kwargs["attempt"] == "retry"
+
+    @pytest.mark.asyncio
+    async def test_retry_with_live_odds_marks_retry_attempt_metadata(self, executor):
+        executor.adapter.get_current_install_detail = AsyncMock(return_value={
+            "installments": "20240101001",
+            "state": 1,
+            "close_countdown_sec": 30,
+        })
+        executor.adapter.load_odds = AsyncMock(return_value={"DX1": 20530})
+        executor.adapter.place_bet = AsyncMock(return_value=BetResult(
+            succeed=1,
+            message="success",
+            raw_response={"succeed": 1},
+        ))
+
+        result = await executor._retry_with_live_odds(
+            make_install(),
+            [{"KeyCode": "DX1", "Amount": 100, "Odds": 19800}],
+        )
+
+        assert result is not None
+        assert result.raw_response["_retry_attempt"] is True
+        assert result.raw_response["_retry_item_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_window_logs_countdown_validation(self, executor):
+        executor.adapter.get_current_install_detail = AsyncMock(return_value={
+            "installments": "20240101001",
+            "state": 1,
+            "close_countdown_sec": 25,
+        })
+        install = make_install()
+
+        with patch("app.engine.executor.log_countdown_validation") as log_validation:
+            is_open = await executor._retry_window_is_open(install)
+
+        assert is_open is True
+        assert log_validation.call_count == 1
+        assert log_validation.call_args.kwargs["phase"] == "retry_submit"
+        assert log_validation.call_args.kwargs["allowed"] is True
+
 
 # 
 # 6. deadline/cancel 7.2.6
@@ -816,7 +916,7 @@ class TestSimulationMode:
 
     @pytest.mark.asyncio
     async def test_simulation_records_virtual_order(self, db, executor, setup_data):
-        """simulation=True status=bet_success, simulation=1"""
+        """simulation=True 时仅写 simulation_bet_orders，不写 bet_orders"""
         signal = make_signal(
             setup_data["strategy"]["id"], simulation=True,
         )
@@ -825,12 +925,17 @@ class TestSimulationMode:
         await executor.execute(install, [signal])
 
         row = await (await db.execute(
-            "SELECT * FROM bet_orders WHERE idempotent_id=?",
+            "SELECT * FROM simulation_bet_orders WHERE idempotent_id=?",
             (signal.idempotent_id,),
         )).fetchone()
         assert row is not None
         assert row["status"] == "bet_success"
-        assert row["simulation"] == 1
+
+        real_row = await (await db.execute(
+            "SELECT * FROM bet_orders WHERE idempotent_id=?",
+            (signal.idempotent_id,),
+        )).fetchone()
+        assert real_row is None
 
     @pytest.mark.asyncio
     async def test_mixed_simulation_and_real(self, db, executor, setup_data):
@@ -852,21 +957,28 @@ class TestSimulationMode:
         assert len(betdata) == 1
         assert betdata[0]["KeyCode"] == "DX2"
 
-        # 
+        # 模拟订单写入 simulation_bet_orders
         sim_row = await (await db.execute(
-            "SELECT * FROM bet_orders WHERE idempotent_id=?",
+            "SELECT * FROM simulation_bet_orders WHERE idempotent_id=?",
             (sim_signal.idempotent_id,),
         )).fetchone()
-        assert sim_row["simulation"] == 1
+        assert sim_row is not None
         assert sim_row["status"] == "bet_success"
 
-        # 
+        # 真实订单写入 bet_orders
         real_row = await (await db.execute(
             "SELECT * FROM bet_orders WHERE idempotent_id=?",
             (real_signal.idempotent_id,),
         )).fetchone()
         assert real_row["simulation"] == 0
         assert real_row["status"] == "bet_success"
+
+        # 模拟订单不得再写入 bet_orders
+        sim_real_row = await (await db.execute(
+            "SELECT * FROM bet_orders WHERE idempotent_id=?",
+            (sim_signal.idempotent_id,),
+        )).fetchone()
+        assert sim_real_row is None
 
 
 # 
@@ -976,8 +1088,14 @@ class TestRequestLogging:
         with patch("app.engine.executor.log_bet") as mock_log_bet:
             await executor.execute(make_install(issue=issue), signals)
 
-        mock_log_bet.assert_called_once()
-        kwargs = mock_log_bet.call_args.kwargs
+        request_submit_calls = [
+            call.kwargs
+            for call in mock_log_bet.call_args_list
+            if call.kwargs.get("key_code") == "DW3_BATCH"
+            and call.kwargs.get("result") == "request_submit"
+        ]
+        assert len(request_submit_calls) == 1
+        kwargs = request_submit_calls[0]
         assert kwargs["operator_id"] == setup_data["operator"]["id"]
         assert kwargs["account_id"] == setup_data["account"]["id"]
         assert kwargs["issue"] == issue

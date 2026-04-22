@@ -10,7 +10,11 @@ from pathlib import Path
 
 import aiosqlite
 
-from app.config import BOCAI_DB_PATH, BOCAI_DEFAULT_ADMIN_ENABLED
+from app.config import (
+    BOCAI_ALLOW_LEGACY_DESTRUCTIVE_RESET,
+    BOCAI_DB_PATH,
+    BOCAI_DEFAULT_ADMIN_ENABLED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +312,116 @@ DDL_STATEMENTS = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_backtest_tasks_operator ON backtest_tasks(operator_id, created_at);",
+
+    # 12. shared_market_groups
+    """
+    CREATE TABLE IF NOT EXISTS shared_market_groups (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_key               TEXT NOT NULL UNIQUE,
+        enabled                 INTEGER NOT NULL DEFAULT 1,
+        collector_platform_type TEXT NOT NULL,
+        collector_account_name  TEXT NOT NULL,
+        collector_password_enc  TEXT NOT NULL,
+        freshness_threshold_sec INTEGER NOT NULL DEFAULT 30,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_groups_enabled ON shared_market_groups(enabled, id);",
+
+    # 13. shared_market_group_urls
+    """
+    CREATE TABLE IF NOT EXISTS shared_market_group_urls (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        shared_group_id INTEGER NOT NULL REFERENCES shared_market_groups(id) ON DELETE CASCADE,
+        normalized_url  TEXT NOT NULL UNIQUE,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_group_urls_group ON shared_market_group_urls(shared_group_id);",
+
+    # 14. shared_market_snapshots
+    """
+    CREATE TABLE IF NOT EXISTS shared_market_snapshots (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        shared_group_id     INTEGER NOT NULL UNIQUE REFERENCES shared_market_groups(id) ON DELETE CASCADE,
+        issue               TEXT,
+        state               TEXT,
+        close_countdown_sec INTEGER,
+        open_countdown_sec  INTEGER,
+        pre_issue           TEXT,
+        open_result         TEXT,
+        fetched_at          TEXT NOT NULL,
+        source_status       TEXT NOT NULL DEFAULT 'online',
+        last_error          TEXT,
+        created_at          TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at          TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_snapshots_fetched ON shared_market_snapshots(shared_group_id, fetched_at DESC);",
+
+    # 15. shared_market_uncovered_urls
+    """
+    CREATE TABLE IF NOT EXISTS shared_market_uncovered_urls (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        normalized_url     TEXT NOT NULL UNIQUE,
+        first_seen_at      TEXT NOT NULL,
+        last_seen_at       TEXT NOT NULL,
+        hit_count          INTEGER NOT NULL DEFAULT 1,
+        last_account_id    INTEGER,
+        last_platform_type TEXT,
+        sample_raw_url     TEXT
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_uncovered_last_seen ON shared_market_uncovered_urls(last_seen_at DESC);",
+
+    # 16. simulation_bet_orders
+    """
+    CREATE TABLE IF NOT EXISTS simulation_bet_orders (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        idempotent_id   TEXT NOT NULL UNIQUE,
+        operator_id     INTEGER NOT NULL REFERENCES operators(id),
+        account_id      INTEGER NOT NULL REFERENCES gambling_accounts(id),
+        strategy_id     INTEGER NOT NULL REFERENCES strategies(id),
+        issue           TEXT NOT NULL,
+        platform_type   TEXT NOT NULL,
+        key_code        TEXT NOT NULL,
+        amount          INTEGER NOT NULL,
+        odds            INTEGER,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        is_win          INTEGER,
+        pnl             INTEGER,
+        open_result     TEXT,
+        sum_value       INTEGER,
+        fail_reason     TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        bet_at          TEXT,
+        settled_at      TEXT
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_simulation_bet_orders_strategy ON simulation_bet_orders(strategy_id, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_simulation_bet_orders_operator_issue ON simulation_bet_orders(operator_id, issue);",
+
+    # 17. simulation_strategy_stats
+    """
+    CREATE TABLE IF NOT EXISTS simulation_strategy_stats (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        strategy_id     INTEGER NOT NULL UNIQUE REFERENCES strategies(id) ON DELETE CASCADE,
+        operator_id     INTEGER NOT NULL REFERENCES operators(id),
+        account_id      INTEGER NOT NULL REFERENCES gambling_accounts(id),
+        daily_pnl       INTEGER NOT NULL DEFAULT 0,
+        total_pnl       INTEGER NOT NULL DEFAULT 0,
+        daily_pnl_date  TEXT,
+        bet_count       INTEGER NOT NULL DEFAULT 0,
+        win_count       INTEGER NOT NULL DEFAULT 0,
+        loss_count      INTEGER NOT NULL DEFAULT 0,
+        last_settled_at TEXT,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_simulation_strategy_stats_operator ON simulation_strategy_stats(operator_id, account_id);",
 ]
 
 
@@ -366,6 +480,16 @@ async def _reset_legacy_platform_binding_schema(db: aiosqlite.Connection) -> Non
     existing_cols = {row[1] for row in rows}
     if "game_type" in existing_cols and "platform_type" not in existing_cols:
         return
+
+    if not BOCAI_ALLOW_LEGACY_DESTRUCTIVE_RESET:
+        logger.error(
+            "Detected legacy account schema, but destructive reset is disabled"
+        )
+        raise RuntimeError(
+            "Detected legacy account schema that would require destructive reset. "
+            "Set BOCAI_ALLOW_LEGACY_DESTRUCTIVE_RESET=true only in a disposable "
+            "environment, or run a real migration before startup."
+        )
 
     logger.warning("Detected legacy account schema; resetting platform-coupled tables")
     for table_name in (

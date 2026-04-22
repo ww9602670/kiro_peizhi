@@ -1,0 +1,94 @@
+.platform-updates-page {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.platform-updates-title {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 700;
+  color: #1a1a1a;
+}
+
+.platform-updates-subtitle {
+  margin: 0 0 16px;
+  color: #666;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.platform-updates-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.platform-update-card {
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid #f0f0f0;
+  padding: 14px;
+}
+
+.platform-update-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.platform-update-kind {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.update-kind-feature {
+  color: #0958d9;
+  background: #e6f4ff;
+}
+
+.update-kind-fix {
+  color: #ad4e00;
+  background: #fff7e6;
+}
+
+.update-kind-risk {
+  color: #a8071a;
+  background: #fff1f0;
+}
+
+.platform-update-date {
+  color: #8c8c8c;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.platform-update-card-title {
+  margin: 0 0 6px;
+  color: #1a1a1a;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.platform-update-items {
+  margin: 0;
+  padding-left: 18px;
+  color: #333;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.platform-update-item + .platform-update-item {
+  margin-top: 6px;
+}
+
+.empty-text {
+  margin: 0;
+  color: #999;
+  font-size: 14px;
+}

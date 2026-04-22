@@ -18,7 +18,9 @@ from unittest.mock import patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.database import get_shared_db
 from app.main import app
+from app.models.db_ops import account_create
 from app.utils.auth import (
     ACTIVE_SESSIONS,
     create_token,
@@ -43,17 +45,22 @@ async def _login(client: AsyncClient, username="admin", password="admin123") -> 
     return resp.json(), resp.status_code
 
 
-async def _create_operator(username="op1", password="pass123456", status="active", expire_date=None):
+async def _create_operator(
+    username="op1",
+    password="pass123456",
+    status="active",
+    expire_date=None,
+    max_accounts=1,
+):
     """ DB  API"""
-    import uuid
-    from app.database import get_shared_db
     db = await get_shared_db()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     #  INSERT OR IGNORE  UNIQUE  DB 
     cursor = await db.execute(
-        """INSERT OR IGNORE INTO operators (username, password, role, status, expire_date, created_at, updated_at)
-           VALUES (?, ?, 'operator', ?, ?, ?, ?)""",
-        (username, password, status, expire_date, now, now),
+        """INSERT OR IGNORE INTO operators
+           (username, password, role, status, max_accounts, expire_date, created_at, updated_at)
+           VALUES (?, ?, 'operator', ?, ?, ?, ?, ?)""",
+        (username, password, status, max_accounts, expire_date, now, now),
     )
     await db.commit()
     if cursor.lastrowid == 0 or cursor.rowcount == 0:
@@ -61,8 +68,8 @@ async def _create_operator(username="op1", password="pass123456", status="active
         row = await (await db.execute("SELECT id FROM operators WHERE username=?", (username,))).fetchone()
         # Update status/expire_date to match desired state
         await db.execute(
-            "UPDATE operators SET status=?, expire_date=?, password=? WHERE username=?",
-            (status, expire_date, password, username),
+            "UPDATE operators SET status=?, max_accounts=?, expire_date=?, password=? WHERE username=?",
+            (status, max_accounts, expire_date, password, username),
         )
         await db.commit()
         return row["id"]
@@ -236,6 +243,100 @@ class TestLoginEndpoint:
         detail = json.loads(row["detail"])
         assert detail["username"] == "nobody"
         assert detail["reason"] == "用户名不存在"
+
+
+class TestOperatorSelfEndpoints:
+    async def test_operator_me_returns_real_quota_fields(self, client):
+        username = "me_op"
+        password = "pass123456"
+        op_id = await _create_operator(username, password, max_accounts=3)
+        db = await get_shared_db()
+        await account_create(
+            db,
+            operator_id=op_id,
+            account_name="acc_me_1",
+            password="platform_pwd_1",
+            platform_type="JND28WEB",
+        )
+        await account_create(
+            db,
+            operator_id=op_id,
+            account_name="acc_me_2",
+            password="platform_pwd_2",
+            platform_type="JND28WEB",
+        )
+
+        login_body, _ = await _login(client, username, password)
+        token = login_body["data"]["token"]
+        resp = await client.get("/api/v1/operator/me", headers=_auth_header(token))
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["code"] == 0
+        assert body["data"]["username"] == username
+        assert body["data"]["max_accounts"] == 3
+        assert body["data"]["bound_accounts"] == 2
+        assert body["data"]["remaining_accounts"] == 1
+
+    async def test_operator_me_rejects_admin(self, client):
+        body, _ = await _login(client, "admin", "admin123")
+        resp = await client.get(
+            "/api/v1/operator/me",
+            headers=_auth_header(body["data"]["token"]),
+        )
+        assert resp.status_code == 403
+        assert resp.json()["code"] == 3001
+
+    async def test_change_operator_password_success(self, client):
+        username = "me_pwd_op"
+        old_password = "pass123456"
+        new_password = "pass123457"
+        op_id = await _create_operator(username, old_password)
+        db = await get_shared_db()
+        account = await account_create(
+            db,
+            operator_id=op_id,
+            account_name="acc_pwd",
+            password="platform_pwd_keep",
+            platform_type="JND28WEB",
+        )
+
+        login_body, _ = await _login(client, username, old_password)
+        token = login_body["data"]["token"]
+        resp = await client.put(
+            "/api/v1/operator/me/password",
+            headers=_auth_header(token),
+            json={"old_password": old_password, "new_password": new_password},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["code"] == 0
+
+        old_login_body, old_status = await _login(client, username, old_password)
+        assert old_status == 401
+        assert old_login_body["code"] == 2002
+
+        new_login_body, new_status = await _login(client, username, new_password)
+        assert new_status == 200
+        assert new_login_body["code"] == 0
+
+        cursor = await db.execute("SELECT password FROM gambling_accounts WHERE id=?", (account["id"],))
+        account_row = await cursor.fetchone()
+        assert account_row["password"] == "platform_pwd_keep"
+
+    async def test_change_operator_password_wrong_old_password(self, client):
+        username = "me_pwd_fail_op"
+        old_password = "pass123456"
+        await _create_operator(username, old_password)
+        login_body, _ = await _login(client, username, old_password)
+        token = login_body["data"]["token"]
+
+        resp = await client.put(
+            "/api/v1/operator/me/password",
+            headers=_auth_header(token),
+            json={"old_password": "wrongpass", "new_password": "pass123457"},
+        )
+        assert resp.status_code == 401
+        assert resp.json()["code"] == 2002
 
 
 class TestLogoutEndpoint:

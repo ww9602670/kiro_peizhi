@@ -16,6 +16,7 @@ from app.engine.adapters.base import (
     InstallInfo,
     LoginResult,
     PlatformAdapter,
+    RemoteLoginRequired,
 )
 from app.engine.adapters.config import DEFAULT_HEADERS, MID_CODES
 from app.engine.adapters.jnd_dw3_profiles import get_jnd_dw3_profile
@@ -327,8 +328,19 @@ class JNDAdapter(PlatformAdapter):
                 "GetCurrentInstall response is not a JSON object"
             )
 
+        raw_state = self._safe_int(data.get("State"), 0)
+        if raw_state < 0:
+            msg = self._safe_text(data.get("Msg")) or f"GetCurrentInstall State={raw_state}"
+            logger.warning(
+                "GetCurrentInstall requires re-login state=%s msg=%s summary=%s",
+                raw_state,
+                msg,
+                self._safe_response_summary(data),
+            )
+            raise RemoteLoginRequired(raw_state=raw_state, message=msg)
+
         issue = self._require_text(data, "Installments")
-        normalized_state = self._normalize_state(data.get("State", 0))
+        normalized_state = self._normalize_state(raw_state)
         close_countdown = self._non_negative_int(data.get("CloseTimeStamp", 0), 0)
         open_countdown = self._non_negative_int(data.get("OpenTimeStamp", 0), 0)
 
@@ -454,7 +466,7 @@ class JNDAdapter(PlatformAdapter):
             - Amount: 分，100 = 1元
             - Odds: 10000倍整数，如 19834 表示赔率 1.9834
         """
-        url = f"{self.base_url}/PlaceBet/Confirmbet"
+        url = f"{self.base_url}/PlaceBet/Confirmbet?lotteryType={self.lottery_type}"
         form_data: dict[str, str] = {}
         for i, bet in enumerate(betdata):
             # 分转元，10000倍整数转浮点
@@ -601,7 +613,7 @@ class JNDAdapter(PlatformAdapter):
         return odds
 
     async def place_bet(self, issue: str, betdata: list[dict]) -> BetResult:
-        url = f"{self.base_url}/PlaceBet/Confirmbet"
+        url = f"{self.base_url}/PlaceBet/Confirmbet?lotteryType={self.lottery_type}"
         form_data: dict[str, str] = {}
         for i, bet in enumerate(betdata):
             amount_fen = self._safe_int(bet["Amount"], 0)

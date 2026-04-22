@@ -5,7 +5,7 @@ export type StrategyPlatformType = 'JND28WEB' | 'JND282' | 'LUCKYSB';
 export interface StrategyCreate {
   account_id: number;
   name: string;
-  type: 'flat' | 'martin' | 'red_wave_double_martin';
+  type: 'flat' | 'martin' | 'red_wave_double_martin' | 'green_wave_single_martin';
   play_code: string;
   base_amount: number;
   martin_sequence: number[] | null;

@@ -1,18 +1,26 @@
-/**
- * 仪表盘 API 契约类型
- * 与后端 backend/app/schemas/dashboard.py 一一对应
- */
-
+import type { AlertInfo } from './alert';
 import type { BetOrderInfo } from './bet-order';
 import type { StrategyInfo } from './strategy';
 
+export interface RecentLotteryResult {
+  id: number;
+  issue: string;
+  open_result: string;
+  sum_value: number;
+  open_time: string | null;
+  created_at: string;
+}
+
 export interface OperatorDashboard {
-  balance: number;          // 元
-  daily_pnl: number;        // 元
-  total_pnl: number;        // 元
+  balance: number;
+  daily_pnl: number;
+  total_pnl: number;
+  countdown_platform_type: string;
   running_strategies: StrategyInfo[];
   pending_bets: BetOrderInfo[];
   unread_alerts: number;
+  recent_results: RecentLotteryResult[];
+  recent_alerts: AlertInfo[];
 }
 
 export interface OperatorSummary {

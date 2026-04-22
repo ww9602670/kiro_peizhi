@@ -52,7 +52,7 @@ try {
     Write-Host ""
     Write-Host "请在另一个终端启动后端服务：" -ForegroundColor Yellow
     Write-Host "  cd backend" -ForegroundColor Cyan
-    Write-Host "  uvicorn app.main:app --host 0.0.0.0 --port 8888" -ForegroundColor Cyan
+    Write-Host "  uvicorn app.main:app --host 0.0.0.0 --port 8888 --reload" -ForegroundColor Cyan
     Write-Host ""
     exit 1
 }

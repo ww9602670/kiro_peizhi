@@ -44,7 +44,8 @@ from app.utils.strategy_timing import (
     BET_TIMING_MIN,
     build_candidate_from_row,
     build_timing_candidate,
-    normalize_red_wave_double_play_code,
+    is_wave_strategy_type,
+    normalize_wave_strategy_play_code,
     resolve_timing_conflicts,
     summarize_timing_conflicts,
 )
@@ -59,22 +60,22 @@ from app.utils.luckysb_play_codes import (
 router = APIRouter()
 
 DW3_PLAY_CODE_LABELS: dict[str, str] = {
-    "DW3_BS_BBB": "DW3 Big-Big-Big",
-    "DW3_BS_BBS": "DW3 Big-Big-Small",
-    "DW3_BS_BSB": "DW3 Big-Small-Big",
-    "DW3_BS_BSS": "DW3 Big-Small-Small",
-    "DW3_BS_SBB": "DW3 Small-Big-Big",
-    "DW3_BS_SBS": "DW3 Small-Big-Small",
-    "DW3_BS_SSB": "DW3 Small-Small-Big",
-    "DW3_BS_SSS": "DW3 Small-Small-Small",
-    "DW3_OE_OOO": "DW3 Odd-Odd-Odd",
-    "DW3_OE_OOE": "DW3 Odd-Odd-Even",
-    "DW3_OE_OEO": "DW3 Odd-Even-Odd",
-    "DW3_OE_OEE": "DW3 Odd-Even-Even",
-    "DW3_OE_EOO": "DW3 Even-Odd-Odd",
-    "DW3_OE_EOE": "DW3 Even-Odd-Even",
-    "DW3_OE_EEO": "DW3 Even-Even-Odd",
-    "DW3_OE_EEE": "DW3 Even-Even-Even",
+    "DW3_BS_BBB": "大大大",
+    "DW3_BS_BBS": "大大小",
+    "DW3_BS_BSB": "大小大",
+    "DW3_BS_BSS": "大小小",
+    "DW3_BS_SBB": "小大大",
+    "DW3_BS_SBS": "小大小",
+    "DW3_BS_SSB": "小小大",
+    "DW3_BS_SSS": "小小小",
+    "DW3_OE_OOO": "单单单",
+    "DW3_OE_OOE": "单单双",
+    "DW3_OE_OEO": "单双单",
+    "DW3_OE_OEE": "单双双",
+    "DW3_OE_EOO": "双单单",
+    "DW3_OE_EOE": "双单双",
+    "DW3_OE_EEO": "双双单",
+    "DW3_OE_EEE": "双双双",
 }
 
 
@@ -489,10 +490,10 @@ async def update_strategy(
     if body.play_code is not None:
         if requested_platform_type == LUCKYSB_PLATFORM_TYPE:
             update_fields["play_code"] = body.play_code
-        elif existing["type"] == "red_wave_double_martin":
+        elif is_wave_strategy_type(existing["type"]):
             try:
-                update_fields["play_code"] = normalize_red_wave_double_play_code(
-                    body.play_code
+                update_fields["play_code"] = normalize_wave_strategy_play_code(
+                    existing["type"], body.play_code
                 )
             except ValueError as exc:
                 raise BizError(1002, str(exc), status_code=400)
@@ -504,11 +505,11 @@ async def update_strategy(
             except ValueError as exc:
                 raise BizError(1002, str(exc), status_code=400)
         else:
-            raise BizError(
-                1002,
-                "play_code update is only allowed for red_wave_double_martin or DW3 flat/martin",
-                status_code=400,
-            )
+                raise BizError(
+                    1002,
+                    "play_code update is only allowed for wave strategies or DW3 flat/martin",
+                    status_code=400,
+                )
     if body.martin_sequence is not None:
         # 
         for v in body.martin_sequence:
@@ -650,19 +651,6 @@ async def _transition_strategy(
                 bet_timing=resolved_bet_timing,
             )
 
-    row = await strategy_update_status(
-        db,
-        strategy_id=strategy_id,
-        operator_id=operator["id"],
-        status=target_status,
-    )
-    
-    logger.info(
-        " strategy_id=%d new_status=%s",
-        strategy_id,
-        target_status,
-    )
-    
     #  EngineManager
     try:
         engine = getattr(request.app.state, "engine", None)
@@ -707,6 +695,8 @@ async def _transition_strategy(
             and s.get("status") == "running"
             and _normalize_strategy_platform_type(s.get("platform_type")) == strategy_platform_type
         ]
+        if not any(int(s.get("id")) == int(strategy_id) for s in running_strategies):
+            running_strategies.append({**existing, "status": "running"})
         
         logger.info(
             "  running account_id=%d count=%d",
@@ -802,6 +792,12 @@ async def _transition_strategy(
         except Exception as e:
             logger.exception(f"暂停移除策略异常: {e}")
     
+    row = await strategy_update_status(
+        db,
+        strategy_id=strategy_id,
+        operator_id=operator["id"],
+        status=target_status,
+    )
     logger.info(" strategy_id=%d new_status=%s", strategy_id, target_status)
     return _to_strategy_info(row)
 

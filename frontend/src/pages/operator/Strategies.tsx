@@ -1,36 +1,35 @@
-/**
- * 策略管理页面（Mobile-First）
- * - 策略列表（卡片布局）
- * - 状态标签、操作按钮
- * - 创建/编辑表单
- */
-
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { isApiError } from '@/api/request';
-import {
-  listStrategies,
-  deleteStrategy,
-  startStrategy,
-  pauseStrategy,
-  stopStrategy,
-} from '@/api/strategies';
-import type { StrategyInfo } from '@/types/api/strategy';
-import StrategyStatusTag from '@/components/StrategyStatusTag';
 import { CountdownDisplay } from '@/components/CountdownDisplay';
+import {
+  deleteStrategy,
+  listStrategies,
+  pauseStrategy,
+  startStrategy,
+  stopStrategy,
+  updateStrategy,
+} from '@/api/strategies';
 import ConfirmDialog from '@/components/ConfirmDialog';
+import StrategyStatusTag from '@/components/StrategyStatusTag';
 import Toast from '@/components/Toast';
 import { useConfirm } from '@/hooks/useConfirm';
 import { useToast } from '@/hooks/useToast';
+import type { StrategyInfo } from '@/types/api/strategy';
 import { getPlatformLabel } from '@/utils/platformLabels';
 import { getPlayCodeDisplay } from '@/utils/playCodeDisplay';
+import Backtest from './Backtest';
+import BetOrders from './BetOrders';
 import StrategyForm from './StrategyForm';
 import './Strategies.css';
 
 function getTypeBadge(type: string): { label: string; className: string } {
-  if (type === 'red_wave_double_martin') return { label: '红波追双', className: 'type-badge-martin' };
+  if (type === 'red_wave_double_martin') return { label: '红波双马丁', className: 'type-badge-martin' };
+  if (type === 'green_wave_single_martin') return { label: '绿波追单', className: 'type-badge-martin' };
   if (type === 'martin') return { label: '马丁', className: 'type-badge-martin' };
-  return { label: '平注', className: 'type-badge-flat' };
+  return { label: '普通', className: 'type-badge-flat' };
 }
+
+type StrategyWorkspace = 'list' | 'orders' | 'backtest';
 
 interface StrategiesProps {
   createIntent?: StrategyCreateIntent | null;
@@ -38,20 +37,51 @@ interface StrategiesProps {
 }
 
 interface StrategyCreateIntent {
-  accountId: number;
+  accountId?: number;
   nonce: number;
+}
+
+const MANUAL_RELOGIN_MESSAGE = '需要人工处理：请前往账号页重新登录后再试。';
+const MANUAL_CONFIRM_ODDS_MESSAGE = '需要人工处理：请先确认赔率后再继续。';
+const TOAST_MERGE_WINDOW_MS = 1500;
+const RELOGIN_HINTS = ['session', 'worker', 'login', 'relogin', 'auth', 'expired', '未登录', '重新登录', '登录失效', '验证'];
+const ODDS_HINTS = ['odds', '赔率', '未确认', 'unconfirmed', 'confirm'];
+
+function normalizeOperatorMessage(rawMessage: string | null | undefined, fallback: string): string {
+  const text = typeof rawMessage === 'string' ? rawMessage.trim() : '';
+  if (!text) return fallback;
+  const lowerText = text.toLowerCase();
+  if (ODDS_HINTS.some((hint) => lowerText.includes(hint))) return MANUAL_CONFIRM_ODDS_MESSAGE;
+  if (RELOGIN_HINTS.some((hint) => lowerText.includes(hint))) return MANUAL_RELOGIN_MESSAGE;
+  return text;
 }
 
 export default function Strategies({ createIntent, onCreateIntentConsumed }: StrategiesProps) {
   const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [workspace, setWorkspace] = useState<StrategyWorkspace>('list');
   const [showForm, setShowForm] = useState(false);
   const [editingStrategy, setEditingStrategy] = useState<StrategyInfo | null>(null);
   const [createAccountId, setCreateAccountId] = useState<number | undefined>(undefined);
   const [actionLoading, setActionLoading] = useState<Record<number, string>>({});
   const { confirmState, confirm, handleConfirm, handleCancel } = useConfirm();
   const { messages, showToast, removeToast } = useToast();
+  const actionLockRef = useRef<Record<number, string>>({});
+  const deleteConfirmLockRef = useRef<Set<number>>(new Set());
+  const recentToastRef = useRef<Map<string, number>>(new Map());
+
+  const showMergedToast = useCallback(
+    (rawMessage: string | null | undefined, fallback: string) => {
+      const message = normalizeOperatorMessage(rawMessage, fallback);
+      const now = Date.now();
+      const lastShownAt = recentToastRef.current.get(message) ?? 0;
+      if (now - lastShownAt < TOAST_MERGE_WINDOW_MS) return;
+      recentToastRef.current.set(message, now);
+      showToast(message);
+    },
+    [showToast]
+  );
 
   const fetchStrategies = useCallback(async () => {
     try {
@@ -59,8 +89,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
       const res = await listStrategies();
       setStrategies(res.data ?? []);
     } catch (err) {
-      if (isApiError(err)) setError(err.message);
-      else setError('加载策略列表失败');
+      setError(isApiError(err) ? err.message : '加载策略失败，请稍后再试。');
     } finally {
       setLoading(false);
     }
@@ -71,49 +100,76 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   }, [fetchStrategies]);
 
   useEffect(() => {
-    if (!createIntent) return;
+    if (!createIntent) {
+      return;
+    }
+    setWorkspace('list');
     setEditingStrategy(null);
     setCreateAccountId(createIntent.accountId);
     setShowForm(true);
     onCreateIntentConsumed?.();
   }, [createIntent, onCreateIntentConsumed]);
 
-  const withActionLoading = async (id: number, action: string, fn: () => Promise<void>) => {
-    setActionLoading((prev) => ({ ...prev, [id]: action }));
-    try {
-      await fn();
-      await fetchStrategies();
-    } catch (err) {
-      showToast(isApiError(err) ? err.message : '操作失败');
-    } finally {
-      setActionLoading((prev) => {
-        const next = { ...prev };
-        delete next[id];
-        return next;
-      });
-    }
-  };
-
-  const handleStart = (id: number) => withActionLoading(id, 'start', () => startStrategy(id).then(() => {}));
-  const handlePause = (id: number) => withActionLoading(id, 'pause', () => pauseStrategy(id).then(() => {}));
-  const handleStop = (id: number) => withActionLoading(id, 'stop', () => stopStrategy(id).then(() => {}));
-
-  const handleDelete = async (id: number, name: string) => {
-    if (!(await confirm(`确定删除策略「${name}」？`))) return;
-    withActionLoading(id, 'delete', async () => {
+  const withActionLoadingSafe = useCallback(
+    async (id: number, action: string, task: () => Promise<void>, fallbackError: string) => {
+      if (actionLockRef.current[id]) return;
+      actionLockRef.current[id] = action;
+      setActionLoading((prev) => ({ ...prev, [id]: action }));
       try {
-        await deleteStrategy(id);
+        await task();
+        await fetchStrategies();
       } catch (err) {
-        if (isApiError(err) && err.message.includes('投注记录')) {
-          if (await confirm(`${err.message}\n\n是否强制删除（同时删除关联的投注记录）？`)) {
-            await deleteStrategy(id, true);
-            return;
+        showMergedToast(isApiError(err) ? err.message : '', fallbackError);
+      } finally {
+        delete actionLockRef.current[id];
+        setActionLoading((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+      }
+    },
+    [fetchStrategies, showMergedToast]
+  );
+
+  const handleStartSafe = (id: number) =>
+    withActionLoadingSafe(id, 'start', () => startStrategy(id).then(() => {}), '操作失败，请稍后再试。');
+
+  const handlePauseSafe = (id: number) =>
+    withActionLoadingSafe(id, 'pause', () => pauseStrategy(id).then(() => {}), '操作失败，请稍后再试。');
+
+  const handleStopSafe = (id: number) =>
+    withActionLoadingSafe(id, 'stop', () => stopStrategy(id).then(() => {}), '操作失败，请稍后再试。');
+
+  const handleSimulationToggleSafe = (strategy: StrategyInfo) =>
+    withActionLoadingSafe(
+      strategy.id,
+      'simulation',
+      () => updateStrategy(strategy.id, { simulation: !strategy.simulation }).then(() => {}),
+      '操作失败，请稍后再试。'
+    );
+
+  const handleDeleteSafe = async (id: number, name: string) => {
+    if (actionLockRef.current[id] || deleteConfirmLockRef.current.has(id)) return;
+    deleteConfirmLockRef.current.add(id);
+    try {
+      if (!(await confirm(`确认删除策略“${name}”吗？`))) return;
+      await withActionLoadingSafe(id, 'delete', async () => {
+        try {
+          await deleteStrategy(id);
+        } catch (err) {
+          if (isApiError(err) && err.message.includes('投注记录')) {
+            if (await confirm(`${err.message}\n\n确认继续强制删除吗？`)) {
+              await deleteStrategy(id, true);
+              return;
+            }
           }
           throw err;
         }
-        throw err;
-      }
-    });
+      }, '删除失败，请稍后再试。');
+    } finally {
+      deleteConfirmLockRef.current.delete(id);
+    }
   };
 
   const handleEdit = (strategy: StrategyInfo) => {
@@ -123,6 +179,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   };
 
   const handleCreate = () => {
+    setWorkspace('list');
     setEditingStrategy(null);
     setCreateAccountId(undefined);
     setShowForm(true);
@@ -132,7 +189,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     setShowForm(false);
     setEditingStrategy(null);
     setCreateAccountId(undefined);
-    fetchStrategies();
+    void fetchStrategies();
   };
 
   const handleFormCancel = () => {
@@ -163,52 +220,96 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
         onConfirm={handleConfirm}
         onCancel={handleCancel}
       />
-      <div className="strategies-header">
-        <h1 className="strategies-title">投注策略</h1>
-      </div>
 
-      <div className="create-section">
+      <section className="strategies-countdown-section">
+        {/* Use the first running strategy's platform; fall back to first loaded strategy,
+            then JND28WEB as the operator console primary deployment target. */}
+        <CountdownDisplay
+          platformType={
+            strategies.find((s) => s.status === 'running')?.platform_type ??
+            strategies[0]?.platform_type ??
+            'JND28WEB'
+          }
+        />
+      </section>
+
+      <div className="strategies-header">
+        <div>
+          <h1 className="strategies-title">投注策略</h1>
+          <p className="strategies-subtitle">策略、投注记录和回测统一收口在这一页处理。</p>
+        </div>
         <button className="create-btn" onClick={handleCreate} type="button">
           + 创建策略
         </button>
       </div>
 
-      {/* 彩票倒计时 */}
-      <div className="countdown-section">
-        <CountdownDisplay />
+      <div className="strategy-workspace-tabs" role="tablist" aria-label="策略工作区">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={workspace === 'list'}
+          className={`workspace-tab ${workspace === 'list' ? 'workspace-tab-active' : ''}`}
+          onClick={() => setWorkspace('list')}
+        >
+          策略列表
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={workspace === 'orders'}
+          className={`workspace-tab ${workspace === 'orders' ? 'workspace-tab-active' : ''}`}
+          onClick={() => setWorkspace('orders')}
+        >
+          投注记录
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={workspace === 'backtest'}
+          className={`workspace-tab ${workspace === 'backtest' ? 'workspace-tab-active' : ''}`}
+          onClick={() => setWorkspace('backtest')}
+        >
+          回测
+        </button>
       </div>
 
-      {loading && <div className="strategies-loading">加载中...</div>}
+      {workspace === 'orders' && <BetOrders />}
+      {workspace === 'backtest' && <Backtest />}
 
-      {!loading && error && (
-        <div className="strategies-error" role="alert">{error}</div>
-      )}
+      {workspace === 'list' && (
+        <>
+          {loading && <div className="strategies-loading">加载中...</div>}
 
-      {!loading && !error && strategies.length === 0 && (
-        <div className="strategies-empty">暂无策略，点击上方按钮创建</div>
-      )}
+          {!loading && error && (
+            <div className="strategies-error" role="alert">{error}</div>
+          )}
 
-      {!loading && !error && strategies.length > 0 && (
-        <div className="strategy-list">
-          {strategies.map((s) => (
-            <StrategyCard
-              key={s.id}
-              strategy={s}
-              actionLoading={actionLoading[s.id]}
-              onStart={handleStart}
-              onPause={handlePause}
-              onStop={handleStop}
-              onDelete={handleDelete}
-              onEdit={handleEdit}
-            />
-          ))}
-        </div>
+          {!loading && !error && strategies.length === 0 && (
+            <div className="strategies-empty">暂无策略，点击上方按钮创建。</div>
+          )}
+
+          {!loading && !error && strategies.length > 0 && (
+            <div className="strategy-list">
+              {strategies.map((strategy) => (
+                <StrategyCard
+                  key={strategy.id}
+                  strategy={strategy}
+                  actionLoading={actionLoading[strategy.id]}
+                  onStart={handleStartSafe}
+                  onPause={handlePauseSafe}
+                  onStop={handleStopSafe}
+                  onDelete={handleDeleteSafe}
+                  onEdit={handleEdit}
+                  onToggleSimulation={handleSimulationToggleSafe}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
 }
-
-/* --- StrategyCard sub-component --- */
 
 interface StrategyCardProps {
   strategy: StrategyInfo;
@@ -218,6 +319,7 @@ interface StrategyCardProps {
   onStop: (id: number) => void;
   onDelete: (id: number, name: string) => void;
   onEdit: (strategy: StrategyInfo) => void;
+  onToggleSimulation: (strategy: StrategyInfo) => void;
 }
 
 function StrategyCard({
@@ -228,17 +330,27 @@ function StrategyCard({
   onStop,
   onDelete,
   onEdit,
+  onToggleSimulation,
 }: StrategyCardProps) {
-  const isActioning = !!actionLoading;
+  const isActioning = Boolean(actionLoading);
   const typeBadge = getTypeBadge(strategy.type);
 
-  const pnlClass = (val: number) =>
-    val > 0 ? 'pnl-positive' : val < 0 ? 'pnl-negative' : '';
+  const pnlClass = (value: number) => (
+    value > 0 ? 'pnl-positive' : value < 0 ? 'pnl-negative' : ''
+  );
+
+  const canToggleSimulation = strategy.status !== 'running';
 
   return (
     <div className="strategy-card">
       <div className="strategy-card-header">
-        <h3 className="strategy-name">{strategy.name}</h3>
+        <div>
+          <h3 className="strategy-name">{strategy.name}</h3>
+          <p className="strategy-mode-line">
+            当前模式：
+            <strong>{strategy.simulation ? '模拟' : '真实'}</strong>
+          </p>
+        </div>
         <div className="strategy-badges">
           <span className={`badge ${typeBadge.className}`}>{typeBadge.label}</span>
           <StrategyStatusTag status={strategy.status} />
@@ -247,34 +359,32 @@ function StrategyCard({
 
       <div className="strategy-info">
         <div className="strategy-info-item">
-          <span className="strategy-info-label">盘口类型</span>
+          <span className="strategy-info-label">平台</span>
           <span className="strategy-info-value">{getPlatformLabel(strategy.platform_type)}</span>
         </div>
         <div className="strategy-info-item">
           <span className="strategy-info-label">玩法</span>
-          <span className="strategy-info-value">{getPlayCodeDisplay(strategy.play_code_name, strategy.play_code)}</span>
+          <span className="strategy-info-value">
+            {getPlayCodeDisplay(strategy.play_code_name, strategy.play_code)}
+          </span>
         </div>
         <div className="strategy-info-item">
           <span className="strategy-info-label">基础金额</span>
           <span className="strategy-info-value">{strategy.base_amount.toFixed(2)} 元</span>
         </div>
         <div className="strategy-info-item">
-          <span className="strategy-info-label">当日盈亏</span>
+          <span className="strategy-info-label">今日盈亏</span>
           <span className={`strategy-info-value ${pnlClass(strategy.daily_pnl)}`}>
             {strategy.daily_pnl >= 0 ? '+' : ''}{strategy.daily_pnl.toFixed(2)}
           </span>
         </div>
         <div className="strategy-info-item">
-          <span className="strategy-info-label">总盈亏</span>
+          <span className="strategy-info-label">累计盈亏</span>
           <span className={`strategy-info-value ${pnlClass(strategy.total_pnl)}`}>
             {strategy.total_pnl >= 0 ? '+' : ''}{strategy.total_pnl.toFixed(2)}
           </span>
         </div>
       </div>
-
-      {strategy.simulation && (
-        <div className="simulation-badge">模拟模式</div>
-      )}
 
       <div className="strategy-actions">
         {strategy.status === 'stopped' && (
@@ -292,10 +402,22 @@ function StrategyCard({
         )}
         {strategy.status === 'running' && (
           <>
-            <button type="button" className="action-btn action-btn-pause" onClick={() => onPause(strategy.id)} disabled={isActioning}>
+            <button
+              type="button"
+              className="action-btn action-btn-pause"
+              onClick={() => onPause(strategy.id)}
+              disabled={isActioning}
+              title="保留马丁级别，稍后可续跑"
+            >
               {actionLoading === 'pause' ? '暂停中...' : '暂停'}
             </button>
-            <button type="button" className="action-btn action-btn-stop" onClick={() => onStop(strategy.id)} disabled={isActioning}>
+            <button
+              type="button"
+              className="action-btn action-btn-stop"
+              onClick={() => onStop(strategy.id)}
+              disabled={isActioning}
+              title="重置马丁级别，回到初始状态"
+            >
               {actionLoading === 'stop' ? '停止中...' : '停止'}
             </button>
           </>
@@ -305,16 +427,42 @@ function StrategyCard({
             <button type="button" className="action-btn action-btn-start" onClick={() => onStart(strategy.id)} disabled={isActioning}>
               {actionLoading === 'start' ? '启动中...' : '启动'}
             </button>
-            <button type="button" className="action-btn action-btn-stop" onClick={() => onStop(strategy.id)} disabled={isActioning}>
+            <button
+              type="button"
+              className="action-btn action-btn-stop"
+              onClick={() => onStop(strategy.id)}
+              disabled={isActioning}
+              title="重置马丁级别，回到初始状态"
+            >
               {actionLoading === 'stop' ? '停止中...' : '停止'}
             </button>
           </>
         )}
         {strategy.status === 'error' && (
-          <button type="button" className="action-btn action-btn-stop" onClick={() => onStop(strategy.id)} disabled={isActioning}>
+          <button
+            type="button"
+            className="action-btn action-btn-stop"
+            onClick={() => onStop(strategy.id)}
+            disabled={isActioning}
+            title="重置马丁级别，回到初始状态"
+          >
             {actionLoading === 'stop' ? '停止中...' : '停止'}
           </button>
         )}
+
+        <button
+          type="button"
+          className="action-btn action-btn-mode"
+          onClick={() => onToggleSimulation(strategy)}
+          disabled={isActioning || !canToggleSimulation}
+          title={canToggleSimulation ? undefined : '运行中不可切换模式，请先暂停或停止'}
+        >
+          {actionLoading === 'simulation'
+            ? '切换中...'
+            : strategy.simulation
+              ? '切到真实'
+              : '切到模拟'}
+        </button>
       </div>
     </div>
   );

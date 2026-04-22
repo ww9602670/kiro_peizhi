@@ -46,7 +46,7 @@ if (-not $backendRunning) {
     Write-Host ""
     Write-Host "请在另一个终端启动后端服务:" -ForegroundColor Cyan
     Write-Host "  cd backend" -ForegroundColor White
-    Write-Host "  uvicorn app.main:app --host 0.0.0.0 --port 8888" -ForegroundColor White
+    Write-Host "  uvicorn app.main:app --host 0.0.0.0 --port 8888 --reload" -ForegroundColor White
     Write-Host ""
     Write-Host "按任意键继续..." -ForegroundColor Yellow
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

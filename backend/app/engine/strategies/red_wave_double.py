@@ -1,9 +1,9 @@
-"""Red-wave trigger + directional double-chase Martin strategy."""
+"""Wave-trigger + directional Martin strategies."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import ClassVar, Optional
 
 from app.engine.strategies.base import (
     BaseStrategy,
@@ -12,11 +12,23 @@ from app.engine.strategies.base import (
     StrategyStopRequest,
 )
 from app.engine.strategies.registry import register_strategy
+from app.utils.strategy_timing import (
+    GREEN_WAVE_SINGLE_ALLOWED_CODES,
+    RED_WAVE_DOUBLE_ALLOWED_CODES,
+)
 
-RED_WAVE_DOUBLE_ALLOWED_CODES = ("B1LM_S", "B2LM_S", "B3LM_S", "DS4")
-_BALL_RED_VALUES = {3, 6, 9}
-_SUM_RED_VALUES = {3, 6, 9, 12, 15, 18, 21, 24}
-_BALL_INDEX = {"B1LM_S": 0, "B2LM_S": 1, "B3LM_S": 2}
+_RED_BALL_VALUES = frozenset({3, 6, 9})
+_RED_SUM_VALUES = frozenset({3, 6, 9, 12, 15, 18, 21, 24})
+_GREEN_BALL_VALUES = frozenset({1, 4, 7})
+_GREEN_SUM_VALUES = frozenset({1, 4, 7, 10, 16, 19, 22, 25})
+_BALL_INDEX = {
+    "B1LM_D": 0,
+    "B1LM_S": 0,
+    "B2LM_D": 1,
+    "B2LM_S": 1,
+    "B3LM_D": 2,
+    "B3LM_S": 2,
+}
 
 
 @dataclass
@@ -25,9 +37,14 @@ class DirectionState:
     level: int = 0
 
 
-def normalize_direction_codes(codes: list[str] | None) -> list[str]:
+def normalize_direction_codes(
+    codes: list[str] | None,
+    *,
+    allowed_codes: tuple[str, ...],
+    default_codes: tuple[str, ...],
+) -> list[str]:
     if codes is None:
-        return ["DS4"]
+        return list(default_codes)
     if len(codes) == 0:
         raise ValueError("direction_codes is required")
 
@@ -36,7 +53,7 @@ def normalize_direction_codes(codes: list[str] | None) -> list[str]:
         c = code.strip().upper()
         if not c:
             continue
-        if c not in RED_WAVE_DOUBLE_ALLOWED_CODES:
+        if c not in allowed_codes:
             raise ValueError(f"invalid direction code: {code}")
         if c not in normalized:
             normalized.append(c)
@@ -44,13 +61,18 @@ def normalize_direction_codes(codes: list[str] | None) -> list[str]:
     if not normalized:
         raise ValueError("direction_codes is required")
 
-    ordered = [code for code in RED_WAVE_DOUBLE_ALLOWED_CODES if code in normalized]
+    ordered = [code for code in allowed_codes if code in normalized]
     return ordered
 
 
-@register_strategy("red_wave_double_martin")
-class RedWaveDoubleMartinStrategy(BaseStrategy):
-    """Directional red-wave trigger + directional double chase."""
+class _WaveDirectionMartinStrategy(BaseStrategy):
+    """Directional wave trigger + directional chase."""
+
+    STRATEGY_NAME: ClassVar[str]
+    ALLOWED_DIRECTION_CODES: ClassVar[tuple[str, ...]]
+    DEFAULT_DIRECTION_CODES: ClassVar[tuple[str, ...]]
+    BALL_TRIGGER_VALUES: ClassVar[frozenset[int]]
+    SUM_TRIGGER_VALUES: ClassVar[frozenset[int]]
 
     def __init__(
         self,
@@ -68,14 +90,18 @@ class RedWaveDoubleMartinStrategy(BaseStrategy):
 
         self._base_amount = base_amount
         self._sequence = [float(v) for v in sequence]
-        self._direction_codes = normalize_direction_codes(direction_codes)
+        self._direction_codes = normalize_direction_codes(
+            direction_codes,
+            allowed_codes=self.ALLOWED_DIRECTION_CODES,
+            default_codes=self.DEFAULT_DIRECTION_CODES,
+        )
         self._states = {
             code: DirectionState(active=False, level=0)
             for code in self._direction_codes
         }
 
     def name(self) -> str:
-        return "red_wave_double_martin"
+        return self.STRATEGY_NAME
 
     @property
     def level(self) -> int:
@@ -110,7 +136,7 @@ class RedWaveDoubleMartinStrategy(BaseStrategy):
             if not state.active:
                 if latest is None:
                     continue
-                if not self._is_red_wave(code, latest.balls, latest.sum_value):
+                if not self._is_target_wave(code, latest.balls, latest.sum_value):
                     continue
                 state.active = True
                 state.level = 0
@@ -167,11 +193,33 @@ class RedWaveDoubleMartinStrategy(BaseStrategy):
             state.level = max(0, min(int(martin_level), len(self._sequence) - 1))
         return None
 
-    def _is_red_wave(self, code: str, balls: list[int], sum_value: int) -> bool:
-        if code == "DS4":
-            return sum_value in _SUM_RED_VALUES
+    def _is_target_wave(self, code: str, balls: list[int], sum_value: int) -> bool:
+        if code.startswith("DS"):
+            return sum_value in self.SUM_TRIGGER_VALUES
 
         ball_index = _BALL_INDEX[code]
         if ball_index >= len(balls):
             return False
-        return balls[ball_index] in _BALL_RED_VALUES
+        return balls[ball_index] in self.BALL_TRIGGER_VALUES
+
+
+@register_strategy("red_wave_double_martin")
+class RedWaveDoubleMartinStrategy(_WaveDirectionMartinStrategy):
+    """Red-wave trigger + directional double chase."""
+
+    STRATEGY_NAME = "red_wave_double_martin"
+    ALLOWED_DIRECTION_CODES = RED_WAVE_DOUBLE_ALLOWED_CODES
+    DEFAULT_DIRECTION_CODES = ("DS4",)
+    BALL_TRIGGER_VALUES = _RED_BALL_VALUES
+    SUM_TRIGGER_VALUES = _RED_SUM_VALUES
+
+
+@register_strategy("green_wave_single_martin")
+class GreenWaveSingleMartinStrategy(_WaveDirectionMartinStrategy):
+    """Green-wave trigger + directional single chase."""
+
+    STRATEGY_NAME = "green_wave_single_martin"
+    ALLOWED_DIRECTION_CODES = GREEN_WAVE_SINGLE_ALLOWED_CODES
+    DEFAULT_DIRECTION_CODES = ("DS3",)
+    BALL_TRIGGER_VALUES = _GREEN_BALL_VALUES
+    SUM_TRIGGER_VALUES = _GREEN_SUM_VALUES

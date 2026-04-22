@@ -25,9 +25,11 @@ from app.models.db_ops import (
     bet_order_update_status,
     odds_get_confirmed_map,
     odds_has_records,
+    simulation_bet_order_create,
+    simulation_bet_order_update,
 )
-from app.utils.logger import log_bet
-from app.utils.strategy_timing import SAFE_CLOSE_THRESHOLD
+from app.utils.logger import log_bet, log_countdown_validation
+from app.utils.strategy_timing import SAFE_CLOSE_THRESHOLD, WAVE_STRATEGY_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,37 @@ class BetExecutor:
         self.operator_id = operator_id
         self.account_id = account_id
         self.platform_type = platform_type
+
+    def _log_confirmbet_terminal(
+        self,
+        *,
+        issue: str,
+        betdata: list[dict],
+        result: str,
+        error_code: str,
+        attempt: str,
+        succeed: int | None = None,
+        message: str | None = None,
+        terminal: bool = True,
+        excluded_from_countdown_quant: bool = False,
+    ) -> None:
+        total_amount = sum(int(item.get("Amount", 0) or 0) for item in betdata)
+        log_bet(
+            operator_id=self.operator_id,
+            account_id=self.account_id,
+            issue=issue,
+            key_code="CONFIRMBET_BATCH",
+            amount=total_amount,
+            result=result,
+            request_item_count=len(betdata),
+            attempt=attempt,
+            succeed=succeed,
+            error_code=error_code,
+            terminal=terminal,
+            excluded_from_countdown_quant=excluded_from_countdown_quant,
+            platform_type=self.platform_type,
+            message_text=message,
+        )
 
     async def execute(
         self, install: InstallInfo, signals: list[BetSignal]
@@ -195,11 +228,11 @@ class BetExecutor:
             for signal in simulation_signals:
                 order = self._find_order(orders_created, signal.idempotent_id)
                 if order:
-                    await bet_order_update_status(
+                    await simulation_bet_order_update(
                         self.db,
                         order_id=order["id"],
-                        operator_id=self.operator_id,
                         status="bet_success",
+                        operator_id=self.operator_id,
                         bet_at=_now_bj(),
                     )
                     logger.info(
@@ -275,7 +308,7 @@ class BetExecutor:
         approved: list[BetSignal],
         report: ExecutionReport,
     ) -> list[BetSignal]:
-        """Prevent partial placement for one red-wave strategy in one issue."""
+        """Prevent partial placement for one wave strategy in one issue."""
         if not approved:
             return approved
 
@@ -284,7 +317,7 @@ class BetExecutor:
         red_strategy_ids = {
             sid
             for sid, stype in strategy_types.items()
-            if stype == "red_wave_double_martin"
+            if stype in WAVE_STRATEGY_TYPES
         }
         if not red_strategy_ids:
             return approved
@@ -335,7 +368,7 @@ class BetExecutor:
     # ------------------------------------------------------------------
 
     async def _is_duplicate(self, signal: BetSignal) -> bool:
-        """Check duplicate by idempotent_id in bet_orders."""
+        """Check duplicate by idempotent_id in both real/simulation order tables."""
         row = await (
             await self.db.execute(
                 "SELECT id FROM bet_orders WHERE idempotent_id=?",
@@ -343,6 +376,18 @@ class BetExecutor:
             )
         ).fetchone()
         if row is not None:
+            logger.info(
+                "idempotent_id=%s", signal.idempotent_id
+            )
+            return True
+
+        sim_row = await (
+            await self.db.execute(
+                "SELECT id FROM simulation_bet_orders WHERE idempotent_id=?",
+                (signal.idempotent_id,),
+            )
+        ).fetchone()
+        if sim_row is not None:
             logger.info(
                 "idempotent_id=%s", signal.idempotent_id
             )
@@ -358,21 +403,37 @@ class BetExecutor:
     ) -> dict | None:
         """Create order, return None on IntegrityError (duplicate)."""
         try:
-            order = await bet_order_create(
-                self.db,
-                idempotent_id=signal.idempotent_id,
-                operator_id=self.operator_id,
-                account_id=self.account_id,
-                strategy_id=signal.strategy_id,
-                issue=issue,
-                key_code=signal.key_code,
-                amount=signal.amount,
-                odds=odds,
-                status="pending",
-                simulation=1 if signal.simulation else 0,
-                martin_level=signal.martin_level,
-                actual_platform_type=self.platform_type,
-            )
+            if signal.simulation:
+                order = await simulation_bet_order_create(
+                    self.db,
+                    idempotent_id=signal.idempotent_id,
+                    operator_id=self.operator_id,
+                    account_id=self.account_id,
+                    strategy_id=signal.strategy_id,
+                    issue=issue,
+                    platform_type=self.platform_type,
+                    key_code=signal.key_code,
+                    amount=signal.amount,
+                    odds=odds,
+                    status="pending",
+                )
+                order["simulation"] = 1
+            else:
+                order = await bet_order_create(
+                    self.db,
+                    idempotent_id=signal.idempotent_id,
+                    operator_id=self.operator_id,
+                    account_id=self.account_id,
+                    strategy_id=signal.strategy_id,
+                    issue=issue,
+                    key_code=signal.key_code,
+                    amount=signal.amount,
+                    odds=odds,
+                    status="pending",
+                    simulation=0,
+                    martin_level=signal.martin_level,
+                    actual_platform_type=self.platform_type,
+                )
             return order
         except Exception as e:
             # IntegrityErrorUNIQUE ?
@@ -405,6 +466,15 @@ class BetExecutor:
                 install.issue, betdata
             )
         except (TimeoutError, asyncio.TimeoutError):
+            self._log_confirmbet_terminal(
+                issue=install.issue,
+                betdata=betdata,
+                result="confirmbet_failed",
+                error_code="TIMEOUT",
+                attempt="initial",
+                message="timeout",
+                excluded_from_countdown_quant=True,
+            )
             await self._mark_all_failed(
                 orders_created, "timeout", now_str,
             )
@@ -414,6 +484,15 @@ class BetExecutor:
             return
         except Exception as e:
             fail_reason = f"异常: {type(e).__name__}: {e}"
+            self._log_confirmbet_terminal(
+                issue=install.issue,
+                betdata=betdata,
+                result="confirmbet_failed",
+                error_code=type(e).__name__.upper(),
+                attempt="initial",
+                message=str(e),
+                excluded_from_countdown_quant=isinstance(e, ConnectionError),
+            )
             await self._mark_all_failed(
                 orders_created, fail_reason, now_str,
             )
@@ -424,6 +503,16 @@ class BetExecutor:
 
         # succeed=5: 赔率已变，用实时赔率重试一次
         if result.succeed == 5:
+            self._log_confirmbet_terminal(
+                issue=install.issue,
+                betdata=betdata,
+                result="confirmbet_retry",
+                error_code="ODDS_CHANGED",
+                attempt="initial",
+                succeed=result.succeed,
+                message=result.message,
+                terminal=False,
+            )
             logger.info(
                 "赔率已变(succeed=5), 从平台获取实时赔率重试 issue=%s account_id=%d",
                 install.issue, self.account_id,
@@ -432,6 +521,14 @@ class BetExecutor:
             if result is None:
                 # 获取实时赔率失败
                 fail_reason = "赔率已变, 重新获取实时赔率失败"
+                self._log_confirmbet_terminal(
+                    issue=install.issue,
+                    betdata=betdata,
+                    result="confirmbet_failed",
+                    error_code="ODDS_CHANGED",
+                    attempt="retry",
+                    message="retry_window_closed_or_live_odds_unavailable",
+                )
                 await self._mark_all_failed(
                     orders_created, fail_reason, now_str,
                 )
@@ -439,6 +536,16 @@ class BetExecutor:
                 return
 
         if result.succeed == 1:
+            retry_attempt = "retry" if bool((result.raw_response or {}).get("_retry_attempt")) else "initial"
+            self._log_confirmbet_terminal(
+                issue=install.issue,
+                betdata=betdata,
+                result="confirmbet_success",
+                error_code="SUCCESS",
+                attempt=retry_attempt,
+                succeed=result.succeed,
+                message=result.message,
+            )
             total_bet_amount = 0
             for order in orders_created:
                 if order.get("simulation", 0) == 1:
@@ -462,6 +569,17 @@ class BetExecutor:
             if total_bet_amount > 0:
                 await self._deduct_balance(total_bet_amount)
         else:
+            retry_attempt = "retry" if bool((result.raw_response or {}).get("_retry_attempt")) else "initial"
+            self._log_confirmbet_terminal(
+                issue=install.issue,
+                betdata=betdata,
+                result="confirmbet_failed",
+                error_code=result.error_code,
+                attempt=retry_attempt,
+                succeed=result.succeed,
+                message=result.message,
+                excluded_from_countdown_quant=result.error_code in {"UNKNOWN", "CLOSED"},
+            )
             fail_reason = f"succeed={result.succeed}, message={result.message}"
             await self._mark_all_failed(
                 orders_created, fail_reason, now_str,
@@ -518,7 +636,12 @@ class BetExecutor:
         )
 
         try:
-            return await self.adapter.place_bet(install.issue, new_betdata)
+            result = await self.adapter.place_bet(install.issue, new_betdata)
+            if not isinstance(result.raw_response, dict):
+                result.raw_response = {}
+            result.raw_response["_retry_attempt"] = True
+            result.raw_response["_retry_item_count"] = len(new_betdata)
+            return result
         except Exception:
             logger.exception(
                 "实时赔率重试下注异常 issue=%s account_id=%d",
@@ -559,6 +682,19 @@ class BetExecutor:
             issue == install.issue
             and state == 1
             and remaining > SAFE_CLOSE_THRESHOLD
+        )
+        log_countdown_validation(
+            operator_id=self.operator_id,
+            account_id=self.account_id,
+            issue=install.issue,
+            phase="retry_submit",
+            allowed=is_open,
+            state=state,
+            close_countdown_sec=remaining,
+            platform_type=self.platform_type,
+            expected_issue=install.issue,
+            current_issue=issue or None,
+            reason=None if is_open else "retry_window_closed",
         )
         if not is_open:
             logger.info(

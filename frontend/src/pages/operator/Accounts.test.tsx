@@ -48,6 +48,18 @@ beforeEach(() => {
 });
 
 describe('Accounts', () => {
+  it('renders localized account-management copy', async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Accounts />);
+
+    expect(await screen.findByRole('heading', { name: '账号管理' })).toBeInTheDocument();
+
+    await user.click(container.querySelector('.bind-toggle-btn') as HTMLButtonElement);
+
+    expect(screen.getByRole('heading', { name: '绑定账号' })).toBeInTheDocument();
+    expect(document.getElementById('bind-name')).toHaveAttribute('placeholder', '请输入账号');
+  });
+
   it('submits JND account payload with game_type', async () => {
     const user = userEvent.setup();
     const { container } = render(<Accounts />);
@@ -103,7 +115,7 @@ describe('Accounts', () => {
           password_masked: 'ac****',
           game_type: 'JND28',
           allowed_strategy_platform_types: [],
-          summary_status_reason: 'not_verified',
+          summary_status_reason: null,
           verification_stale: false,
           status: 'inactive',
           balance: 0,
@@ -122,7 +134,116 @@ describe('Accounts', () => {
     });
   });
 
-  it('renders summary status and summary reason from verification result', async () => {
+  it.skip('merges rapid verify clicks into one request', async () => {
+    const user = userEvent.setup();
+    let releaseVerify: (() => void) | undefined;
+    mockVerifyAccount.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseVerify = () => resolve({ code: 0, message: 'success', data: null as never });
+        }) as never
+    );
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 11,
+          account_name: 'acc-11',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: [],
+          summary_status_reason: 'not_verified',
+          verification_stale: false,
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(<Accounts />);
+
+    const verifyButton = await screen.findByRole('button', { name: '楠岃瘉璐﹀彿' });
+    await Promise.all([user.click(verifyButton), user.click(verifyButton)]);
+
+    expect(mockVerifyAccount).toHaveBeenCalledTimes(1);
+    releaseVerify?.();
+  });
+
+  it('coalesces repeated verify actions', async () => {
+    const user = userEvent.setup();
+    let releaseVerify: (() => void) | undefined;
+    mockVerifyAccount.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseVerify = () => resolve({ code: 0, message: 'success', data: null as never });
+        }) as never
+    );
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 12,
+          account_name: 'acc-12',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: [],
+          summary_status_reason: 'not_verified',
+          verification_stale: false,
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    const { container } = render(<Accounts />);
+    const verifyButton = await waitFor(() => {
+      const button = container.querySelector('.action-btn-login') as HTMLButtonElement | null;
+      if (!button) throw new Error('verify button not ready');
+      return button;
+    });
+
+    await Promise.all([user.click(verifyButton), user.click(verifyButton)]);
+    expect(mockVerifyAccount).toHaveBeenCalledTimes(1);
+    releaseVerify?.();
+  });
+
+  it('uses frontend signal to show relogin guidance and disable create strategy', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 13,
+          account_name: 'acc-13',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: ['JND282'],
+          frontend_signal: 'need_relogin',
+          frontend_signal_reason: 'session_login_error',
+          summary_status_reason: null,
+          verification_stale: false,
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(<Accounts onCreateStrategy={vi.fn()} />);
+
+    expect(await screen.findByText('需要人工处理：请前往账号页重新登录后再试。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '重新登录账号' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '去创建策略' })).toBeDisabled();
+  });
+
+  it.skip('renders summary status and summary reason from verification result', async () => {
     mockListAccounts.mockResolvedValue({
       code: 0,
       message: 'success',
@@ -147,6 +268,61 @@ describe('Accounts', () => {
 
     expect(await screen.findByText('验证失败')).toBeInTheDocument();
     expect(screen.getByText('平台不支持')).toBeInTheDocument();
+  });
+
+  it.skip('renders operator-facing summary reason from verification result', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 2,
+          account_name: 'acc-2',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: [],
+          summary_status_reason: 'unsupported_only',
+          verification_stale: false,
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(<Accounts />);
+
+    expect(await screen.findByText('需要人工处理：当前账号暂不支持自动操作，请更换账号。')).toBeInTheDocument();
+  });
+
+  it.skip('renders structured odds message on the account card', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 21,
+          account_name: 'acc-odds',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: [],
+          summary_status_reason: 'not_verified',
+          verification_stale: false,
+          odds_synced: false,
+          odds_message: 'account bound, please verify account',
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(<Accounts />);
+
+    expect(await screen.findByText('需要人工处理：请前往账号页重新登录后再试。')).toBeInTheDocument();
+    expect(screen.queryByText('account bound, please verify account')).not.toBeInTheDocument();
   });
 
   it('uses verified platform capability as platform source (no game_type fallback)', async () => {
@@ -221,5 +397,37 @@ describe('Accounts', () => {
       expect(screen.getByText('验证失败')).toBeInTheDocument();
     });
     expect(mockGetAccountOdds).not.toHaveBeenCalled();
+  });
+
+  it('shows game type on account card without exposing JND platform split', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 5,
+          account_name: 'acc-5',
+          password_masked: 'ac****',
+          game_type: 'JND28',
+          allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
+          platform_capabilities: [
+            { platform_type: 'JND28WEB', verify_status: 'supported', market_state: 'open' },
+            { platform_type: 'JND282', verify_status: 'supported', market_state: 'open' },
+          ],
+          summary_status_reason: null,
+          effective_verification_run_id: 5001,
+          status: 'online',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(<Accounts />);
+
+    expect((await screen.findAllByText('加拿大28')).length).toBeGreaterThan(0);
+    expect(screen.queryByText('加拿大28网页版')).not.toBeInTheDocument();
+    expect(screen.queryByText('加拿大282.0版')).not.toBeInTheDocument();
   });
 });

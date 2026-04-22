@@ -24,6 +24,7 @@ from app.utils.logger import (
     log_balance,
     log_bet,
     log_login,
+    log_countdown_validation,
     log_settlement,
     log_strategy_state,
     set_trace_id,
@@ -361,6 +362,47 @@ class TestLogLogin:
         assert parsed["success"] is False
         assert parsed["fail_reason"] == "invalid_password"
         assert parsed["retry_count"] == 2
+        assert parsed["level"] == "WARNING"
+
+
+class TestLogCountdownValidation:
+    def test_log_countdown_validation_allowed(self, capture_helpers):
+        log_countdown_validation(
+            operator_id=6,
+            account_id=60,
+            issue="20250601088",
+            phase="pre_submit",
+            allowed=True,
+            state=1,
+            close_countdown_sec=24,
+            platform_type="JND28WEB",
+            expected_issue="20250601088",
+            current_issue="20250601088",
+            bet_timing=30,
+            strategy_ids=[11, 12],
+        )
+        parsed = json.loads(capture_helpers.records[-1])
+        assert parsed["action"] == "countdown_validation"
+        assert parsed["allowed"] is True
+        assert parsed["phase"] == "pre_submit"
+        assert parsed["strategy_ids"] == [11, 12]
+        assert parsed["level"] == "INFO"
+
+    def test_log_countdown_validation_blocked(self, capture_helpers):
+        log_countdown_validation(
+            operator_id=6,
+            account_id=60,
+            issue="20250601088",
+            phase="retry_submit",
+            allowed=False,
+            state=2,
+            close_countdown_sec=7,
+            reason="retry_window_closed",
+        )
+        parsed = json.loads(capture_helpers.records[-1])
+        assert parsed["action"] == "countdown_validation"
+        assert parsed["allowed"] is False
+        assert parsed["reason"] == "retry_window_closed"
         assert parsed["level"] == "WARNING"
 
 

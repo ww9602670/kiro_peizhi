@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
-from app.engine.adapters.base import InstallInfo
+from app.engine.adapters.base import InstallInfo, RemoteLoginRequired
 from app.engine.worker import (
     AccountWorker,
     SKIP_THRESHOLD,
@@ -28,6 +28,7 @@ from app.engine.worker import (
     API_RETRY_DELAYS,
     API_RETRY_MAX,
     StrategyRuntimeProfile,
+    WorkerStartupError,
     _parse_result,
 )
 
@@ -172,6 +173,8 @@ class TestDowntimeHandling:
         """state!=1 时不投注"""
         worker = _make_worker()
         worker.running = True
+        worker._startup_ready = True
+        worker._startup_ready = True
         worker._lock_token = "test-lock"
 
         install = _make_install(state=0, close_countdown_sec=0, open_countdown_sec=0)
@@ -241,6 +244,7 @@ class TestExceptionRecovery:
         """ 5  error"""
         worker = _make_worker()
         worker.running = True
+        worker._startup_ready = True
 
         sleep_calls = []
 
@@ -721,7 +725,7 @@ class TestLifecycle:
 
         # Mock _run_with_restart to avoid actual loop
         async def noop():
-            pass
+            worker._resolve_startup_success()
 
         worker._run_with_restart = noop
         await worker.start()
@@ -895,6 +899,7 @@ class TestPBT_P22_WorkerRecoveryIdempotency:
             worker = _make_worker()
             worker.running = True
             worker.status = "running"
+            worker._startup_ready = True
 
             call_count = 0
 
@@ -978,6 +983,38 @@ class TestPBT_P27_SkipThreshold:
 
 
 class TestIssueExecutionPlan:
+    def test_replace_strategy_snapshot_preserves_executed_current_issue_groups(self):
+        worker = _make_worker(
+            strategies={1: MagicMock()},
+            strategy_profiles={
+                1: StrategyRuntimeProfile(strategy_id=1, bet_timing=60),
+            },
+        )
+
+        plan = worker._ensure_issue_execution_plan("20250302001")
+        worker._consume_timing_group(plan.groups[0])
+
+        worker.replace_strategy_snapshot(
+            {1: MagicMock(), 2: MagicMock()},
+            {
+                1: StrategyRuntimeProfile(strategy_id=1, bet_timing=60),
+                2: StrategyRuntimeProfile(strategy_id=2, bet_timing=30),
+            },
+            apply_next_issue_only=False,
+        )
+
+        rebuilt = worker._issue_execution_plan
+        assert rebuilt is not None
+        assert rebuilt.issue == "20250302001"
+        assert rebuilt.executed_strategy_ids == {1}
+
+        pending_groups = {
+            group.bet_timing: group.strategy_ids
+            for group in rebuilt.groups
+            if not group.executed
+        }
+        assert pending_groups == {30: [2]}
+
     @pytest.mark.asyncio
     async def test_run_due_strategy_windows_executes_groups_in_desc_order(self):
         from app.engine.executor import ExecutionReport
@@ -1044,6 +1081,55 @@ class TestIssueExecutionPlan:
         worker.executor.execute.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_run_due_strategy_windows_retries_after_precheck_failed_without_skipping_later_groups(self):
+        from app.engine.adapters.base import RemoteLoginRequired
+        from app.engine.executor import ExecutionReport
+        from app.engine.strategy_runner import BetSignal
+
+        worker = _make_worker(
+            strategies={1: MagicMock(), 2: MagicMock()},
+            strategy_profiles={
+                1: StrategyRuntimeProfile(strategy_id=1, bet_timing=122),
+                2: StrategyRuntimeProfile(strategy_id=2, bet_timing=110),
+            },
+        )
+        worker.running = True
+        worker.adapter.get_current_install = AsyncMock(
+            side_effect=[
+                RemoteLoginRequired(raw_state=-2, message="session expired"),
+                _make_install(close_countdown_sec=100),
+                _make_install(close_countdown_sec=98),
+            ]
+        )
+        worker._fetch_install_with_retry = AsyncMock(
+            return_value=_make_install(close_countdown_sec=100)
+        )
+        worker._collect_signals = AsyncMock(
+            side_effect=[
+                [BetSignal(strategy_id=1, key_code="DX1", amount=1000, idempotent_id="i-1")],
+                [BetSignal(strategy_id=2, key_code="DX2", amount=1000, idempotent_id="i-2")],
+            ]
+        )
+        worker.executor.execute = AsyncMock(
+            side_effect=[ExecutionReport(), ExecutionReport()]
+        )
+        worker._apply_execution_report = AsyncMock()
+
+        with patch("app.engine.worker.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            result = await worker._run_due_strategy_windows(
+                _make_install(close_countdown_sec=101)
+            )
+
+        assert result.close_countdown_sec == 98
+        assert sleep_mock.await_count == 1
+        worker._fetch_install_with_retry.assert_awaited_once()
+        assert worker._collect_signals.call_args_list[0].kwargs["strategy_ids"] == [1]
+        assert worker._collect_signals.call_args_list[1].kwargs["strategy_ids"] == [2]
+        assert worker.executor.execute.await_count == 2
+        assert worker._issue_execution_plan is not None
+        assert worker._issue_execution_plan.skipped_strategy_reasons == {}
+
+    @pytest.mark.asyncio
     async def test_run_due_strategy_windows_marks_dw3_gate_skipped_reason(self):
         runner = MagicMock()
         runner.collect_signals.return_value = []
@@ -1080,6 +1166,56 @@ class TestIssueExecutionPlan:
             1: "gate_skipped_all_blocked",
         }
         worker.executor.execute.assert_not_awaited()
+
+
+class TestCountdownValidationLogging:
+    @pytest.mark.asyncio
+    async def test_revalidate_group_window_logs_allowed_opportunity(self):
+        worker = _make_worker()
+        worker.adapter.get_current_install = AsyncMock(
+            return_value=_make_install(
+                issue="20250302001",
+                state=1,
+                close_countdown_sec=24,
+            )
+        )
+
+        with patch("app.engine.worker.log_countdown_validation") as log_validation:
+            refreshed, reason = await worker._revalidate_group_window(
+                _make_install(issue="20250302001", state=1, close_countdown_sec=28),
+                bet_timing=30,
+                strategy_ids=[1, 2],
+            )
+
+        assert reason is None
+        assert refreshed.close_countdown_sec == 24
+        assert log_validation.call_count == 1
+        assert log_validation.call_args.kwargs["allowed"] is True
+        assert log_validation.call_args.kwargs["phase"] == "pre_submit"
+        assert log_validation.call_args.kwargs["strategy_ids"] == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_revalidate_group_window_logs_blocked_reason(self):
+        worker = _make_worker()
+        worker.adapter.get_current_install = AsyncMock(
+            return_value=_make_install(
+                issue="20250302002",
+                state=1,
+                close_countdown_sec=24,
+            )
+        )
+
+        with patch("app.engine.worker.log_countdown_validation") as log_validation:
+            refreshed, reason = await worker._revalidate_group_window(
+                _make_install(issue="20250302001", state=1, close_countdown_sec=28),
+                bet_timing=30,
+                strategy_ids=[7],
+            )
+
+        assert refreshed.issue == "20250302002"
+        assert reason == "issue_changed"
+        assert log_validation.call_args.kwargs["allowed"] is False
+        assert log_validation.call_args.kwargs["reason"] == "issue_changed"
 
 
 # ==================================================================
@@ -1527,16 +1663,37 @@ class TestFreshStartDetection:
         worker.db.execute = mock_db_execute
 
         # Mock poller
-        install = _make_install(issue="20250302005")
+        install = _make_install(issue="20250302005", close_countdown_sec=60)
         worker.poller.poll = AsyncMock(return_value=install)
 
         await worker._detect_fresh_start()
 
-        # Verify last_issue was set
-        assert worker.poller.last_issue == "20250302005"
+        # Verify the current issue remains joinable
+        assert worker.poller.last_issue == ""
 
         # Verify settle was NOT called
         worker.settler.settle.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fresh_start_records_last_issue_when_window_not_safe(self):
+        worker = _make_worker()
+        worker.running = False
+        worker.session.login = AsyncMock()
+
+        mock_cursor_count = AsyncMock()
+        mock_cursor_count.fetchone = AsyncMock(return_value={"cnt": 0})
+
+        async def mock_db_execute(sql, params=None):
+            return mock_cursor_count
+
+        worker.db.execute = mock_db_execute
+        worker.poller.poll = AsyncMock(
+            return_value=_make_install(issue="20250302005", close_countdown_sec=18)
+        )
+
+        await worker._detect_fresh_start()
+
+        assert worker.poller.last_issue == "20250302005"
 
     @pytest.mark.asyncio
     async def test_non_fresh_start_skips_detection(self):
@@ -1660,6 +1817,43 @@ class TestFetchInstallWithRetry:
 
         assert result == install
         assert worker.poller.poll.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_remote_login_reconnects_and_retries(self):
+        worker = _make_worker()
+        install = _make_install()
+        worker.poller.poll = AsyncMock(
+            side_effect=[
+                RemoteLoginRequired(raw_state=-2, message="remote login detected"),
+                install,
+            ]
+        )
+        worker.session._reconnect = AsyncMock()
+        worker.session.ensure_session = AsyncMock(return_value=True)
+
+        result = await worker._fetch_install_with_retry()
+
+        assert result == install
+        worker.session._reconnect.assert_awaited_once()
+        worker.session.ensure_session.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_remote_login_failure_stops_worker_and_alerts(self):
+        worker = _make_worker()
+        worker.running = True
+        worker.poller.poll = AsyncMock(
+            side_effect=RemoteLoginRequired(raw_state=-2, message="remote login detected")
+        )
+        worker.session._reconnect = AsyncMock()
+        worker.session.ensure_session = AsyncMock(return_value=False)
+
+        result = await worker._fetch_install_with_retry()
+
+        assert result is None
+        assert worker.running is False
+        assert worker.status == "error"
+        worker.alert_service.send.assert_awaited_once()
+        assert worker.alert_service.send.await_args.kwargs["alert_type"] == "session_lost"
 
 
 
@@ -1843,6 +2037,7 @@ class TestRenewFailureStopsWorker:
         worker = _make_worker()
         worker.running = True
         worker._lock_token = "my-token"
+        worker.poller.poll = AsyncMock(return_value=_make_install())
 
         mock_cursor = AsyncMock()
         mock_cursor.rowcount = 0  # 续约失败
@@ -1866,6 +2061,7 @@ class TestRenewFailureStopsWorker:
         worker = _make_worker_with_db()
         worker.running = True
         worker._lock_token = "my-token"
+        worker.poller.poll = AsyncMock(return_value=_make_install())
 
         # _renew_lock fails
         mock_cursor_renew = AsyncMock()
@@ -1968,10 +2164,9 @@ class TestStartWithLock:
 
         # Mock _run_with_restart to avoid actual loop
         async def noop():
-            pass
+            worker._resolve_startup_success()
 
         worker._run_with_restart = noop
-
         await worker.start()
 
         assert worker.running is True
@@ -1987,7 +2182,8 @@ class TestStartWithLock:
         worker.db.execute = AsyncMock(return_value=mock_cursor)
         worker.db.commit = AsyncMock()
 
-        await worker.start()
+        with pytest.raises(WorkerStartupError):
+            await worker.start()
 
         assert worker.running is False
         assert worker.status == "stopped"
@@ -1997,6 +2193,14 @@ class TestStartWithLock:
         worker.alert_service.send.assert_called_once()
         call_kwargs = worker.alert_service.send.call_args.kwargs
         assert call_kwargs["alert_type"] == "worker_lock_conflict"
+
+    @pytest.mark.asyncio
+    async def test_main_loop_login_failure_raises_startup_error(self):
+        worker = _make_worker()
+        worker.session.login = AsyncMock(return_value=False)
+
+        with pytest.raises(WorkerStartupError, match="session login failed"):
+            await worker._main_loop()
 
     @pytest.mark.asyncio
     async def test_start_already_running_skips_lock(self):
@@ -2112,6 +2316,32 @@ class TestFeedbackSettlementResults:
         assert runner1.on_result.call_count == 2
         runner1.on_result.assert_any_call(1, 500, key_code="DX1")
         runner1.on_result.assert_any_call(0, -1000, key_code="DX2")
+
+    @pytest.mark.asyncio
+    async def test_feedback_reads_settled_simulation_orders(self):
+        """妯℃嫙缁撶畻璁㈠崟涔熷簲鍙嶉鍒?runner"""
+        worker = _make_worker()
+        runner1 = AsyncMock()
+        runner1.on_result = AsyncMock()
+        worker.strategies = {10: runner1}
+
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DX1",
+                "is_win": 1,
+                "pnl": 500,
+                "martin_level": None,
+                "simulation": 1,
+            }
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20250302001")
+
+        runner1.on_result.assert_called_once_with(1, 500, key_code="DX1")
 
     @pytest.mark.asyncio
     async def test_feedback_dispatches_to_correct_runners(self):
@@ -2291,6 +2521,41 @@ class TestFeedbackSettlementResults:
         await worker._feedback_settlement_results("20250302001")
 
         runner.on_result.assert_called_once_with(1, 500, key_code="DS4")
+        worker._stop_strategy_runner.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_feedback_ignores_green_wave_settlement_stop_request(self):
+        """Green-wave single must not stop on settlement target-hit requests."""
+        from app.engine.strategies.base import StrategyStopRequest
+
+        worker = _make_worker()
+        runner = AsyncMock()
+        runner.strategy = MagicMock()
+        runner.strategy.name.return_value = "green_wave_single_martin"
+        runner.on_result = AsyncMock(
+            return_value=StrategyStopRequest(
+                should_stop=True,
+                reason="target_hit",
+            )
+        )
+        worker.strategies = {10: runner}
+        worker._stop_strategy_runner = AsyncMock()
+
+        mock_rows = [
+            {
+                "strategy_id": 10,
+                "key_code": "DS3",
+                "is_win": 1,
+                "pnl": 500,
+            },
+        ]
+        mock_cursor = AsyncMock()
+        mock_cursor.fetchall = AsyncMock(return_value=mock_rows)
+        worker.db.execute = AsyncMock(return_value=mock_cursor)
+
+        await worker._feedback_settlement_results("20240101001")
+
+        runner.on_result.assert_called_once_with(1, 500, key_code="DS3")
         worker._stop_strategy_runner.assert_not_called()
 
 

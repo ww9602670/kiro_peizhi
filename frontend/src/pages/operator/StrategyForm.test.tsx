@@ -39,10 +39,11 @@ vi.mock('@/components/PlayCodeSelect', () => ({
 }));
 
 import { listAccounts } from '@/api/accounts';
-import { createStrategy } from '@/api/strategies';
+import { createStrategy, updateStrategy } from '@/api/strategies';
 
 const mockListAccounts = vi.mocked(listAccounts);
 const mockCreateStrategy = vi.mocked(createStrategy);
+const mockUpdateStrategy = vi.mocked(updateStrategy);
 
 const accounts = [
   {
@@ -112,6 +113,28 @@ beforeEach(() => {
       platform_type: 'LUCKYSB',
     },
   });
+  mockUpdateStrategy.mockResolvedValue({
+    code: 0,
+    message: 'success',
+    data: {
+      id: 9,
+      account_id: 1,
+      name: 'edit strategy',
+      type: 'flat',
+      play_code: 'DX1',
+      base_amount: 5,
+      martin_sequence: null,
+      bet_timing: 30,
+      simulation: false,
+      status: 'stopped',
+      martin_level: 0,
+      stop_loss: null,
+      take_profit: null,
+      daily_pnl: 0,
+      total_pnl: 0,
+      platform_type: 'JND28WEB',
+    },
+  });
 });
 
 describe('StrategyForm', () => {
@@ -145,6 +168,51 @@ describe('StrategyForm', () => {
       expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
     });
     expect((document.getElementById('sf-amount') as HTMLInputElement).value).toBe('1');
+  });
+
+  it('removes the simulation switch during create flow but keeps it for edit flow', async () => {
+    const { rerender } = render(
+      <StrategyForm
+        strategy={null}
+        onDone={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
+    });
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+
+    rerender(
+      <StrategyForm
+        strategy={{
+          id: 9,
+          account_id: 1,
+          name: 'edit strategy',
+          type: 'flat',
+          play_code: 'DX1',
+          play_code_name: '大小单双',
+          base_amount: 5,
+          martin_sequence: null,
+          bet_timing: 30,
+          simulation: true,
+          status: 'stopped',
+          martin_level: 0,
+          stop_loss: null,
+          take_profit: null,
+          daily_pnl: 0,
+          total_pnl: 0,
+          platform_type: 'JND28WEB',
+        }}
+        onDone={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('switch')).toBeInTheDocument();
+    });
   });
 
   it('clears invalid strategy type when switching to lucky account', async () => {
@@ -226,6 +294,8 @@ describe('StrategyForm', () => {
     await waitFor(() => {
       expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
     });
+    expect(screen.getByRole('option', { name: 'WEB' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '2.0' })).toBeInTheDocument();
 
     await user.type(document.getElementById('sf-name') as HTMLInputElement, 'jnd flat');
     await user.click(screen.getByRole('button', { name: 'play:empty' }));
@@ -240,6 +310,92 @@ describe('StrategyForm', () => {
           account_id: 1,
           play_code: 'DX1',
           platform_type: 'JND282',
+        }),
+      );
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it('submits green-wave single strategy with default DS3 direction', async () => {
+    const user = userEvent.setup();
+    const onDone = vi.fn();
+
+    render(
+      <StrategyForm
+        strategy={null}
+        initialAccountId={1}
+        onDone={onDone}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
+    });
+
+    await user.type(document.getElementById('sf-name') as HTMLInputElement, 'green single');
+    await user.click(screen.getByRole('button', { name: '绿波追单' }));
+    await user.click(screen.getByRole('button', { name: '创建' }));
+
+    await waitFor(() => {
+      expect(mockCreateStrategy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          account_id: 1,
+          type: 'green_wave_single_martin',
+          play_code: 'DS3',
+          platform_type: 'JND28WEB',
+        }),
+      );
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it('updates existing green-wave single strategy directions', async () => {
+    const user = userEvent.setup();
+    const onDone = vi.fn();
+
+    render(
+      <StrategyForm
+        strategy={{
+          id: 12,
+          account_id: 1,
+          name: 'green edit',
+          type: 'green_wave_single_martin',
+          play_code: 'DS3',
+          play_code_name: '单',
+          base_amount: 5,
+          martin_sequence: [1, 2, 4],
+          bet_timing: 30,
+          simulation: false,
+          status: 'stopped',
+          martin_level: 0,
+          stop_loss: null,
+          take_profit: null,
+          daily_pnl: 0,
+          total_pnl: 0,
+          platform_type: 'JND28WEB',
+        }}
+        onDone={onDone}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '更新' })).toBeInTheDocument();
+    });
+
+    const directionCheckboxes = Array.from(document.querySelectorAll('.direction-checkbox'));
+    expect(directionCheckboxes).toHaveLength(4);
+
+    await user.click(directionCheckboxes[0] as HTMLInputElement);
+    await user.click(screen.getByRole('button', { name: '更新' }));
+
+    await waitFor(() => {
+      expect(mockUpdateStrategy).toHaveBeenCalledWith(
+        12,
+        expect.objectContaining({
+          play_code: 'B1LM_D,DS3',
+          platform_type: 'JND28WEB',
         }),
       );
     });
@@ -282,16 +438,102 @@ describe('StrategyForm', () => {
     await waitFor(() => {
       expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('3');
     });
-    expect(screen.getByText(/verification is stale/i)).toBeInTheDocument();
+    expect(screen.getByText('当前账号验证结果已失效，请重新验证后再创建策略。')).toBeInTheDocument();
 
     const platformSelect = document.getElementById('sf-platform') as HTMLSelectElement;
     expect(platformSelect).toBeDisabled();
     expect(platformSelect.value).toBe('');
-    expect(screen.getByRole('option', { name: 'No verified platform available' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: '暂无可用盘口' })).toBeInTheDocument();
 
     const submitButton = container.querySelector('.form-submit-btn') as HTMLButtonElement;
     expect(submitButton).toBeDisabled();
     expect(mockCreateStrategy).not.toHaveBeenCalled();
+  });
+
+  it('blocks JND submit when no effective verified platform is available', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 4,
+          account_name: 'jnd_no_verified',
+          password_masked: 'jn****',
+          game_type: 'JND28',
+          latest_verification_run_id: 404,
+          effective_verification_run_id: null,
+          verification_stale: false,
+          summary_status_reason: 'not_verified',
+          allowed_strategy_platform_types: [],
+          platform_capabilities: [],
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    const { container } = render(
+      <StrategyForm
+        strategy={null}
+        onDone={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('4');
+    });
+    expect(screen.getByText('当前账号暂无有效验证结果，请先完成账号验证。')).toBeInTheDocument();
+
+    const submitButton = container.querySelector('.form-submit-btn') as HTMLButtonElement;
+    expect(submitButton).toBeDisabled();
+    expect(mockCreateStrategy).not.toHaveBeenCalled();
+  });
+
+  it('locks JND platform selector when only one verified platform exists', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 6,
+          account_name: 'jnd_only_20',
+          password_masked: 'jn****',
+          game_type: 'JND28',
+          latest_verification_run_id: 606,
+          effective_verification_run_id: 606,
+          verification_stale: false,
+          summary_status_reason: null,
+          allowed_strategy_platform_types: ['JND282'],
+          platform_capabilities: [
+            { platform_type: 'JND282', verify_status: 'supported', market_state: 'open' },
+          ],
+          status: 'inactive',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    });
+
+    render(
+      <StrategyForm
+        strategy={null}
+        onDone={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('6');
+    });
+
+    const platformSelect = document.getElementById('sf-platform') as HTMLSelectElement;
+    expect(platformSelect.value).toBe('JND282');
+    expect(platformSelect).toBeDisabled();
+    expect(screen.getByRole('option', { name: '2.0' })).toBeInTheDocument();
   });
 
   it('shows the DW3 multi-strategy risk warning for the same account', async () => {

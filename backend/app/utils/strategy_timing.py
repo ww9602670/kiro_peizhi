@@ -10,6 +10,12 @@ SAFE_CLOSE_THRESHOLD = 18
 SAME_DIRECTION_MIN_GAP = 20
 
 RED_WAVE_DOUBLE_ALLOWED_CODES = ("B1LM_S", "B2LM_S", "B3LM_S", "DS4")
+GREEN_WAVE_SINGLE_ALLOWED_CODES = ("B1LM_D", "B2LM_D", "B3LM_D", "DS3")
+WAVE_STRATEGY_ALLOWED_CODES: dict[str, tuple[str, ...]] = {
+    "red_wave_double_martin": RED_WAVE_DOUBLE_ALLOWED_CODES,
+    "green_wave_single_martin": GREEN_WAVE_SINGLE_ALLOWED_CODES,
+}
+WAVE_STRATEGY_TYPES = tuple(WAVE_STRATEGY_ALLOWED_CODES.keys())
 
 
 @dataclass(frozen=True)
@@ -49,29 +55,45 @@ class TimingResolution:
     reason: str | None = None
 
 
-def normalize_red_wave_double_play_code(play_code: str) -> str:
-    """Normalize red-wave direction codes with the documented ordering."""
+def is_wave_strategy_type(strategy_type: str) -> bool:
+    return strategy_type in WAVE_STRATEGY_ALLOWED_CODES
+
+
+def normalize_wave_strategy_play_code(strategy_type: str, play_code: str) -> str:
+    """Normalize wave-strategy direction codes with the documented ordering."""
+    allowed_codes = WAVE_STRATEGY_ALLOWED_CODES.get(strategy_type)
+    if allowed_codes is None:
+        raise ValueError(f"unsupported wave strategy type: {strategy_type}")
+
     codes: list[str] = []
     for raw in play_code.split(","):
         code = raw.strip().upper()
         if not code:
             continue
-        if code not in RED_WAVE_DOUBLE_ALLOWED_CODES:
-            raise ValueError(f"invalid red wave direction key_code: {code}")
+        if code not in allowed_codes:
+            raise ValueError(f"invalid wave strategy direction key_code: {code}")
         if code not in codes:
             codes.append(code)
 
     if not codes:
-        raise ValueError("red wave direction key_code is required")
+        raise ValueError("wave strategy direction key_code is required")
 
-    ordered = [code for code in RED_WAVE_DOUBLE_ALLOWED_CODES if code in codes]
+    ordered = [code for code in allowed_codes if code in codes]
     return ",".join(ordered)
+
+
+def normalize_red_wave_double_play_code(play_code: str) -> str:
+    return normalize_wave_strategy_play_code("red_wave_double_martin", play_code)
+
+
+def normalize_green_wave_single_play_code(play_code: str) -> str:
+    return normalize_wave_strategy_play_code("green_wave_single_martin", play_code)
 
 
 def normalize_direction_keys(strategy_type: str, play_code: str) -> tuple[str, ...]:
     """Normalize play_code into comparable direction keys."""
-    if strategy_type == "red_wave_double_martin":
-        return tuple(normalize_red_wave_double_play_code(play_code).split(","))
+    if is_wave_strategy_type(strategy_type):
+        return tuple(normalize_wave_strategy_play_code(strategy_type, play_code).split(","))
 
     codes: list[str] = []
     for raw in play_code.split(","):

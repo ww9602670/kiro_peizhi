@@ -223,3 +223,43 @@ def log_login(
         fail_reason=fail_reason,
         retry_count=retry_count,
     )
+
+
+def log_countdown_validation(
+    operator_id: int,
+    account_id: int,
+    issue: str,
+    *,
+    phase: str,
+    allowed: bool,
+    state: int,
+    close_countdown_sec: int,
+    platform_type: Optional[str] = None,
+    expected_issue: Optional[str] = None,
+    current_issue: Optional[str] = None,
+    bet_timing: Optional[int] = None,
+    reason: Optional[str] = None,
+    strategy_ids: Optional[list[int]] = None,
+) -> dict[str, Any]:
+    """Log countdown-driven window validation for quantitative acceptance."""
+    return _log_structured(
+        "countdown_validation",
+        level=logging.INFO if allowed else logging.WARNING,
+        message=(
+            f" phase={phase} issue={issue} allowed={allowed} "
+            f"state={state} close_countdown_sec={close_countdown_sec}"
+        ),
+        operator_id=operator_id,
+        account_id=account_id,
+        issue=issue,
+        phase=phase,
+        allowed=allowed,
+        state=state,
+        close_countdown_sec=close_countdown_sec,
+        platform_type=platform_type,
+        expected_issue=expected_issue,
+        current_issue=current_issue,
+        bet_timing=bet_timing,
+        reason=reason,
+        strategy_ids=strategy_ids,
+    )

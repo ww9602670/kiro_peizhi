@@ -7,7 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.utils.strategy_timing import (
     BET_TIMING_MAX,
     BET_TIMING_MIN,
-    normalize_red_wave_double_play_code,
+    WAVE_STRATEGY_TYPES,
+    normalize_wave_strategy_play_code,
 )
 
 PlatformType = Literal["JND28WEB", "JND282", "LUCKYSB"]
@@ -94,7 +95,7 @@ class StrategyCreate(BaseModel):
 
     account_id: int
     name: str = Field(..., min_length=1, max_length=64)
-    type: Literal["flat", "martin", "red_wave_double_martin"]
+    type: Literal["flat", "martin", "red_wave_double_martin", "green_wave_single_martin"]
     play_code: str = Field(..., min_length=1)
     base_amount: float = Field(..., gt=0)
     martin_sequence: Optional[list[float]] = None
@@ -107,7 +108,7 @@ class StrategyCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_strategy(self):
-        if self.type in ("martin", "red_wave_double_martin"):
+        if self.type == "martin" or self.type in WAVE_STRATEGY_TYPES:
             if not self.martin_sequence:
                 raise ValueError("martin_sequence")
             for value in self.martin_sequence:
@@ -116,8 +117,8 @@ class StrategyCreate(BaseModel):
         elif self.type == "flat":
             self.martin_sequence = None
 
-        if self.type == "red_wave_double_martin":
-            self.play_code = normalize_red_wave_double_play_code(self.play_code)
+        if self.type in WAVE_STRATEGY_TYPES:
+            self.play_code = normalize_wave_strategy_play_code(self.type, self.play_code)
             return self
 
         if has_dw3_prefix(self.play_code):

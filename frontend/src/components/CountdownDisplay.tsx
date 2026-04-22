@@ -1,12 +1,15 @@
 /**
- * Countdown display component
- * - Shows previous issue number + lottery wave-color result
- * - Shows close/open countdown timers
- * - Shows current lottery state (open/closed/drawing)
+ * Countdown display component.
  */
 import { useLotteryCountdown } from '@/hooks/useLotteryCountdown';
 import { STATE_DISPLAY_MAP, LotteryStateEnum } from '@/types/api/lottery';
+import type { RecentLotteryResult } from '@/types/api/dashboard';
 import './CountdownDisplay.css';
+
+interface CountdownDisplayProps {
+  platformType?: string;
+  recentResults?: RecentLotteryResult[];
+}
 
 type WaveTone = 'red' | 'green' | 'blue' | 'special' | 'unknown';
 
@@ -49,13 +52,13 @@ function getSumWave(value: number): WaveTone {
 
 function ResultBalls({ result }: { result: string }) {
   const balls = parseBalls(result);
-  if (!balls) return <span className="no-result">等待开奖</span>;
+  if (!balls) return <span className="no-result">暂无结果</span>;
   const sum = balls[0] + balls[1] + balls[2];
   return (
     <span className="wave-result">
       {balls.map((value, index) => (
         <span key={index} className="wave-item">
-          <span className="wave-label">球{index + 1}</span>
+          <span className="wave-label">{`球${index + 1}`}</span>
           <span className={`wave-value wave-${getBallWave(value)}`}>{value}</span>
         </span>
       ))}
@@ -67,23 +70,49 @@ function ResultBalls({ result }: { result: string }) {
   );
 }
 
-export function CountdownDisplay() {
-  const { data, closeCountdown, openCountdown, error, lastUpdateTime } = useLotteryCountdown();
+function HistoryResultBalls({ result }: { result: string }) {
+  const balls = parseBalls(result);
+  if (!balls) return <span className="recent-result-empty">-</span>;
+  const sum = balls[0] + balls[1] + balls[2];
+  return (
+    <div className="recent-result-balls">
+      {balls.map((value, index) => (
+        <span
+          key={`${index}-${value}`}
+          className={`recent-ball recent-ball-${getBallWave(value)}`}
+        >
+          {value}
+        </span>
+      ))}
+      <span className={`recent-sum recent-sum-${getSumWave(sum)}`}>{sum}</span>
+    </div>
+  );
+}
 
-  const stateDisplay = STATE_DISPLAY_MAP[data?.state as LotteryStateEnum] ?? STATE_DISPLAY_MAP[LotteryStateEnum.UNKNOWN];
+export function CountdownDisplay({ platformType, recentResults }: CountdownDisplayProps = {}) {
+  const { data, closeCountdown, openCountdown, error, lastUpdateTime } = useLotteryCountdown({
+    platformType,
+  });
+
+  const stateDisplay =
+    STATE_DISPLAY_MAP[data?.state as LotteryStateEnum] ??
+    STATE_DISPLAY_MAP[LotteryStateEnum.UNKNOWN];
 
   return (
     <div className="countdown-display">
       {error && (
         <div className="error-banner">
-          {error} {lastUpdateTime && `(最后更新: ${lastUpdateTime.toLocaleTimeString()})`}
+          {error}{' '}
+          {lastUpdateTime && `(更新时间 ${lastUpdateTime.toLocaleTimeString()})`}
         </div>
       )}
+
       <div className="issue-row">
-        <span className="issue-label">最新开奖：</span>
+        <span className="issue-label">上期开奖</span>
         <strong className="issue-number">{data?.pre_installments || '-'}</strong>
         <ResultBalls result={data?.pre_lottery_result || ''} />
       </div>
+
       <div className="countdown-row">
         <div className="countdown-item">
           <span>当前期号</span>
@@ -95,13 +124,49 @@ export function CountdownDisplay() {
         </div>
         <div className="countdown-item">
           <span>封盘倒计时</span>
-          <strong className="cd-value">{closeCountdown}<small>秒</small></strong>
+          <strong className="cd-value">
+            {closeCountdown}
+            <small>秒</small>
+          </strong>
         </div>
         <div className="countdown-item">
           <span>开奖倒计时</span>
-          <strong className="cd-value">{openCountdown}<small>秒</small></strong>
+          <strong className="cd-value">
+            {openCountdown}
+            <small>秒</small>
+          </strong>
         </div>
       </div>
+
+      {recentResults && recentResults.length > 0 && (
+        <section className="recent-results-panel" aria-label="recent-results">
+          <div className="recent-results-list">
+            {recentResults.map((result) => {
+              const tone = getSumWave(result.sum_value);
+              return (
+                <article
+                  key={result.id}
+                  className={`recent-result-card recent-result-card-${tone}`}
+                >
+                  <div className="recent-result-header">
+                    <strong className="recent-result-issue">{result.issue}</strong>
+                    <span className={`recent-result-sum-tag recent-result-sum-tag-${tone}`}>
+                      {`和值 ${result.sum_value}`}
+                    </span>
+                  </div>
+                  <HistoryResultBalls result={result.open_result} />
+                  <div className="recent-result-footer">
+                    <span className="recent-result-raw">{result.open_result || '-'}</span>
+                    <time className="recent-result-time">
+                      {result.open_time || result.created_at}
+                    </time>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
     </div>
   );
 }

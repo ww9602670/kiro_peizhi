@@ -12,6 +12,7 @@ from app.engine.adapters.base import (
     InstallInfo,
     LoginResult,
     PlatformAdapter,
+    RemoteLoginRequired,
 )
 from app.engine.adapters.config import PLATFORM_CONFIGS
 from app.engine.adapters.jnd import InvalidInstallResponse, JNDAdapter
@@ -274,6 +275,19 @@ class TestGetCurrentInstall:
             await adapter.get_current_install()
 
     @pytest.mark.asyncio
+    async def test_remote_login_state_raises_remote_login_required(self, adapter):
+        _patch_post(adapter, {
+            "State": -2,
+            "Msg": "remote login detected",
+        })
+
+        with pytest.raises(RemoteLoginRequired) as exc_info:
+            await adapter.get_current_install()
+
+        assert exc_info.value.raw_state == -2
+        assert "remote login" in str(exc_info.value)
+
+    @pytest.mark.asyncio
     async def test_negative_countdown_is_clamped_to_zero(self, adapter):
         _patch_post(adapter, {
             "Installments": "3397190",
@@ -465,9 +479,12 @@ class TestPlaceBet:
         result = await adapter.place_bet("3397187", betdata)
 
         assert result.succeed == 1
-        #  _post  form_data  betdata
         call_args = adapter._post.call_args
+        request_url = call_args.args[0] if call_args.args else call_args[1].get("url")
+        assert request_url == "https://test.example.com/PlaceBet/Confirmbet?lotteryType=JND28WEB"
+        #  _post  form_data  betdata
         form_data = call_args.kwargs.get("data") or call_args[1].get("data") or call_args[0][1]
+        assert form_data["lotteryType"] == "JND28WEB"
         assert "betdata[0][Amount]" in form_data
         assert "betdata[1][Amount]" in form_data
         assert form_data["betdata[0][KeyCode]"] == "DX1"

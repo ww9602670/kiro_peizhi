@@ -4,7 +4,7 @@ import { getPlatformLabel } from './platformLabels';
 
 describe('playCodeDisplay', () => {
   it('uses backend play_code_name when available', () => {
-    expect(getPlayCodeDisplay('红波', 'SB1')).toBe('红波');
+    expect(getPlayCodeDisplay('红波单', 'SB1')).toBe('红波单');
   });
 
   it('localizes JND play codes when play_code_name is empty', () => {

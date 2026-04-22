@@ -1,0 +1,154 @@
+.my-page {
+  padding: 16px;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.my-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.my-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.my-subtitle {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 14px;
+}
+
+.my-refresh,
+.my-submit {
+  border: none;
+  border-radius: 10px;
+  background: #1677ff;
+  color: #fff;
+  min-height: 44px;
+  padding: 0 18px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.my-submit:disabled,
+.my-refresh:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.my-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.my-card,
+.my-panel {
+  background: #fff;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+}
+
+.my-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.my-card-label,
+.my-field-label {
+  color: #64748b;
+  font-size: 13px;
+}
+
+.my-card-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.my-panel {
+  margin-bottom: 16px;
+}
+
+.my-panel-title {
+  margin: 0 0 16px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.quota-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-top: 1px solid #e2e8f0;
+}
+
+.quota-row:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.my-form {
+  display: grid;
+  gap: 14px;
+}
+
+.my-field {
+  display: grid;
+  gap: 8px;
+}
+
+.my-input {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+
+.my-message {
+  margin: 0;
+  font-size: 13px;
+}
+
+.my-message-error,
+.my-state-error {
+  color: #dc2626;
+}
+
+.my-message-success {
+  color: #16a34a;
+}
+
+.my-state {
+  text-align: center;
+  padding: 48px 0;
+  color: #64748b;
+}
+
+@media (max-width: 767px) {
+  .my-summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .my-header {
+    flex-direction: column;
+  }
+
+  .my-refresh,
+  .my-submit {
+    width: 100%;
+  }
+}

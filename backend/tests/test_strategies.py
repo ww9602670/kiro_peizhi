@@ -288,6 +288,16 @@ class TestSchemaValidation:
                 martin_sequence=[1, 2, 4],
             )
 
+    def test_green_wave_single_valid(self):
+        from app.schemas.strategy import StrategyCreate
+        s = StrategyCreate(
+            account_id=1, name="green", type="green_wave_single_martin",
+            play_code="DS3,B1LM_D,DS3", base_amount=10.0,
+            martin_sequence=[1, 2, 4],
+        )
+        assert s.martin_sequence == [1, 2, 4]
+        assert s.play_code == "B1LM_D,DS3"
+
 
 # 
 # 5.  API
@@ -412,6 +422,38 @@ async def test_create_red_wave_double_rejects_invalid_direction(client):
     )
     assert resp.status_code == 422
     assert resp.json()["code"] == 1001
+
+
+@pytest.mark.asyncio
+async def test_create_green_wave_single_multi_directions(client):
+    uid = _uid()
+    token, op_id, acc_id = await _create_operator_with_account(f"green_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "green_single",
+            "type": "green_wave_single_martin",
+            "play_code": "DS3,B1LM_D,DS3",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+            "simulation": True,
+            "stop_loss": 100.0,
+            "take_profit": 50.0,
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["type"] == "green_wave_single_martin"
+    assert data["play_code"] == "B1LM_D,DS3"
+    assert data["martin_sequence"] == [1, 2, 4]
+    assert data["simulation"] is True
+    assert data["stop_loss"] == 100.0
+    assert data["take_profit"] == 50.0
 
 
 @pytest.mark.asyncio
@@ -908,6 +950,9 @@ async def test_start_strategy_rejected_without_effective_verification_run(client
     assert resp.json()["code"] == 4002
     assert "effective_verification_run_id" in resp.json()["message"]
     mock_engine.start_worker.assert_not_called()
+    list_resp = await client.get("/api/v1/strategies", headers=headers)
+    strategy = next(item for item in list_resp.json()["data"] if item["id"] == sid)
+    assert strategy["status"] == "stopped"
 
 
 @pytest.mark.asyncio
@@ -941,6 +986,38 @@ async def test_start_strategy_rejected_when_verification_stale(client, mock_engi
     assert resp.json()["code"] == 4002
     assert "verification_stale" in resp.json()["message"]
     mock_engine.start_worker.assert_not_called()
+    list_resp = await client.get("/api/v1/strategies", headers=headers)
+    strategy = next(item for item in list_resp.json()["data"] if item["id"] == sid)
+    assert strategy["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_start_strategy_keeps_stopped_when_worker_start_fails(client, mock_engine):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"start_fail_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "start_fail",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 30,
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+    mock_engine.start_worker.side_effect = RuntimeError("startup failed")
+
+    resp = await client.post(f"/api/v1/strategies/{sid}/start", headers=headers)
+    assert resp.status_code == 500
+
+    list_resp = await client.get("/api/v1/strategies", headers=headers)
+    strategy = next(item for item in list_resp.json()["data"] if item["id"] == sid)
+    assert strategy["status"] == "stopped"
 
 
 # 
@@ -1005,6 +1082,35 @@ async def test_update_red_wave_strategy_play_code(client):
     )
     assert resp.status_code == 200
     assert resp.json()["data"]["play_code"] == "B2LM_S,DS4"
+
+
+@pytest.mark.asyncio
+async def test_update_green_wave_strategy_play_code(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"updgreen_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "upd_green_orig",
+            "type": "green_wave_single_martin",
+            "play_code": "DS3",
+            "base_amount": 10.0,
+            "martin_sequence": [1, 2, 4],
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    resp = await client.put(
+        f"/api/v1/strategies/{sid}",
+        headers=headers,
+        json={"play_code": "B2LM_D,DS3"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["play_code"] == "B2LM_D,DS3"
 
 
 @pytest.mark.asyncio
@@ -1559,3 +1665,104 @@ async def test_strategies_table_has_gate_window_issues_column():
     rows = await (await db.execute("PRAGMA table_info(strategies)")).fetchall()
     column_names = {row["name"] for row in rows}
     assert "gate_window_issues" in column_names
+
+
+@pytest.mark.asyncio
+async def test_list_strategies_reads_simulation_pnl_from_stats(client):
+    from datetime import datetime, timedelta, timezone
+
+    uid = _uid()
+    token, operator_id, account_id = await _create_operator_with_account(f"sim_pnl_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+    real_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": account_id,
+            "name": "real",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "simulation": False,
+        },
+    )
+    sim_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": account_id,
+            "name": "sim",
+            "type": "flat",
+            "play_code": "DX2",
+            "base_amount": 10.0,
+            "simulation": True,
+        },
+    )
+    real_id = real_resp.json()["data"]["id"]
+    sim_id = sim_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE strategies SET daily_pnl=?, total_pnl=?, daily_pnl_date=? WHERE id=?",
+        (1200, 3000, today, real_id),
+    )
+    await db.execute(
+        "UPDATE strategies SET daily_pnl=?, total_pnl=?, daily_pnl_date=? WHERE id=?",
+        (9999, 8888, today, sim_id),
+    )
+    await db.execute(
+        """INSERT INTO simulation_strategy_stats
+           (strategy_id, operator_id, account_id, daily_pnl, total_pnl, daily_pnl_date, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'), datetime('now', '+8 hours'))""",
+        (sim_id, operator_id, account_id, 2500, 4500, today),
+    )
+    await db.commit()
+
+    list_resp = await client.get("/api/v1/strategies", headers=headers)
+    assert list_resp.status_code == 200
+    data = list_resp.json()["data"]
+    by_id = {item["id"]: item for item in data}
+
+    assert by_id[real_id]["daily_pnl"] == 12.0
+    assert by_id[real_id]["total_pnl"] == 30.0
+    assert by_id[sim_id]["daily_pnl"] == 25.0
+    assert by_id[sim_id]["total_pnl"] == 45.0
+
+
+@pytest.mark.asyncio
+async def test_list_strategies_simulation_pnl_falls_back_to_zero_without_stats(client):
+    from datetime import datetime, timedelta, timezone
+
+    uid = _uid()
+    token, _, account_id = await _create_operator_with_account(f"sim_zero_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": account_id,
+            "name": "sim_no_stats",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "simulation": True,
+        },
+    )
+    strategy_id = create_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE strategies SET daily_pnl=?, total_pnl=?, daily_pnl_date=? WHERE id=?",
+        (5000, 7000, today, strategy_id),
+    )
+    await db.commit()
+
+    list_resp = await client.get("/api/v1/strategies", headers=headers)
+    assert list_resp.status_code == 200
+    item = next(x for x in list_resp.json()["data"] if x["id"] == strategy_id)
+    assert item["daily_pnl"] == 0.0
+    assert item["total_pnl"] == 0.0
