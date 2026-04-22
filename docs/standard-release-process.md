@@ -4,6 +4,8 @@
 
 Use one fixed path from local development to server deployment so code changes do not pile up into one large cleanup at the end.
 
+For the scripted path, use [one-click-release-and-rollback.md](./one-click-release-and-rollback.md).
+
 This process assumes the production server uses:
 
 - `/opt/bocai_web/releases/<commit>`
@@ -67,15 +69,28 @@ For the current legacy-to-current schema jump, use:
 
 ## Standard deploy steps
 
-1. Generate or locate the release candidate locally.
-2. Put it on the server under `/opt/bocai_web/releases/<commit>`.
-3. Install backend dependencies for that release using the shared `.venv`.
-4. Install frontend dependencies and build `frontend/dist` for that release if the candidate did not already include `dist`.
-5. Run migration only after backup and rehearsal.
-6. Switch `/opt/bocai_web/current` to the new release.
-7. Restart `bocai-backend`.
-8. Reload nginx.
-9. Run smoke checks:
+1. Preferred path:
+   run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy_one_click.ps1`
+2. That scripted deploy covers:
+   - release candidate generation
+   - push to `web/main`
+   - server backup
+   - backend package sync into shared `.venv`
+   - release switch
+   - backend restart
+   - nginx reload
+   - health checks
+   - `web/server/live` mirror update
+3. If a manual deploy is ever required, the equivalent order is:
+   - generate or locate the release candidate locally
+   - put it on the server under `/opt/bocai_web/releases/<commit>`
+   - install backend dependencies for that release using the shared `.venv`
+   - install frontend dependencies and build `frontend/dist` for that release if the candidate did not already include `dist`
+   - run migration only after backup and rehearsal
+   - switch `/opt/bocai_web/current` to the new release
+   - restart `bocai-backend`
+   - reload nginx
+   - run smoke checks:
    - `/api/v1/health`
    - login
    - operator account list
@@ -87,9 +102,14 @@ For the current legacy-to-current schema jump, use:
 
 If the code is bad but the schema is unchanged:
 
-1. switch `current` back to the previous release
-2. restart `bocai-backend`
-3. reload nginx
+1. Preferred path:
+   run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\rollback_one_click.ps1`
+2. That scripted rollback:
+   - creates a fresh production backup
+   - switches `current` to the rollback target
+   - restarts backend
+   - reloads nginx
+   - updates `web/server/live`
 
 If the schema changed:
 

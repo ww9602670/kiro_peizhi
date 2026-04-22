@@ -90,18 +90,13 @@ python -m pip install --upgrade pip
 ## Release deployment
 
 Use the standard release process in [standard-release-process.md](./standard-release-process.md).
+The preferred scripted path is [one-click-release-and-rollback.md](./one-click-release-and-rollback.md).
 
 The short version is:
 
-1. Prepare a release candidate locally.
-2. Back up `/opt/bocai_web/shared/backend-data/bocai.db` before any migration.
-3. Upload the candidate into `/opt/bocai_web/releases/<commit>`.
-4. Install backend/frontend dependencies for that release.
-5. Run any required migration against a copied database first.
-6. Build the frontend inside that release if `dist` was not shipped.
-7. Switch `current` to the new release.
-8. Restart `bocai-backend` and reload nginx.
-9. Run smoke checks.
+1. Run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy_one_click.ps1`
+2. The script will back up production state, upload the new release, sync backend dependencies, switch `current`, restart backend, reload nginx, and verify health.
+3. For schema-changing releases, keep the same migration rehearsal rule before using the one-click deploy.
 
 ## Smoke checks
 
@@ -128,9 +123,8 @@ Expected backend response:
 
 If the new code fails and the database schema was not changed:
 
-1. switch `current` back to the previous release
-2. restart `bocai-backend`
-3. reload nginx
+1. run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\rollback_one_click.ps1`
+2. the script will back up the current production state and switch back to the previous release
 
 If a migration changed shared data, rollback also requires restoring the database backup.
 
