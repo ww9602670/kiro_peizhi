@@ -12,6 +12,8 @@ from typing import Any, Optional
 
 import aiosqlite
 
+from app.utils.strategy_timing import DEFAULT_BET_TIMING
+
 
 # 
 # helpers
@@ -890,7 +892,7 @@ async def strategy_create(
     base_amount: int,
     martin_sequence: str | None = None,
     strategy_config: str | None = None,
-    bet_timing: int = 30,
+    bet_timing: int = DEFAULT_BET_TIMING,
     simulation: int = 0,
     stop_loss: int | None = None,
     take_profit: int | None = None,

@@ -869,9 +869,9 @@ class TestConfirmbetZeroRetry:
 class TestDeadlineCancel:
     @pytest.mark.asyncio
     async def test_close_countdown_sec_too_small_skips(self, executor, setup_data):
-        """close_countdown_sec <= 10 deadline_seconds <= 0"""
+        """close_countdown_sec <= 5 deadline_seconds <= 0"""
         signal = make_signal(setup_data["strategy"]["id"])
-        install = make_install(close_countdown_sec=10)
+        install = make_install(close_countdown_sec=5)
 
         await executor.execute(install, [signal])
 
@@ -898,8 +898,8 @@ class TestDeadlineCancel:
 
         executor.adapter.place_bet = AsyncMock(side_effect=slow_place_bet)
         signal = make_signal(setup_data["strategy"]["id"])
-        # close_countdown_sec=11  deadline=1 
-        install = make_install(close_countdown_sec=11)
+        # close_countdown_sec=6  deadline=1
+        install = make_install(close_countdown_sec=6)
 
         await executor.execute(install, [signal])
 

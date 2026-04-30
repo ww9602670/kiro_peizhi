@@ -201,6 +201,23 @@ def _parse_fetched_at(value: object) -> Optional[datetime]:
     return None
 
 
+def _snapshot_age_seconds(
+    fetched_at: Optional[datetime],
+    *,
+    now: Optional[datetime] = None,
+) -> int:
+    if fetched_at is None:
+        return 0
+    current = now
+    if current is None:
+        current = datetime.now(fetched_at.tzinfo) if fetched_at.tzinfo else datetime.now()
+    elif fetched_at.tzinfo is not None and current.tzinfo is None:
+        current = current.replace(tzinfo=fetched_at.tzinfo)
+    elif fetched_at.tzinfo is None and current.tzinfo is not None:
+        current = current.replace(tzinfo=None)
+    return max(0, int((current - fetched_at).total_seconds()))
+
+
 @dataclass(slots=True)
 class SharedMarketSnapshot:
     shared_group_id: int
@@ -213,12 +230,13 @@ class SharedMarketSnapshot:
     fetched_at: Optional[datetime]
     source_status: str = "ok"
 
-    def to_install(self) -> InstallInfo:
+    def to_install(self, *, now: Optional[datetime] = None) -> InstallInfo:
+        age_seconds = _snapshot_age_seconds(self.fetched_at, now=now)
         return InstallInfo(
             issue=self.issue,
             state=self.state,
-            close_countdown_sec=self.close_countdown_sec,
-            open_countdown_sec=self.open_countdown_sec,
+            close_countdown_sec=max(0, int(self.close_countdown_sec) - age_seconds),
+            open_countdown_sec=max(0, int(self.open_countdown_sec) - age_seconds),
             pre_issue=self.pre_issue,
             pre_result=self.pre_result,
             is_new_issue=False,

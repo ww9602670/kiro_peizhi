@@ -2,7 +2,7 @@
 
 覆盖：
 - mock 依赖注入
-- 17s/18s/19s 投注时机
+- 7s/8s/9s 投注时机
 - 倒计时驱动主循环
 - 异常恢复 5 次后 error
 - 补结算 / 全新启动检测
@@ -114,29 +114,29 @@ class TestParseResult:
 
 
 # 
-# 17s/18s/19s
+# 7s/8s/9s
 # 
 
 
 class TestBetTiming:
-    """DoDCloseTimeStamp=17s18s19s"""
+    """DoDCloseTimeStamp=7s8s9s"""
 
-    def test_17s_skip(self):
-        """CloseTimeStamp=17s  """
+    def test_7s_skip(self):
+        """CloseTimeStamp=7s  """
         worker = _make_worker()
-        install = _make_install(close_countdown_sec=17)
+        install = _make_install(close_countdown_sec=7)
         assert worker._should_bet(install) is False
 
-    def test_18s_skip(self):
-        """CloseTimeStamp=18s  18s"""
+    def test_8s_skip(self):
+        """CloseTimeStamp=8s  8s"""
         worker = _make_worker()
-        install = _make_install(close_countdown_sec=18)
+        install = _make_install(close_countdown_sec=8)
         assert worker._should_bet(install) is False
 
-    def test_19s_bet(self):
-        """CloseTimeStamp=19s  """
+    def test_9s_bet(self):
+        """CloseTimeStamp=9s  """
         worker = _make_worker()
-        install = _make_install(close_countdown_sec=19)
+        install = _make_install(close_countdown_sec=9)
         assert worker._should_bet(install) is True
 
     def test_30s_bet(self):
@@ -159,7 +159,7 @@ class TestBetTiming:
 
     def test_threshold_constant(self):
         """SKIP_THRESHOLD  18"""
-        assert SKIP_THRESHOLD == 18
+        assert SKIP_THRESHOLD == 8
 
 
 # 
@@ -490,13 +490,13 @@ class TestMainLoop:
 
     @pytest.mark.asyncio
     async def test_skip_threshold_no_execute(self):
-        """CloseTimeStamp <= 18s 时不调用 executor"""
+        """CloseTimeStamp <= SKIP_THRESHOLD 时不调用 executor"""
         worker = _make_worker()
         worker.running = True
         worker._lock_token = "test-lock"
 
         betting_install = _make_install(
-            close_countdown_sec=18,
+            close_countdown_sec=8,
             state=1,
             open_countdown_sec=5,
             pre_issue="20250302000",
@@ -505,7 +505,7 @@ class TestMainLoop:
         settlement_install = _make_install(
             issue="20250302002",
             state=1,
-            close_countdown_sec=18,
+            close_countdown_sec=8,
             open_countdown_sec=5,
             pre_issue="20250302001",
             pre_result="4,2,6",
@@ -932,23 +932,23 @@ class TestPBT_P22_WorkerRecoveryIdempotency:
 
 
 # 
-# PBT: P27  18s 
+# PBT: P27  8s
 # 
 
 
 class TestPBT_P27_SkipThreshold:
-    """P27: the worker only enters the 19..bet_timing window.
+    """P27: the worker only enters the 9..bet_timing window.
 
     **Validates: Requirements 5.1**
 
     Property: For any CloseTimeStamp value, _should_bet returns False
-    when close_countdown_sec <= SKIP_THRESHOLD (18), and only returns True
+    when close_countdown_sec <= SKIP_THRESHOLD (8), and only returns True
     inside the configured strategy window.
     """
 
-    @given(close_countdown_sec=st.integers(min_value=0, max_value=18))
+    @given(close_countdown_sec=st.integers(min_value=0, max_value=8))
     @settings(max_examples=100)
-    def test_pbt_skip_when_lte_18(self, close_countdown_sec: int):
+    def test_pbt_skip_when_lte_8(self, close_countdown_sec: int):
         """CloseTimeStamp 18  _should_bet returns False.
 
         **Validates: Requirements 5.1**
@@ -960,10 +960,10 @@ class TestPBT_P27_SkipThreshold:
             f"but _should_bet returned True"
         )
 
-    @given(close_countdown_sec=st.integers(min_value=19, max_value=30))
+    @given(close_countdown_sec=st.integers(min_value=9, max_value=30))
     @settings(max_examples=100)
     def test_pbt_bet_when_within_default_window(self, close_countdown_sec: int):
-        """CloseTimeStamp inside 19..30 enters the default 30s window."""
+        """CloseTimeStamp inside 9..30 enters the default 30s window."""
         worker = _make_worker()
         install = _make_install(close_countdown_sec=close_countdown_sec)
         assert worker._should_bet(install) is True, (
@@ -1688,7 +1688,7 @@ class TestFreshStartDetection:
 
         worker.db.execute = mock_db_execute
         worker.poller.poll = AsyncMock(
-            return_value=_make_install(issue="20250302005", close_countdown_sec=18)
+            return_value=_make_install(issue="20250302005", close_countdown_sec=8)
         )
 
         await worker._detect_fresh_start()

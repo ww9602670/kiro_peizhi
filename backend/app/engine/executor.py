@@ -30,7 +30,11 @@ from app.models.db_ops import (
     simulation_bet_order_update,
 )
 from app.utils.logger import log_bet, log_countdown_validation
-from app.utils.strategy_timing import SAFE_CLOSE_THRESHOLD, WAVE_STRATEGY_TYPES
+from app.utils.strategy_timing import (
+    EXECUTION_DEADLINE_MARGIN_SECONDS,
+    SAFE_CLOSE_THRESHOLD,
+    WAVE_STRATEGY_TYPES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +106,7 @@ class BetExecutor:
         if not signals:
             return report
 
-        deadline_seconds = install.close_countdown_sec - 10
+        deadline_seconds = install.close_countdown_sec - EXECUTION_DEADLINE_MARGIN_SECONDS
         if deadline_seconds <= 0:
             logger.info(
                 "issue=%sclose_timestamp=%d",

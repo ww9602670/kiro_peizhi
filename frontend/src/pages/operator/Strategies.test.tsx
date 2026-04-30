@@ -37,6 +37,7 @@ vi.mock('@/hooks/useConfirm', () => ({
   useConfirm: () => ({
     confirmState: { open: false, message: '', title: '' },
     confirm: vi.fn().mockResolvedValue(true),
+    notify: vi.fn().mockResolvedValue(undefined),
     handleConfirm: vi.fn(),
     handleCancel: vi.fn(),
   }),

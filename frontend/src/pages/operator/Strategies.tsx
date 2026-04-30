@@ -85,22 +85,22 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   const [editingStrategy, setEditingStrategy] = useState<StrategyInfo | null>(null);
   const [createAccountId, setCreateAccountId] = useState<number | undefined>(undefined);
   const [actionLoading, setActionLoading] = useState<Record<number, string>>({});
-  const { confirmState, confirm, handleConfirm, handleCancel } = useConfirm();
-  const { messages, showToast, removeToast } = useToast();
+  const { confirmState, confirm, notify, handleConfirm, handleCancel } = useConfirm();
+  const { messages, removeToast } = useToast();
   const actionLockRef = useRef<Record<number, string>>({});
   const deleteConfirmLockRef = useRef<Set<number>>(new Set());
   const recentToastRef = useRef<Map<string, number>>(new Map());
 
-  const showMergedToast = useCallback(
+  const showMergedNotice = useCallback(
     (rawMessage: string | null | undefined, fallback: string) => {
       const message = normalizeOperatorMessage(rawMessage, fallback);
       const now = Date.now();
       const lastShownAt = recentToastRef.current.get(message) ?? 0;
       if (now - lastShownAt < TOAST_MERGE_WINDOW_MS) return;
       recentToastRef.current.set(message, now);
-      showToast(message);
+      void notify(message, '操作提示');
     },
-    [showToast]
+    [notify]
   );
 
   const fetchStrategies = useCallback(async () => {
@@ -144,7 +144,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
       return;
     }
     if (!hasAuthorizedStrategyAccount) {
-      showMergedToast(STRATEGY_NOT_AUTHORIZED_MESSAGE, STRATEGY_NOT_AUTHORIZED_MESSAGE);
+      showMergedNotice(STRATEGY_NOT_AUTHORIZED_MESSAGE, STRATEGY_NOT_AUTHORIZED_MESSAGE);
       onCreateIntentConsumed?.();
       return;
     }
@@ -157,7 +157,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     createIntent,
     hasAuthorizedStrategyAccount,
     onCreateIntentConsumed,
-    showMergedToast,
+    showMergedNotice,
     strategyGateLoading,
   ]);
 
@@ -170,7 +170,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
         await task();
         await fetchStrategies();
       } catch (err) {
-        showMergedToast(isApiError(err) ? err.message : '', fallbackError);
+        showMergedNotice(isApiError(err) ? err.message : '', fallbackError);
       } finally {
         delete actionLockRef.current[id];
         setActionLoading((prev) => {
@@ -180,7 +180,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
         });
       }
     },
-    [fetchStrategies, showMergedToast]
+    [fetchStrategies, showMergedNotice]
   );
 
   const handleStartSafe = (id: number) =>
@@ -192,13 +192,21 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   const handleStopSafe = (id: number) =>
     withActionLoadingSafe(id, 'stop', () => stopStrategy(id).then(() => {}), '操作失败，请稍后再试。');
 
-  const handleSimulationToggleSafe = (strategy: StrategyInfo) =>
-    withActionLoadingSafe(
+  const handleSimulationToggleSafe = async (strategy: StrategyInfo) => {
+    if (strategy.simulation) {
+      const ok = await confirm(
+        `确认将策略“${strategy.name}”切换为真实投注吗？切换后启动策略将会向平台真实下注。`,
+        '真实投注确认'
+      );
+      if (!ok) return;
+    }
+    await withActionLoadingSafe(
       strategy.id,
       'simulation',
       () => updateStrategy(strategy.id, { simulation: !strategy.simulation }).then(() => {}),
       '操作失败，请稍后再试。'
     );
+  };
 
   const handleDeleteSafe = async (id: number, name: string) => {
     if (actionLockRef.current[id] || deleteConfirmLockRef.current.has(id)) return;
@@ -221,7 +229,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
 
   const handleCreate = () => {
     if (!hasAuthorizedStrategyAccount) {
-      showMergedToast(STRATEGY_NOT_AUTHORIZED_MESSAGE, STRATEGY_NOT_AUTHORIZED_MESSAGE);
+      showMergedNotice(STRATEGY_NOT_AUTHORIZED_MESSAGE, STRATEGY_NOT_AUTHORIZED_MESSAGE);
       return;
     }
     setWorkspace('list');
@@ -264,6 +272,9 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
         open={confirmState.open}
         message={confirmState.message}
         title={confirmState.title}
+        showCancel={confirmState.showCancel}
+        confirmText={confirmState.confirmText}
+        cancelText={confirmState.cancelText}
         onConfirm={handleConfirm}
         onCancel={handleCancel}
       />

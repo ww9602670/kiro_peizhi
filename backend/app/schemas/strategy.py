@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.utils.strategy_timing import (
     BET_TIMING_MAX,
     BET_TIMING_MIN,
+    DEFAULT_BET_TIMING,
     WAVE_STRATEGY_TYPES,
     normalize_wave_strategy_play_code,
 )
@@ -134,7 +135,7 @@ class StrategyCreate(BaseModel):
                 "play_code": "DX1",
                 "base_amount": 10.0,
                 "martin_sequence": None,
-                "bet_timing": 30,
+                "bet_timing": DEFAULT_BET_TIMING,
                 "simulation": False,
                 "stop_loss": None,
                 "take_profit": None,
@@ -160,7 +161,7 @@ class StrategyCreate(BaseModel):
     base_amount: float = Field(..., gt=0)
     martin_sequence: Optional[list[float]] = None
     strategy_config: Optional[dict[str, Any]] = None
-    bet_timing: int = Field(default=30, ge=BET_TIMING_MIN, le=BET_TIMING_MAX)
+    bet_timing: int = Field(default=DEFAULT_BET_TIMING, ge=BET_TIMING_MIN, le=BET_TIMING_MAX)
     simulation: bool = False
     stop_loss: Optional[float] = Field(default=None, gt=0)
     take_profit: Optional[float] = Field(default=None, gt=0)
@@ -305,7 +306,7 @@ class StrategyInfo(BaseModel):
                 "play_code": "DX1",
                 "base_amount": 10.0,
                 "martin_sequence": None,
-                "bet_timing": 30,
+                "bet_timing": DEFAULT_BET_TIMING,
                 "simulation": False,
                 "status": "stopped",
                 "martin_level": 0,

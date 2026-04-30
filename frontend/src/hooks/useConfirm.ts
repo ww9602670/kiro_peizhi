@@ -8,6 +8,9 @@ interface ConfirmState {
   open: boolean;
   message: string;
   title?: string;
+  showCancel?: boolean;
+  confirmText?: string;
+  cancelText?: string;
 }
 
 export function useConfirm() {
@@ -17,7 +20,14 @@ export function useConfirm() {
   const confirm = useCallback((message: string, title?: string): Promise<boolean> => {
     return new Promise((resolve) => {
       resolveRef.current = resolve;
-      setState({ open: true, message, title });
+      setState({ open: true, message, title, showCancel: true });
+    });
+  }, []);
+
+  const notify = useCallback((message: string, title = '提示'): Promise<void> => {
+    return new Promise((resolve) => {
+      resolveRef.current = () => resolve();
+      setState({ open: true, message, title, showCancel: false, confirmText: '知道了' });
     });
   }, []);
 
@@ -36,6 +46,7 @@ export function useConfirm() {
   return {
     confirmState: state,
     confirm,
+    notify,
     handleConfirm,
     handleCancel,
   };

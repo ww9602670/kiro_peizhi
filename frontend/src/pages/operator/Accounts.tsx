@@ -226,22 +226,22 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
   const [actionLoading, setActionLoading] = useState<Record<number, string>>({});
 
   // Dialog & Toast hooks
-  const { confirmState, confirm, handleConfirm, handleCancel } = useConfirm();
-  const { messages, showToast, removeToast } = useToast();
+  const { confirmState, confirm, notify, handleConfirm, handleCancel } = useConfirm();
+  const { messages, removeToast } = useToast();
   const actionLockRef = useRef<Record<number, string>>({});
   const deleteConfirmLockRef = useRef<Set<number>>(new Set());
   const recentToastRef = useRef<Map<string, number>>(new Map());
 
-  const showMergedToast = useCallback(
+  const showMergedNotice = useCallback(
     (rawMessage: string | null | undefined, fallback: string) => {
       const message = normalizeOperatorMessage(rawMessage, fallback);
       const now = Date.now();
       const lastShownAt = recentToastRef.current.get(message) ?? 0;
       if (now - lastShownAt < TOAST_MERGE_WINDOW_MS) return;
       recentToastRef.current.set(message, now);
-      showToast(message);
+      void notify(message, '操作提示');
     },
-    [showToast]
+    [notify]
   );
 
   const fetchAccounts = useCallback(async () => {
@@ -273,7 +273,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
         await task();
         await fetchAccounts();
       } catch (err) {
-        showMergedToast(isApiError(err) ? err.message : '', fallbackError);
+        showMergedNotice(isApiError(err) ? err.message : '', fallbackError);
       } finally {
         delete actionLockRef.current[id];
         setActionLoading((prev) => {
@@ -283,7 +283,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
         });
       }
     },
-    [fetchAccounts, showMergedToast]
+    [fetchAccounts, showMergedNotice]
   );
 
   const handleBind = async (e: FormEvent) => {
@@ -359,6 +359,9 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
         open={confirmState.open}
         message={confirmState.message}
         title={confirmState.title}
+        showCancel={confirmState.showCancel}
+        confirmText={confirmState.confirmText}
+        cancelText={confirmState.cancelText}
         onConfirm={handleConfirm}
         onCancel={handleCancel}
       />
@@ -507,7 +510,7 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
               onDelete={handleDeleteSafe}
               onKillSwitch={handleKillSwitchSafe}
               onCreateStrategy={onCreateStrategy}
-              showToast={(text) => showMergedToast(text, text)}
+              showToast={(text) => showMergedNotice(text, text)}
             />
           ))}
         </div>
@@ -767,15 +770,20 @@ function AccountCard({
           await fetchOddsStatus();
         } else if (refreshResult.oddsCount > 0) {
           setRefreshMsg({ text: refreshResult.message, type: 'error' });
+          showToast(refreshResult.message);
         } else {
           setRefreshMsg({ text: refreshResult.message, type: 'info' });
         }
       }
     } catch (err) {
       if (isApiError(err)) {
-        setRefreshMsg({ text: normalizeOperatorMessage(err.message, '赔率刷新失败'), type: 'error' });
+        const message = normalizeOperatorMessage(err.message, '赔率刷新失败');
+        setRefreshMsg({ text: message, type: 'error' });
+        showToast(message);
       } else {
-        setRefreshMsg({ text: '赔率刷新失败', type: 'error' });
+        const message = '赔率刷新失败';
+        setRefreshMsg({ text: message, type: 'error' });
+        showToast(message);
       }
     } finally {
       setRefreshLoading(false);

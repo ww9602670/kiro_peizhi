@@ -29,7 +29,13 @@ from app.engine.shared_market_runtime import SharedMarketRuntime
 from app.engine.strategy_runner import StrategyRunner
 from app.engine.worker import AccountWorker, StrategyRuntimeProfile
 from app.models import db_ops
-from app.utils.strategy_timing import WAVE_STRATEGY_TYPES, normalize_direction_keys
+from app.utils.strategy_timing import (
+    BET_TIMING_MAX,
+    BET_TIMING_MIN,
+    DEFAULT_BET_TIMING,
+    WAVE_STRATEGY_TYPES,
+    normalize_direction_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -569,7 +575,10 @@ class EngineManager:
     ) -> StrategyRuntimeProfile:
         return StrategyRuntimeProfile(
             strategy_id=int(strategy_data["id"]),
-            bet_timing=int(strategy_data.get("bet_timing", 30)),
+            bet_timing=max(
+                BET_TIMING_MIN,
+                min(int(strategy_data.get("bet_timing", DEFAULT_BET_TIMING)), BET_TIMING_MAX),
+            ),
             normalized_direction_keys=normalize_direction_keys(
                 str(strategy_data.get("type", "flat")),
                 str(strategy_data.get("play_code", "")),

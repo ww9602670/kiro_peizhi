@@ -223,6 +223,15 @@ class TestAmountConversion:
 class TestSchemaValidation:
     """StrategyCreate schema """
 
+    def test_create_default_bet_timing_is_88(self):
+        """"""
+        from app.schemas.strategy import StrategyCreate
+        s = StrategyCreate(
+            account_id=1, name="test", type="flat",
+            play_code="DX1", base_amount=10.0,
+        )
+        assert s.bet_timing == 88
+
     def test_martin_requires_sequence(self):
         """"""
         from app.schemas.strategy import StrategyCreate
@@ -942,7 +951,7 @@ async def test_create_strategy_rejects_when_no_valid_non_dw3_timing_slot(client)
     headers = {"Authorization": f"Bearer {token}"}
 
     db = await get_shared_db()
-    occupied_timings = [19, 39, 59, 79, 99, 119, 139, 159, 179]
+    occupied_timings = [10, 30, 50, 70, 90]
     for idx, timing in enumerate(occupied_timings):
         create_resp = await client.post(
             "/api/v1/strategies",
@@ -978,7 +987,7 @@ async def test_create_strategy_rejects_when_no_valid_non_dw3_timing_slot(client)
     body = resp.json()
     assert body["code"] == 1003
     assert body["data"]["reason"] == "NO_AVAILABLE_BET_TIMING"
-    assert body["data"]["bet_timing_window"] == {"min": 19, "max": 180}
+    assert body["data"]["bet_timing_window"] == {"min": 10, "max": 100}
 
 
 @pytest.mark.asyncio

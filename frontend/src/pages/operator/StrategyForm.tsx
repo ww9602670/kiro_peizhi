@@ -55,6 +55,12 @@ const AI_RANDOM_FLAT_TYPE: AiRandomStrategyType = 'ai_random_flat';
 const AI_RANDOM_MARTIN_TYPE: AiRandomStrategyType = 'ai_random_martin';
 const LUCKYSB_PLATFORM_TYPE: StrategyPlatformType = 'LUCKYSB';
 const DW3_DISPLAY_NAME = '三字定位';
+const DEFAULT_BET_TIMING = 88;
+const BET_TIMING_MIN = 10;
+const BET_TIMING_MAX = 100;
+const LOW_BET_TIMING_WARNING_THRESHOLD = 20;
+const LOW_BET_TIMING_MESSAGE =
+  '当前下注时机低于20秒，可能因网络或平台响应延迟导致本期跳过或下注失败，确认继续使用该时机吗？';
 const OMISSION_RANDOM_CATEGORY_OPTIONS: { key: OmissionRandomCategory; label: string }[] = [
   { key: 'ball1', label: '球1' },
   { key: 'ball2', label: '球2' },
@@ -390,7 +396,10 @@ export default function StrategyForm({
   const [omissionRandomPickCount, setOmissionRandomPickCount] = useState<OmissionRandomPickCount>(
     normalizeOmissionRandomPickCount(strategy?.strategy_config?.pick_count)
   );
-  const [betTiming, setBetTiming] = useState(strategy?.bet_timing?.toString() ?? '30');
+  const [betTiming, setBetTiming] = useState(
+    strategy?.bet_timing?.toString() ?? String(DEFAULT_BET_TIMING)
+  );
+  const [betTimingTouched, setBetTimingTouched] = useState(false);
   const [simulation, setSimulation] = useState(strategy?.simulation ?? false);
   const [stopLoss, setStopLoss] = useState(strategy?.stop_loss?.toString() ?? '');
   const [takeProfit, setTakeProfit] = useState(strategy?.take_profit?.toString() ?? '');
@@ -660,9 +669,22 @@ export default function StrategyForm({
       setFormError('基础金额必须大于 0');
       return;
     }
-    if (!betTiming || Number(betTiming) < 5 || Number(betTiming) > 180) {
-      setFormError('下注时机必须在 5 到 180 秒之间');
-      return;
+    const parsedBetTiming = Number(betTiming);
+    const shouldSubmitBetTiming = !isEdit || betTimingTouched;
+    if (shouldSubmitBetTiming) {
+      if (
+        !betTiming ||
+        Number.isNaN(parsedBetTiming) ||
+        parsedBetTiming < BET_TIMING_MIN ||
+        parsedBetTiming > BET_TIMING_MAX
+      ) {
+        setFormError(`下注时机必须在 ${BET_TIMING_MIN} 到 ${BET_TIMING_MAX} 秒之间`);
+        return;
+      }
+      if (parsedBetTiming < LOW_BET_TIMING_WARNING_THRESHOLD && !window.confirm(LOW_BET_TIMING_MESSAGE)) {
+        setFormError(LOW_BET_TIMING_MESSAGE);
+        return;
+      }
     }
 
     if (dw3Mode && !isDw3Platform(submitPlatformType)) {
@@ -736,12 +758,14 @@ export default function StrategyForm({
           name: name.trim(),
           base_amount: Number(baseAmount),
           martin_sequence: parsedSequence,
-          bet_timing: Number(betTiming),
           simulation,
           stop_loss: stopLoss ? Number(stopLoss) : null,
           take_profit: takeProfit ? Number(takeProfit) : null,
           platform_type: submitPlatformType,
         };
+        if (betTimingTouched) {
+          updatePayload.bet_timing = parsedBetTiming;
+        }
 
         if (dw3Mode) {
           updatePayload.play_code = dw3PlayCode;
@@ -771,7 +795,7 @@ export default function StrategyForm({
           base_amount: Number(baseAmount),
           martin_sequence: parsedSequence,
           strategy_config: randomPickConfig,
-          bet_timing: Number(betTiming),
+          bet_timing: parsedBetTiming,
           simulation,
           stop_loss: stopLoss ? Number(stopLoss) : null,
           take_profit: takeProfit ? Number(takeProfit) : null,
@@ -1186,9 +1210,12 @@ export default function StrategyForm({
             className="form-input"
             inputMode="numeric"
             value={betTiming}
-            onChange={(e) => setBetTiming(e.target.value)}
-            min="5"
-            max="180"
+            onChange={(e) => {
+              setBetTimingTouched(true);
+              setBetTiming(e.target.value);
+            }}
+            min={BET_TIMING_MIN}
+            max={BET_TIMING_MAX}
             disabled={submitting}
           />
         </div>

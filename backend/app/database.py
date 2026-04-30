@@ -143,7 +143,7 @@ DDL_STATEMENTS = [
         base_amount     INTEGER NOT NULL,
         martin_sequence TEXT,
         strategy_config TEXT,
-        bet_timing      INTEGER NOT NULL DEFAULT 30,
+        bet_timing      INTEGER NOT NULL DEFAULT 88,
         simulation      INTEGER NOT NULL DEFAULT 0,
         status          TEXT NOT NULL DEFAULT 'stopped',
         martin_level    INTEGER NOT NULL DEFAULT 0,

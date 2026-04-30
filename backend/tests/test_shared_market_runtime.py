@@ -183,6 +183,26 @@ def test_shared_collector_default_interval_and_freshness_are_aligned():
     assert DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS > DEFAULT_COLLECTOR_INTERVAL_SECONDS
 
 
+def test_shared_snapshot_to_install_subtracts_snapshot_age():
+    fetched_at = datetime(2026, 5, 1, 12, 0, 0)
+    snapshot = SharedMarketSnapshot(
+        shared_group_id=1,
+        issue="20260501001",
+        state=1,
+        close_countdown_sec=41,
+        open_countdown_sec=26,
+        pre_issue="20260501000",
+        pre_result="1,2,3",
+        fetched_at=fetched_at,
+        source_status="ok",
+    )
+
+    install = snapshot.to_install(now=fetched_at + timedelta(seconds=7))
+
+    assert install.close_countdown_sec == 34
+    assert install.open_countdown_sec == 19
+
+
 @pytest.mark.asyncio
 async def test_snapshot_get_latest_maps_open_result_to_pre_result(monkeypatch):
     async def fake_snapshot_get_latest(_db, *, shared_group_id: int) -> dict:

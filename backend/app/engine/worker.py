@@ -8,7 +8,7 @@ Phase 10.1:  AccountWorker EngineManager
 
 
   -  30s 5s 10s
-  - CloseTimeStamp  18s  8.1s  + 10s 
+  - CloseTimeStamp  8s  5s deadline margin
 
 
   -  Worker try/except + 
@@ -44,6 +44,7 @@ from app.models.db_ops import account_platform_session_upsert, strategy_update_s
 from app.utils.strategy_timing import (
     BET_TIMING_MAX,
     BET_TIMING_MIN,
+    DEFAULT_BET_TIMING as DEFAULT_STRATEGY_BET_TIMING,
     SAFE_CLOSE_THRESHOLD,
     WAVE_STRATEGY_TYPES,
 )
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 # 
 MIN_BET_TIMING = BET_TIMING_MIN
-DEFAULT_BET_TIMING = 30   #  30s
+DEFAULT_BET_TIMING = DEFAULT_STRATEGY_BET_TIMING
 DEADLINE_MARGIN = 10      #  10s 
 SKIP_THRESHOLD = SAFE_CLOSE_THRESHOLD
 
@@ -174,7 +175,7 @@ class AccountWorker:
         self.risk = risk
         self.alert_service = alert_service
         self.strategies: dict[int, StrategyRunner] = strategies or {}
-        self.bet_timing = max(MIN_BET_TIMING, min(bet_timing, 300))
+        self.bet_timing = max(MIN_BET_TIMING, min(bet_timing, BET_TIMING_MAX))
         self.strategy_profiles: dict[int, StrategyRuntimeProfile] = (
             dict(strategy_profiles)
             if strategy_profiles is not None
@@ -1742,8 +1743,8 @@ class AccountWorker:
 
         
         - State != 1  
-        - close_countdown_sec <= 18s  
-        - State == 1  close_countdown_sec > 18s  
+        - close_countdown_sec <= SKIP_THRESHOLD
+        - State == 1  close_countdown_sec > SKIP_THRESHOLD
 
         Args:
             install: 

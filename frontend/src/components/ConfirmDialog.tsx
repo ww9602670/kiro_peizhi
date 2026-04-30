@@ -11,6 +11,7 @@ export interface ConfirmDialogProps {
   message: string;
   confirmText?: string;
   cancelText?: string;
+  showCancel?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -21,6 +22,7 @@ export default function ConfirmDialog({
   message,
   confirmText = '确认',
   cancelText = '取消',
+  showCancel = true,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -36,7 +38,8 @@ export default function ConfirmDialog({
   // ESC 关闭
   const handleCancel = (e: React.SyntheticEvent) => {
     e.preventDefault();
-    onCancel();
+    if (showCancel) onCancel();
+    else onConfirm();
   };
 
   if (!open) return null;
@@ -47,9 +50,11 @@ export default function ConfirmDialog({
         <h3 className="confirm-dialog-title">{title}</h3>
         <p className="confirm-dialog-message">{message}</p>
         <div className="confirm-dialog-actions">
-          <button type="button" className="confirm-dialog-btn cancel" onClick={onCancel}>
-            {cancelText}
-          </button>
+          {showCancel && (
+            <button type="button" className="confirm-dialog-btn cancel" onClick={onCancel}>
+              {cancelText}
+            </button>
+          )}
           <button type="button" className="confirm-dialog-btn confirm" onClick={onConfirm} autoFocus>
             {confirmText}
           </button>

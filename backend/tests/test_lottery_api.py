@@ -311,7 +311,7 @@ async def test_get_current_install_uses_shared_snapshot_without_running_worker(m
     )
 
     assert response.data.installments == "3425001"
-    assert response.data.close_countdown_sec == 12
+    assert response.data.close_countdown_sec == 10
     assert response.data.pre_installments == "3425000"
     assert response.data.pre_lottery_result == "2,2,2"
     assert response.data.market_data_state == "shared_hit"

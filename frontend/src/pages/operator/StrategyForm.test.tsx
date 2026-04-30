@@ -169,6 +169,7 @@ describe('StrategyForm', () => {
       expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('2');
     });
     expect((document.getElementById('sf-platform') as HTMLSelectElement).value).toBe('LUCKYSB');
+    expect((document.getElementById('sf-timing') as HTMLInputElement).value).toBe('88');
     expect(document.getElementById('sf-platform')).toBeDisabled();
   });
 
@@ -360,6 +361,36 @@ describe('StrategyForm', () => {
       );
     });
     expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires confirmation when create bet timing is below 20 seconds', async () => {
+    const user = userEvent.setup();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const { container } = render(
+      <StrategyForm
+        strategy={null}
+        initialAccountId={1}
+        onDone={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    try {
+      await waitFor(() => {
+        expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
+      });
+
+      await user.type(document.getElementById('sf-name') as HTMLInputElement, 'low timing');
+      await user.click(screen.getByRole('button', { name: 'play:empty' }));
+      await user.clear(document.getElementById('sf-timing') as HTMLInputElement);
+      await user.type(document.getElementById('sf-timing') as HTMLInputElement, '15');
+      await user.click(container.querySelector('.form-submit-btn') as HTMLButtonElement);
+
+      expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('低于20秒'));
+      expect(mockCreateStrategy).not.toHaveBeenCalled();
+    } finally {
+      confirmSpy.mockRestore();
+    }
   });
 
   it('submits green-wave single strategy with default DS3 direction', async () => {
