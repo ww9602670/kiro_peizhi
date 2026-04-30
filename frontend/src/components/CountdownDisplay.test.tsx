@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CountdownDisplay } from './CountdownDisplay';
@@ -65,7 +65,7 @@ describe('CountdownDisplay', () => {
     expect(mockUseLotteryCountdown).toHaveBeenCalledWith({ platformType: 'JND282' });
   });
 
-  it('renders recent results as mobile-friendly cards with full issue numbers', () => {
+  it('renders recent results as compact rows with full issue numbers', () => {
     mockUseLotteryCountdown.mockReturnValue({
       data: {
         installments: '20260419099',
@@ -104,7 +104,50 @@ describe('CountdownDisplay', () => {
     expect(screen.getByLabelText('recent-results')).toBeInTheDocument();
     expect(screen.getByText('20260419097')).toBeInTheDocument();
     expect(screen.getByText('和值 6')).toBeInTheDocument();
-    expect(screen.getByText('2026-04-19 00:01:00')).toBeInTheDocument();
+    expect(screen.getByText('00:01')).toBeInTheDocument();
+  });
+
+  it('collapses recent results by default and expands on demand', () => {
+    mockUseLotteryCountdown.mockReturnValue({
+      data: {
+        installments: '20260419101',
+        state: LotteryStateEnum.OPEN,
+        close_countdown_sec: 10,
+        open_countdown_sec: 20,
+        pre_lottery_result: '3,3,3',
+        pre_installments: '20260419100',
+        template_code: 'JND282',
+        market_data_state: 'shared_hit',
+      },
+      closeCountdown: 10,
+      openCountdown: 20,
+      closeTimestamp: 10,
+      openTimestamp: 20,
+      error: null,
+      lastUpdateTime: null,
+    });
+
+    render(
+      <CountdownDisplay
+        recentResults={[1, 2, 3, 4].map((id) => ({
+          id,
+          issue: `2026041909${id}`,
+          open_result: '1,2,3',
+          sum_value: 6,
+          open_time: `2026-04-19 00:0${id}:00`,
+          created_at: `2026-04-19 00:0${id}:10`,
+        }))}
+      />,
+    );
+
+    expect(screen.getByText('20260419091')).toBeInTheDocument();
+    expect(screen.queryByText('20260419094')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /展开全部/ }));
+    expect(screen.getByText('20260419094')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '收起' }));
+    expect(screen.queryByText('20260419094')).not.toBeInTheDocument();
   });
 
   it('shows an error banner and graceful fallback when previous result is missing', () => {

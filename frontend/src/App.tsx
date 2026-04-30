@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { getRoutePath, resolveRouteKey, type AppRouteKey } from '@/appRoutes';
+import { listAccounts } from '@/api/accounts';
 import Layout, { type NavItem } from '@/components/Layout';
 import { AlertsProvider } from '@/contexts/AlertsContext';
 import { useAlertsContext } from '@/hooks/useAlertsContext';
@@ -8,9 +9,11 @@ import Login from '@/pages/Login';
 import AdminDashboardPage from '@/pages/admin/Dashboard';
 import Operators from '@/pages/admin/Operators';
 import Accounts from '@/pages/operator/Accounts';
+import Alerts from '@/pages/operator/Alerts';
 import Dashboard from '@/pages/operator/Dashboard';
 import My from '@/pages/operator/My';
 import Strategies from '@/pages/operator/Strategies';
+import type { AccountInfo } from '@/types/api/account';
 import './App.css';
 
 export type StrategyCreateIntent = {
@@ -22,13 +25,19 @@ const OPERATOR_NAV: NavItem[] = [
   { key: 'dashboard', label: '仪表盘' },
   { key: 'accounts', label: '账号' },
   { key: 'strategies', label: '策略' },
+  { key: 'alerts', label: '告警' },
   { key: 'me', label: '我的' },
 ];
 
 const ADMIN_NAV: NavItem[] = [
   { key: 'admin-dashboard', label: '仪表盘' },
   { key: 'operators', label: '操作员' },
+  { key: 'alerts', label: '告警' },
 ];
+
+function hasStrategyAccess(accounts: AccountInfo[]): boolean {
+  return accounts.some((account) => (account.allowed_strategy_types ?? []).length > 0);
+}
 
 interface AuthedAppShellProps {
   isAdmin: boolean;
@@ -39,6 +48,7 @@ interface AuthedAppShellProps {
   strategyCreateIntent: StrategyCreateIntent | null;
   clearStrategyIntent: () => void;
   openStrategyCreate: (accountId?: number) => void;
+  canUseStrategies: boolean;
 }
 
 function AuthedAppShell({
@@ -50,6 +60,7 @@ function AuthedAppShell({
   strategyCreateIntent,
   clearStrategyIntent,
   openStrategyCreate,
+  canUseStrategies,
 }: AuthedAppShellProps) {
   const { unreadCount } = useAlertsContext();
 
@@ -61,14 +72,21 @@ function AuthedAppShell({
       unreadAlerts={unreadCount}
       onLogout={onLogout}
     >
-      {activeTab === 'dashboard' && <Dashboard onCreateStrategy={() => openStrategyCreate()} />}
-      {activeTab === 'accounts' && <Accounts onCreateStrategy={(accountId) => openStrategyCreate(accountId)} />}
-      {activeTab === 'strategies' && (
+      {activeTab === 'dashboard' && (
+        <Dashboard onCreateStrategy={canUseStrategies ? () => openStrategyCreate() : undefined} />
+      )}
+      {activeTab === 'accounts' && (
+        <Accounts
+          onCreateStrategy={canUseStrategies ? (accountId) => openStrategyCreate(accountId) : undefined}
+        />
+      )}
+      {activeTab === 'strategies' && canUseStrategies && (
         <Strategies
           createIntent={strategyCreateIntent}
           onCreateIntentConsumed={clearStrategyIntent}
         />
       )}
+      {activeTab === 'alerts' && <Alerts />}
       {activeTab === 'me' && <My />}
 
       {isAdmin && activeTab === 'admin-dashboard' && <AdminDashboardPage />}
@@ -80,7 +98,11 @@ function AuthedAppShell({
 function App() {
   const { isAuthenticated, role, logout } = useAuth();
   const isAdmin = role === 'admin';
-  const navItems = isAdmin ? ADMIN_NAV : OPERATOR_NAV;
+  const [operatorStrategyAccess, setOperatorStrategyAccess] = useState<boolean | null>(null);
+  const operatorHasStrategyAccess = isAdmin || operatorStrategyAccess === true;
+  const navItems = isAdmin
+    ? ADMIN_NAV
+    : OPERATOR_NAV.filter((item) => item.key !== 'strategies' || operatorHasStrategyAccess);
 
   const [activeTab, setActiveTab] = useState<AppRouteKey>(() =>
     resolveRouteKey(window.location.pathname, isAuthenticated, isAdmin),
@@ -127,11 +149,56 @@ function App() {
     setActiveTab(resolvedKey);
   }, [isAuthenticated, isAdmin, navigateTo]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!isAuthenticated || isAdmin) {
+      setOperatorStrategyAccess(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setOperatorStrategyAccess(null);
+    listAccounts()
+      .then((res) => {
+        if (!cancelled) {
+          setOperatorStrategyAccess(hasStrategyAccess(res.data ?? []));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOperatorStrategyAccess(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, isAdmin]);
+
+  useEffect(() => {
+    if (
+      isAuthenticated &&
+      !isAdmin &&
+      operatorStrategyAccess === false &&
+      activeTab === 'strategies'
+    ) {
+      setStrategyCreateIntent(null);
+      navigateTo('dashboard', { replace: true });
+    }
+  }, [activeTab, isAuthenticated, isAdmin, navigateTo, operatorStrategyAccess]);
+
   const handleNavChange = (key: string) => {
     navigateTo(key as AppRouteKey);
   };
 
   const openStrategyCreate = (accountId?: number) => {
+    if (!operatorHasStrategyAccess) {
+      setStrategyCreateIntent(null);
+      navigateTo('dashboard');
+      return;
+    }
     setStrategyCreateIntent({ accountId, nonce: Date.now() });
     navigateTo('strategies');
   };
@@ -157,6 +224,7 @@ function App() {
         strategyCreateIntent={strategyCreateIntent}
         clearStrategyIntent={() => setStrategyCreateIntent(null)}
         openStrategyCreate={openStrategyCreate}
+        canUseStrategies={operatorHasStrategyAccess}
       />
     </AlertsProvider>
   );

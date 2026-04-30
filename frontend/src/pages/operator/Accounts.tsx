@@ -698,6 +698,7 @@ function AccountCard({
         : '验证账号';
   const isVerifying = account.verification_in_progress || actionLoading === 'verify';
   const canCreateStrategy =
+    (account.allowed_strategy_types ?? []).length > 0 &&
     oddsPlatformOptions.length > 0 &&
     account.frontend_signal !== 'need_relogin' &&
     account.frontend_signal !== 'need_confirm_odds';

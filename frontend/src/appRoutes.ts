@@ -1,17 +1,19 @@
-export type OperatorRouteKey = 'dashboard' | 'accounts' | 'strategies' | 'me';
-export type AdminRouteKey = 'admin-dashboard' | 'operators';
+export type OperatorRouteKey = 'dashboard' | 'accounts' | 'strategies' | 'alerts' | 'me';
+export type AdminRouteKey = 'admin-dashboard' | 'operators' | 'alerts';
 export type AppRouteKey = OperatorRouteKey | AdminRouteKey | 'login';
 
 export const OPERATOR_ROUTE_PATHS: Record<OperatorRouteKey, string> = {
   dashboard: '/dashboard',
   accounts: '/accounts',
   strategies: '/strategies',
+  alerts: '/alerts',
   me: '/me',
 };
 
 export const ADMIN_ROUTE_PATHS: Record<AdminRouteKey, string> = {
   'admin-dashboard': '/admin/dashboard',
   operators: '/operators',
+  alerts: '/alerts',
 };
 
 export function getDefaultRouteKey(isAdmin: boolean): OperatorRouteKey | AdminRouteKey {
@@ -40,6 +42,9 @@ export function resolveRouteKey(
   }
 
   if (isAdmin) {
+    if (pathname === ADMIN_ROUTE_PATHS.alerts) {
+      return 'alerts';
+    }
     if (pathname === ADMIN_ROUTE_PATHS.operators) {
       return 'operators';
     }
@@ -51,6 +56,8 @@ export function resolveRouteKey(
       return 'accounts';
     case OPERATOR_ROUTE_PATHS.strategies:
       return 'strategies';
+    case OPERATOR_ROUTE_PATHS.alerts:
+      return 'alerts';
     case OPERATOR_ROUTE_PATHS.me:
       return 'me';
     case OPERATOR_ROUTE_PATHS.dashboard:

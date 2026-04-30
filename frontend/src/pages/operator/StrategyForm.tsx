@@ -9,9 +9,13 @@ import { listAccounts } from '@/api/accounts';
 import PlayCodeMultiSelect from '@/components/PlayCodeMultiSelect';
 import PlayCodeSelect from '@/components/PlayCodeSelect';
 import type {
+  OmissionRandomCategory,
+  OmissionRandomPickCount,
   StrategyCreate,
   StrategyInfo,
+  StrategyPermissionType,
   StrategyPlatformType,
+  StrategyType,
   StrategyUpdate,
 } from '@/types/api/strategy';
 import type { AccountInfo } from '@/types/api/account';
@@ -30,7 +34,9 @@ import { getPlatformLabel } from '@/utils/platformLabels';
 import './StrategyForm.css';
 
 type WaveStrategyType = 'red_wave_double_martin' | 'green_wave_single_martin';
-type StrategyType = 'flat' | 'martin' | WaveStrategyType;
+type OmissionRandomStrategyType = 'omission_random_flat' | 'omission_random_martin';
+type AiRandomStrategyType = 'ai_random_flat' | 'ai_random_martin';
+type RandomPickStrategyType = OmissionRandomStrategyType | AiRandomStrategyType;
 type StrategyTypeValue = StrategyType | '';
 
 interface StrategyFormProps {
@@ -43,8 +49,25 @@ interface StrategyFormProps {
 
 const RED_WAVE_DOUBLE_TYPE: WaveStrategyType = 'red_wave_double_martin';
 const GREEN_WAVE_SINGLE_TYPE: WaveStrategyType = 'green_wave_single_martin';
+const OMISSION_RANDOM_FLAT_TYPE: OmissionRandomStrategyType = 'omission_random_flat';
+const OMISSION_RANDOM_MARTIN_TYPE: OmissionRandomStrategyType = 'omission_random_martin';
+const AI_RANDOM_FLAT_TYPE: AiRandomStrategyType = 'ai_random_flat';
+const AI_RANDOM_MARTIN_TYPE: AiRandomStrategyType = 'ai_random_martin';
 const LUCKYSB_PLATFORM_TYPE: StrategyPlatformType = 'LUCKYSB';
 const DW3_DISPLAY_NAME = '三字定位';
+const OMISSION_RANDOM_CATEGORY_OPTIONS: { key: OmissionRandomCategory; label: string }[] = [
+  { key: 'ball1', label: '球1' },
+  { key: 'ball2', label: '球2' },
+  { key: 'ball3', label: '球3' },
+  { key: 'sum', label: '和值' },
+];
+const OMISSION_RANDOM_PICK_COUNTS: OmissionRandomPickCount[] = [3, 4, 5, 6];
+const OMISSION_RANDOM_PLAY_CODES: Record<OmissionRandomCategory, string> = {
+  ball1: 'OMR_BALL1',
+  ball2: 'OMR_BALL2',
+  ball3: 'OMR_BALL3',
+  sum: 'OMR_SUM',
+};
 
 const RED_WAVE_DIRECTION_ORDER = ['B1LM_S', 'B2LM_S', 'B3LM_S', 'DS4'] as const;
 const GREEN_WAVE_DIRECTION_ORDER = ['B1LM_D', 'B2LM_D', 'B3LM_D', 'DS3'] as const;
@@ -63,6 +86,31 @@ const BUTTON_CREATE = '创建';
 const BUTTON_RED_WAVE = '红波追双';
 const ERROR_SELECT_TYPE = '请选择策略类型';
 
+const STRATEGY_NOT_AUTHORIZED_MESSAGE = '当前账号暂未开通策略，请联系管理员';
+const STRATEGY_TYPE_OPTIONS: Array<{
+  type: StrategyType;
+  permission: StrategyPermissionType;
+  label: string;
+  jndOnly?: boolean;
+}> = [
+  { type: 'flat', permission: 'flat', label: '平注' },
+  { type: 'martin', permission: 'martin', label: '马丁' },
+  { type: OMISSION_RANDOM_FLAT_TYPE, permission: OMISSION_RANDOM_FLAT_TYPE, label: '遗漏随机平注', jndOnly: true },
+  { type: OMISSION_RANDOM_MARTIN_TYPE, permission: OMISSION_RANDOM_MARTIN_TYPE, label: '遗漏随机马丁', jndOnly: true },
+  { type: AI_RANDOM_FLAT_TYPE, permission: AI_RANDOM_FLAT_TYPE, label: 'AI推荐平注', jndOnly: true },
+  { type: AI_RANDOM_MARTIN_TYPE, permission: AI_RANDOM_MARTIN_TYPE, label: 'AI推荐马丁', jndOnly: true },
+  { type: RED_WAVE_DOUBLE_TYPE, permission: RED_WAVE_DOUBLE_TYPE, label: '红波追双', jndOnly: true },
+  { type: GREEN_WAVE_SINGLE_TYPE, permission: GREEN_WAVE_SINGLE_TYPE, label: '绿波追单', jndOnly: true },
+];
+const DW3_STRATEGY_TYPE_OPTIONS: Array<{
+  type: StrategyType;
+  permission: StrategyPermissionType;
+  label: string;
+}> = [
+  { type: 'flat', permission: 'dw3_flat', label: '平注' },
+  { type: 'martin', permission: 'dw3_martin', label: '马丁' },
+];
+
 function normalizeRedWaveDirections(codes: string[]): string[] {
   const upper = codes.map((code) => code.trim().toUpperCase()).filter(Boolean);
   const deduped = Array.from(new Set(upper));
@@ -77,6 +125,18 @@ function normalizeGreenWaveDirections(codes: string[]): string[] {
 
 function isWaveStrategyType(type: StrategyTypeValue): type is WaveStrategyType {
   return type === RED_WAVE_DOUBLE_TYPE || type === GREEN_WAVE_SINGLE_TYPE;
+}
+
+function isOmissionRandomType(type: StrategyTypeValue): type is OmissionRandomStrategyType {
+  return type === OMISSION_RANDOM_FLAT_TYPE || type === OMISSION_RANDOM_MARTIN_TYPE;
+}
+
+function isAiRandomType(type: StrategyTypeValue): type is AiRandomStrategyType {
+  return type === AI_RANDOM_FLAT_TYPE || type === AI_RANDOM_MARTIN_TYPE;
+}
+
+function isRandomPickStrategyType(type: StrategyTypeValue): type is RandomPickStrategyType {
+  return isOmissionRandomType(type) || isAiRandomType(type);
 }
 
 function getWaveDirectionDefault(type: WaveStrategyType): string[] {
@@ -104,7 +164,38 @@ function normalizeWaveDirections(type: WaveStrategyType, codes: string[]): strin
 }
 
 function isMartinLike(type: StrategyTypeValue) {
-  return type === 'martin' || isWaveStrategyType(type);
+  return (
+    type === 'martin' ||
+    isWaveStrategyType(type) ||
+    type === OMISSION_RANDOM_MARTIN_TYPE ||
+    type === AI_RANDOM_MARTIN_TYPE
+  );
+}
+
+function buildOmissionRandomPlayCode(categories: OmissionRandomCategory[]): string {
+  return OMISSION_RANDOM_CATEGORY_OPTIONS
+    .map((option) => option.key)
+    .filter((category) => categories.includes(category))
+    .map((category) => OMISSION_RANDOM_PLAY_CODES[category])
+    .join(',');
+}
+
+function normalizeOmissionRandomCategories(value: unknown): OmissionRandomCategory[] {
+  if (!Array.isArray(value)) return ['ball1'];
+  const selected = new Set(value.filter((item): item is OmissionRandomCategory =>
+    item === 'ball1' || item === 'ball2' || item === 'ball3' || item === 'sum'
+  ));
+  const normalized = OMISSION_RANDOM_CATEGORY_OPTIONS
+    .map((option) => option.key)
+    .filter((category) => selected.has(category));
+  return normalized.length > 0 ? normalized : ['ball1'];
+}
+
+function normalizeOmissionRandomPickCount(value: unknown): OmissionRandomPickCount {
+  const n = Number(value);
+  return OMISSION_RANDOM_PICK_COUNTS.includes(n as OmissionRandomPickCount)
+    ? (n as OmissionRandomPickCount)
+    : 3;
 }
 
 function isRealPlatformType(platformType?: string | null): platformType is StrategyPlatformType {
@@ -176,6 +267,38 @@ function resolveAllowedPlatformTypes(account?: AccountInfo): StrategyPlatformTyp
     )
   );
   return explicit;
+}
+
+function resolveAllowedStrategyTypes(account?: AccountInfo): StrategyPermissionType[] {
+  return Array.from(new Set(account?.allowed_strategy_types ?? []));
+}
+
+function getSelectableStrategyTypeOptions(
+  allowedStrategyTypes: StrategyPermissionType[],
+  platformType: string,
+  dw3Mode: boolean
+) {
+  const allowed = new Set(allowedStrategyTypes);
+  if (dw3Mode) {
+    return DW3_STRATEGY_TYPE_OPTIONS.filter((option) => allowed.has(option.permission));
+  }
+  const isJndPlatform = platformType !== LUCKYSB_PLATFORM_TYPE;
+  return STRATEGY_TYPE_OPTIONS.filter((option) => {
+    if (!allowed.has(option.permission)) return false;
+    if (option.jndOnly && !isJndPlatform) return false;
+    return true;
+  });
+}
+
+function isStrategyTypeAuthorized(
+  type: StrategyTypeValue,
+  allowedStrategyTypes: StrategyPermissionType[],
+  platformType: string,
+  dw3Mode: boolean
+) {
+  if (!type) return false;
+  return getSelectableStrategyTypeOptions(allowedStrategyTypes, platformType, dw3Mode)
+    .some((option) => option.type === type);
 }
 
 function pickPlatformType(
@@ -261,6 +384,12 @@ export default function StrategyForm({
   const [platformType, setPlatformType] = useState<string>(initialStrategyPlatformType);
   const [baseAmount, setBaseAmount] = useState(strategy?.base_amount?.toString() ?? '1');
   const [martinSequence, setMartinSequence] = useState(strategy?.martin_sequence?.join(',') ?? '1,2,4,8,16');
+  const [omissionRandomCategories, setOmissionRandomCategories] = useState<OmissionRandomCategory[]>(
+    normalizeOmissionRandomCategories(strategy?.strategy_config?.categories)
+  );
+  const [omissionRandomPickCount, setOmissionRandomPickCount] = useState<OmissionRandomPickCount>(
+    normalizeOmissionRandomPickCount(strategy?.strategy_config?.pick_count)
+  );
   const [betTiming, setBetTiming] = useState(strategy?.bet_timing?.toString() ?? '30');
   const [simulation, setSimulation] = useState(strategy?.simulation ?? false);
   const [stopLoss, setStopLoss] = useState(strategy?.stop_loss?.toString() ?? '');
@@ -280,10 +409,13 @@ export default function StrategyForm({
 
   const isLuckySb = platformType === LUCKYSB_PLATFORM_TYPE;
   const isWaveStrategy = isWaveStrategyType(type);
+  const isAiRandomStrategy = isAiRandomType(type);
+  const isRandomPickStrategy = isRandomPickStrategyType(type);
   const activeWaveStrategyType = isWaveStrategyType(type) ? type : null;
 
   const selectedAccount = accounts.find((a) => a.id === accountId);
   const allowedPlatformTypes = resolveAllowedPlatformTypes(selectedAccount);
+  const allowedStrategyTypes = resolveAllowedStrategyTypes(selectedAccount);
   const verificationGateError = getVerificationGateError(selectedAccount, allowedPlatformTypes);
   const selectablePlatformTypes = (
     dw3Mode ? allowedPlatformTypes.filter((item) => isDw3Platform(item)) : allowedPlatformTypes
@@ -294,9 +426,35 @@ export default function StrategyForm({
     currentPlatformType && effectivePlatformTypes.includes(currentPlatformType)
       ? currentPlatformType
       : '';
+  const hasDw3Platform = allowedPlatformTypes.some((item) => isDw3Platform(item));
+  const normalStrategyTypeOptions = getSelectableStrategyTypeOptions(
+    allowedStrategyTypes,
+    platformType,
+    false
+  );
+  const dw3StrategyTypeOptions = getSelectableStrategyTypeOptions(
+    allowedStrategyTypes,
+    platformType,
+    true
+  );
+  const selectableStrategyTypeOptions = dw3Mode ? dw3StrategyTypeOptions : normalStrategyTypeOptions;
+  const hasAnySelectableStrategyType =
+    normalStrategyTypeOptions.length > 0 || (hasDw3Platform && dw3StrategyTypeOptions.length > 0);
+  const strategyPermissionError =
+    !isEdit && selectedAccount && !hasAnySelectableStrategyType
+      ? STRATEGY_NOT_AUTHORIZED_MESSAGE
+      : '';
+  const strategyTypeUnavailableForCurrentMode =
+    !isEdit && selectableStrategyTypeOptions.length === 0;
   const submitDisabled =
-    submitting || (accounts.length === 0 && !isEdit) || Boolean(verificationGateError);
-  const canUseDw3 = allowedPlatformTypes.some((item) => isDw3Platform(item)) || dw3Mode;
+    submitting ||
+    (accounts.length === 0 && !isEdit) ||
+    Boolean(verificationGateError) ||
+    Boolean(strategyPermissionError) ||
+    strategyTypeUnavailableForCurrentMode;
+  const canUseDw3 =
+    (hasDw3Platform && dw3StrategyTypeOptions.length > 0) ||
+    dw3Mode;
   const sameAccountExistingDw3Count = existingStrategies.filter((item) => {
     if (item.account_id !== accountId) return false;
     if (strategy && item.id === strategy.id) return false;
@@ -373,6 +531,17 @@ export default function StrategyForm({
     fetchAccounts();
   }, [fetchAccounts]);
 
+  useEffect(() => {
+    if (isEdit) return;
+    if (selectableStrategyTypeOptions.length === 0) {
+      if (type !== '') setType('');
+      return;
+    }
+    if (!selectableStrategyTypeOptions.some((option) => option.type === type)) {
+      setType(selectableStrategyTypeOptions[0].type);
+    }
+  }, [isEdit, selectableStrategyTypeOptions, type]);
+
   const handleAccountChange = (nextAccountId: number) => {
     setAccountId(nextAccountId);
     const nextAccount = accounts.find((a) => a.id === nextAccountId);
@@ -388,7 +557,7 @@ export default function StrategyForm({
     if (enabled) {
       if (!canUseDw3) return;
       setDw3Mode(true);
-      if (isWaveStrategyType(type)) setType('flat');
+      if (isWaveStrategyType(type) || isRandomPickStrategyType(type)) setType('flat');
       setPlayCode([]);
       setLuckySbPlayCode('');
       if (!isDw3Platform(platformType)) {
@@ -405,6 +574,16 @@ export default function StrategyForm({
     setPlatformType((current) => pickPlatformType(allowedPlatformTypes, current));
   };
 
+  const handleStrategyTypeSelect = (nextType: StrategyType) => {
+    setType(nextType);
+    if (nextType === RED_WAVE_DOUBLE_TYPE || nextType === GREEN_WAVE_SINGLE_TYPE) {
+      setWaveDirections((current) => {
+        const normalized = normalizeWaveDirections(nextType, current);
+        return normalized.length > 0 ? normalized : getWaveDirectionDefault(nextType);
+      });
+    }
+  };
+
   const toggleWaveDirection = (code: string) => {
     setWaveDirections((previous) => {
       if (!activeWaveStrategyType) return previous;
@@ -412,6 +591,17 @@ export default function StrategyForm({
         return previous.filter((item) => item !== code);
       }
       return normalizeWaveDirections(activeWaveStrategyType, [...previous, code]);
+    });
+  };
+
+  const toggleOmissionRandomCategory = (category: OmissionRandomCategory) => {
+    setOmissionRandomCategories((previous) => {
+      if (previous.includes(category)) {
+        return previous.filter((item) => item !== category);
+      }
+      return OMISSION_RANDOM_CATEGORY_OPTIONS
+        .map((option) => option.key)
+        .filter((item) => [...previous, category].includes(item));
     });
   };
 
@@ -449,6 +639,10 @@ export default function StrategyForm({
       setFormError(ERROR_SELECT_TYPE);
       return;
     }
+    if (!isEdit && !isStrategyTypeAuthorized(type, allowedStrategyTypes, submitPlatformType, dw3Mode)) {
+      setFormError(STRATEGY_NOT_AUTHORIZED_MESSAGE);
+      return;
+    }
     if (!allowedPlatformTypes.includes(submitPlatformType)) {
       setFormError('当前账号不支持所选盘口类型');
       return;
@@ -479,8 +673,13 @@ export default function StrategyForm({
       setFormError('请选择极速飞艇玩法');
       return;
     }
-    if (!isLuckySbPlatform && !dw3Mode && !isWaveStrategy && playCode.length === 0) {
+    if (!isLuckySbPlatform && !dw3Mode && !isWaveStrategy && !isRandomPickStrategy && playCode.length === 0) {
       setFormError('请选择玩法');
+      return;
+    }
+
+    if (isRandomPickStrategy && omissionRandomCategories.length === 0) {
+      setFormError('请选择随机选号类型');
       return;
     }
 
@@ -519,6 +718,17 @@ export default function StrategyForm({
       }
     }
 
+    const randomPickConfig = isRandomPickStrategy
+      ? {
+          pick_count: omissionRandomPickCount,
+          categories: omissionRandomCategories,
+          weight_mode: isAiRandomStrategy ? 'pure_random' : 'omission_plus_random',
+        }
+      : null;
+    const randomPickPlayCode = isRandomPickStrategy
+      ? buildOmissionRandomPlayCode(omissionRandomCategories)
+      : '';
+
     setSubmitting(true);
     try {
       if (isEdit && strategy) {
@@ -536,6 +746,9 @@ export default function StrategyForm({
         if (dw3Mode) {
           updatePayload.play_code = dw3PlayCode;
           updatePayload.gate_window_issues = parsedGateWindowIssues;
+        } else if (isRandomPickStrategy && randomPickConfig) {
+          updatePayload.play_code = randomPickPlayCode;
+          updatePayload.strategy_config = randomPickConfig;
         } else if (isWaveStrategy) {
           updatePayload.play_code = selectedDirections.join(',');
         }
@@ -550,11 +763,14 @@ export default function StrategyForm({
             ? dw3PlayCode
             : isLuckySbPlatform
             ? luckySbPlayCode
+            : isRandomPickStrategy
+            ? randomPickPlayCode
             : isWaveStrategy
             ? selectedDirections.join(',')
             : playCode.join(','),
           base_amount: Number(baseAmount),
           martin_sequence: parsedSequence,
+          strategy_config: randomPickConfig,
           bet_timing: Number(betTiming),
           simulation,
           stop_loss: stopLoss ? Number(stopLoss) : null,
@@ -655,19 +871,24 @@ export default function StrategyForm({
         {!isEdit && (
           <div className="form-field">
             <span className="form-label">策略类型</span>
+            {strategyPermissionError && (
+              <div className="form-hint form-hint-warn">{STRATEGY_NOT_AUTHORIZED_MESSAGE}</div>
+            )}
             <div className="type-toggle">
               <button
                 type="button"
+                hidden={!selectableStrategyTypeOptions.some((option) => option.type === 'flat')}
                 className={`type-toggle-btn ${type === 'flat' ? 'type-toggle-active' : ''}`}
-                onClick={() => setType('flat')}
+                onClick={() => handleStrategyTypeSelect('flat')}
                 disabled={submitting}
               >
                 平注
               </button>
               <button
                 type="button"
+                hidden={!selectableStrategyTypeOptions.some((option) => option.type === 'martin')}
                 className={`type-toggle-btn ${type === 'martin' ? 'type-toggle-active' : ''}`}
-                onClick={() => setType('martin')}
+                onClick={() => handleStrategyTypeSelect('martin')}
                 disabled={submitting}
               >
                 马丁
@@ -676,6 +897,43 @@ export default function StrategyForm({
                 <>
                   <button
                     type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === OMISSION_RANDOM_FLAT_TYPE)}
+                    className={`type-toggle-btn ${type === OMISSION_RANDOM_FLAT_TYPE ? 'type-toggle-active' : ''}`}
+                    onClick={() => handleStrategyTypeSelect(OMISSION_RANDOM_FLAT_TYPE)}
+                    disabled={submitting}
+                  >
+                    遗漏随机平注
+                  </button>
+                  <button
+                    type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === OMISSION_RANDOM_MARTIN_TYPE)}
+                    className={`type-toggle-btn ${type === OMISSION_RANDOM_MARTIN_TYPE ? 'type-toggle-active' : ''}`}
+                    onClick={() => handleStrategyTypeSelect(OMISSION_RANDOM_MARTIN_TYPE)}
+                    disabled={submitting}
+                  >
+                    遗漏随机马丁
+                  </button>
+                  <button
+                    type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === AI_RANDOM_FLAT_TYPE)}
+                    className={`type-toggle-btn ${type === AI_RANDOM_FLAT_TYPE ? 'type-toggle-active' : ''}`}
+                    onClick={() => handleStrategyTypeSelect(AI_RANDOM_FLAT_TYPE)}
+                    disabled={submitting}
+                  >
+                    AI推荐平注
+                  </button>
+                  <button
+                    type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === AI_RANDOM_MARTIN_TYPE)}
+                    className={`type-toggle-btn ${type === AI_RANDOM_MARTIN_TYPE ? 'type-toggle-active' : ''}`}
+                    onClick={() => handleStrategyTypeSelect(AI_RANDOM_MARTIN_TYPE)}
+                    disabled={submitting}
+                  >
+                    AI推荐马丁
+                  </button>
+                  <button
+                    type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === RED_WAVE_DOUBLE_TYPE)}
                     className={`type-toggle-btn ${type === RED_WAVE_DOUBLE_TYPE ? 'type-toggle-active' : ''}`}
                     onClick={() => {
                       setType(RED_WAVE_DOUBLE_TYPE);
@@ -690,6 +948,7 @@ export default function StrategyForm({
                   </button>
                   <button
                     type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === GREEN_WAVE_SINGLE_TYPE)}
                     className={`type-toggle-btn ${type === GREEN_WAVE_SINGLE_TYPE ? 'type-toggle-active' : ''}`}
                     onClick={() => {
                       setType(GREEN_WAVE_SINGLE_TYPE);
@@ -796,6 +1055,53 @@ export default function StrategyForm({
           </div>
         )}
 
+        {isRandomPickStrategy && !dw3Mode && !isLuckySb && (
+          <>
+            <div className="form-field">
+              <span className="form-label">随机选号类型</span>
+              <div className="direction-grid">
+                {OMISSION_RANDOM_CATEGORY_OPTIONS.map((option) => {
+                  const checked = omissionRandomCategories.includes(option.key);
+                  return (
+                    <label key={option.key} className="direction-option">
+                      <input
+                        type="checkbox"
+                        className="direction-checkbox"
+                        checked={checked}
+                        onChange={() => toggleOmissionRandomCategory(option.key)}
+                        disabled={submitting}
+                      />
+                      <span className="direction-text">{option.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="form-field">
+              <span className="form-label">每类产出号码数</span>
+              <div className="type-toggle">
+                {OMISSION_RANDOM_PICK_COUNTS.map((count) => (
+                  <button
+                    key={count}
+                    type="button"
+                    className={`type-toggle-btn ${omissionRandomPickCount === count ? 'type-toggle-active' : ''}`}
+                    onClick={() => setOmissionRandomPickCount(count)}
+                    disabled={submitting}
+                  >
+                    {count}个
+                  </button>
+                ))}
+              </div>
+              <div className="form-hint">
+                {isAiRandomStrategy
+                  ? '每个已选类型纯随机产出号码，不使用遗漏或概率权重。'
+                  : '每个已选类型固定3个按遗漏权重产出，其余号码随机产出。'}
+              </div>
+            </div>
+          </>
+        )}
+
         {!isEdit && isLuckySb && !dw3Mode && (
           <div className="form-field">
             <label className="form-label">极速飞艇玩法</label>
@@ -808,7 +1114,7 @@ export default function StrategyForm({
           </div>
         )}
 
-        {!isEdit && !isLuckySb && !isWaveStrategy && !dw3Mode && (
+        {!isEdit && !isLuckySb && !isWaveStrategy && !isRandomPickStrategy && !dw3Mode && (
           <div className="form-field">
             <label className="form-label">玩法</label>
             <PlayCodeMultiSelect

@@ -173,7 +173,9 @@ export default function BetOrders() {
       <div className="bet-orders-header">
         <div>
           <h2 className="bet-orders-title">{getLedgerTitle(ledger)}</h2>
-          <p className="bet-orders-subtitle">{getLedgerSummaryLabel(ledger)}</p>
+          <p className="bet-orders-subtitle">
+            {getLedgerSummaryLabel(ledger)} · 默认显示近24小时，筛选查询最多近3天
+          </p>
         </div>
         <button type="button" className="refresh-btn" onClick={refresh}>
           刷新

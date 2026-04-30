@@ -17,6 +17,10 @@ vi.mock('@/api/strategies', () => ({
   stopStrategy: vi.fn(),
 }));
 
+vi.mock('@/api/accounts', () => ({
+  listAccounts: vi.fn(),
+}));
+
 vi.mock('@/api/request', () => ({
   isApiError: mockIsApiError,
 }));
@@ -64,8 +68,10 @@ vi.mock('@/components/CountdownDisplay', () => ({
   CountdownDisplay: () => <div data-testid="countdown">countdown</div>,
 }));
 
+import { listAccounts } from '@/api/accounts';
 import { listStrategies, startStrategy, updateStrategy } from '@/api/strategies';
 
+const mockListAccounts = vi.mocked(listAccounts);
 const mockListStrategies = vi.mocked(listStrategies);
 const mockStartStrategy = vi.mocked(startStrategy);
 const mockUpdateStrategy = vi.mocked(updateStrategy);
@@ -73,6 +79,22 @@ const mockUpdateStrategy = vi.mocked(updateStrategy);
 beforeEach(() => {
   vi.clearAllMocks();
   mockIsApiError.mockReturnValue(false);
+  mockListAccounts.mockResolvedValue({
+    code: 0,
+    message: 'success',
+    data: [
+      {
+        id: 1,
+        account_name: 'acc',
+        password_masked: '***',
+        allowed_strategy_types: ['flat'],
+        status: 'online',
+        balance: 0,
+        kill_switch: false,
+        last_login_at: null,
+      },
+    ],
+  } as never);
   mockListStrategies.mockResolvedValue({
     code: 0,
     message: 'success',
@@ -120,6 +142,35 @@ describe('Strategies', () => {
   it('renders countdown summary on the strategies page', async () => {
     render(<Strategies />);
     expect(await screen.findByTestId('countdown')).toBeInTheDocument();
+  });
+
+  it('hides create entry when no account has strategy permission', async () => {
+    mockListAccounts.mockResolvedValueOnce({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          id: 1,
+          account_name: 'acc',
+          password_masked: '***',
+          allowed_strategy_types: [],
+          status: 'online',
+          balance: 0,
+          kill_switch: false,
+          last_login_at: null,
+        },
+      ],
+    } as never);
+    mockListStrategies.mockResolvedValueOnce({
+      code: 0,
+      message: 'success',
+      data: [],
+    });
+
+    render(<Strategies />);
+
+    expect(await screen.findByText('当前账号暂未开通策略，请联系管理员')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /\+ 创建策略/ })).not.toBeInTheDocument();
   });
 
   it('switches between list, bet orders, and backtest workspaces', async () => {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { isApiError } from '@/api/request';
+import { listAccounts } from '@/api/accounts';
 import { CountdownDisplay } from '@/components/CountdownDisplay';
 import {
   deleteStrategy,
@@ -15,6 +16,7 @@ import Toast from '@/components/Toast';
 import { useConfirm } from '@/hooks/useConfirm';
 import { useToast } from '@/hooks/useToast';
 import type { StrategyInfo } from '@/types/api/strategy';
+import type { AccountInfo } from '@/types/api/account';
 import { getPlatformLabel } from '@/utils/platformLabels';
 import { getPlayCodeDisplay } from '@/utils/playCodeDisplay';
 import Backtest from './Backtest';
@@ -25,8 +27,18 @@ import './Strategies.css';
 function getTypeBadge(type: string): { label: string; className: string } {
   if (type === 'red_wave_double_martin') return { label: '红波双马丁', className: 'type-badge-martin' };
   if (type === 'green_wave_single_martin') return { label: '绿波追单', className: 'type-badge-martin' };
+  if (type === 'omission_random_flat') return { label: '遗漏随机平注', className: 'type-badge-flat' };
+  if (type === 'omission_random_martin') return { label: '遗漏随机马丁', className: 'type-badge-martin' };
+  if (type === 'ai_random_flat') return { label: 'AI推荐平注', className: 'type-badge-flat' };
+  if (type === 'ai_random_martin') return { label: 'AI推荐马丁', className: 'type-badge-martin' };
   if (type === 'martin') return { label: '马丁', className: 'type-badge-martin' };
   return { label: '普通', className: 'type-badge-flat' };
+}
+
+function getOmissionRandomConfigDisplay(strategy: StrategyInfo): string {
+  if (!strategy.type.startsWith('omission_random_') && !strategy.type.startsWith('ai_random_')) return '';
+  const pickCount = strategy.strategy_config?.pick_count;
+  return pickCount ? `每类${pickCount}个` : '';
 }
 
 type StrategyWorkspace = 'list' | 'orders' | 'backtest';
@@ -46,6 +58,11 @@ const MANUAL_CONFIRM_ODDS_MESSAGE = '需要人工处理：请先确认赔率后�
 const TOAST_MERGE_WINDOW_MS = 1500;
 const RELOGIN_HINTS = ['session', 'worker', 'login', 'relogin', 'auth', 'expired', '未登录', '重新登录', '登录失效', '验证'];
 const ODDS_HINTS = ['odds', '赔率', '未确认', 'unconfirmed', 'confirm'];
+const STRATEGY_NOT_AUTHORIZED_MESSAGE = '当前账号暂未开通策略，请联系管理员';
+
+function hasStrategyPermission(account: AccountInfo): boolean {
+  return (account.allowed_strategy_types ?? []).length > 0;
+}
 
 function normalizeOperatorMessage(rawMessage: string | null | undefined, fallback: string): string {
   const text = typeof rawMessage === 'string' ? rawMessage.trim() : '';
@@ -60,6 +77,9 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [strategyGateLoading, setStrategyGateLoading] = useState(true);
+  const [strategyGateError, setStrategyGateError] = useState('');
+  const [hasAuthorizedStrategyAccount, setHasAuthorizedStrategyAccount] = useState(false);
   const [workspace, setWorkspace] = useState<StrategyWorkspace>('list');
   const [showForm, setShowForm] = useState(false);
   const [editingStrategy, setEditingStrategy] = useState<StrategyInfo | null>(null);
@@ -95,12 +115,37 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     }
   }, []);
 
+  const fetchStrategyGate = useCallback(async () => {
+    try {
+      setStrategyGateError('');
+      const res = await listAccounts();
+      setHasAuthorizedStrategyAccount((res.data ?? []).some(hasStrategyPermission));
+    } catch (err) {
+      setHasAuthorizedStrategyAccount(false);
+      setStrategyGateError(isApiError(err) ? err.message : '加载账号权限失败，请稍后重试。');
+    } finally {
+      setStrategyGateLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     fetchStrategies();
   }, [fetchStrategies]);
 
   useEffect(() => {
+    fetchStrategyGate();
+  }, [fetchStrategyGate]);
+
+  useEffect(() => {
     if (!createIntent) {
+      return;
+    }
+    if (strategyGateLoading) {
+      return;
+    }
+    if (!hasAuthorizedStrategyAccount) {
+      showMergedToast(STRATEGY_NOT_AUTHORIZED_MESSAGE, STRATEGY_NOT_AUTHORIZED_MESSAGE);
+      onCreateIntentConsumed?.();
       return;
     }
     setWorkspace('list');
@@ -108,7 +153,13 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     setCreateAccountId(createIntent.accountId);
     setShowForm(true);
     onCreateIntentConsumed?.();
-  }, [createIntent, onCreateIntentConsumed]);
+  }, [
+    createIntent,
+    hasAuthorizedStrategyAccount,
+    onCreateIntentConsumed,
+    showMergedToast,
+    strategyGateLoading,
+  ]);
 
   const withActionLoadingSafe = useCallback(
     async (id: number, action: string, task: () => Promise<void>, fallbackError: string) => {
@@ -153,19 +204,9 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     if (actionLockRef.current[id] || deleteConfirmLockRef.current.has(id)) return;
     deleteConfirmLockRef.current.add(id);
     try {
-      if (!(await confirm(`确认删除策略“${name}”吗？`))) return;
+      if (!(await confirm(`确认删除策略“${name}”吗？投注记录和盈亏历史会保留。`))) return;
       await withActionLoadingSafe(id, 'delete', async () => {
-        try {
-          await deleteStrategy(id);
-        } catch (err) {
-          if (isApiError(err) && err.message.includes('投注记录')) {
-            if (await confirm(`${err.message}\n\n确认继续强制删除吗？`)) {
-              await deleteStrategy(id, true);
-              return;
-            }
-          }
-          throw err;
-        }
+        await deleteStrategy(id);
       }, '删除失败，请稍后再试。');
     } finally {
       deleteConfirmLockRef.current.delete(id);
@@ -179,11 +220,17 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   };
 
   const handleCreate = () => {
+    if (!hasAuthorizedStrategyAccount) {
+      showMergedToast(STRATEGY_NOT_AUTHORIZED_MESSAGE, STRATEGY_NOT_AUTHORIZED_MESSAGE);
+      return;
+    }
     setWorkspace('list');
     setEditingStrategy(null);
     setCreateAccountId(undefined);
     setShowForm(true);
   };
+
+  const noStrategyPermission = !strategyGateLoading && !hasAuthorizedStrategyAccount;
 
   const handleFormDone = () => {
     setShowForm(false);
@@ -238,10 +285,16 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
           <h1 className="strategies-title">投注策略</h1>
           <p className="strategies-subtitle">策略、投注记录和回测统一收口在这一页处理。</p>
         </div>
-        <button className="create-btn" onClick={handleCreate} type="button">
-          + 创建策略
-        </button>
+        {!strategyGateLoading && hasAuthorizedStrategyAccount && (
+          <button className="create-btn" onClick={handleCreate} type="button">
+            + 创建策略
+          </button>
+        )}
       </div>
+
+      {strategyGateError && (
+        <div className="strategies-error" role="alert">{strategyGateError}</div>
+      )}
 
       <div className="strategy-workspace-tabs" role="tablist" aria-label="策略工作区">
         <button
@@ -285,7 +338,9 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
           )}
 
           {!loading && !error && strategies.length === 0 && (
-            <div className="strategies-empty">暂无策略，点击上方按钮创建。</div>
+            <div className="strategies-empty">
+              {noStrategyPermission ? STRATEGY_NOT_AUTHORIZED_MESSAGE : '暂无策略，点击上方按钮创建。'}
+            </div>
           )}
 
           {!loading && !error && strategies.length > 0 && (
@@ -334,6 +389,7 @@ function StrategyCard({
 }: StrategyCardProps) {
   const isActioning = Boolean(actionLoading);
   const typeBadge = getTypeBadge(strategy.type);
+  const omissionConfigDisplay = getOmissionRandomConfigDisplay(strategy);
 
   const pnlClass = (value: number) => (
     value > 0 ? 'pnl-positive' : value < 0 ? 'pnl-negative' : ''
@@ -366,6 +422,7 @@ function StrategyCard({
           <span className="strategy-info-label">玩法</span>
           <span className="strategy-info-value">
             {getPlayCodeDisplay(strategy.play_code_name, strategy.play_code)}
+            {omissionConfigDisplay ? ` · ${omissionConfigDisplay}` : ''}
           </span>
         </div>
         <div className="strategy-info-item">

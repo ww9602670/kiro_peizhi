@@ -40,12 +40,27 @@ vi.mock('@/components/PlayCodeSelect', () => ({
 
 import { listAccounts } from '@/api/accounts';
 import { createStrategy, updateStrategy } from '@/api/strategies';
+import type { AccountInfo } from '@/types/api/account';
+import type { StrategyPermissionType } from '@/types/api/strategy';
 
 const mockListAccounts = vi.mocked(listAccounts);
 const mockCreateStrategy = vi.mocked(createStrategy);
 const mockUpdateStrategy = vi.mocked(updateStrategy);
 
-const accounts = [
+const allStrategyPermissions: StrategyPermissionType[] = [
+  'flat',
+  'martin',
+  'dw3_flat',
+  'dw3_martin',
+  'red_wave_double_martin',
+  'green_wave_single_martin',
+  'omission_random_flat',
+  'omission_random_martin',
+  'ai_random_flat',
+  'ai_random_martin',
+];
+
+const accounts: AccountInfo[] = [
   {
     id: 1,
     account_name: 'jnd',
@@ -56,6 +71,7 @@ const accounts = [
     verification_stale: false,
     summary_status_reason: null,
     allowed_strategy_platform_types: ['JND28WEB', 'JND282'],
+    allowed_strategy_types: [...allStrategyPermissions],
     platform_capabilities: [
       { platform_type: 'JND28WEB', verify_status: 'supported', market_state: 'open' },
       { platform_type: 'JND282', verify_status: 'supported', market_state: 'open' },
@@ -76,6 +92,7 @@ const accounts = [
     verification_stale: false,
     summary_status_reason: null,
     allowed_strategy_platform_types: ['LUCKYSB'],
+    allowed_strategy_types: ['flat', 'martin'],
     platform_capabilities: [
       { platform_type: 'LUCKYSB', verify_status: 'supported', market_state: 'open' },
     ],
@@ -168,6 +185,35 @@ describe('StrategyForm', () => {
       expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
     });
     expect((document.getElementById('sf-amount') as HTMLInputElement).value).toBe('1');
+  });
+
+  it('shows empty strategy choices when account has no strategy permission', async () => {
+    mockListAccounts.mockResolvedValue({
+      code: 0,
+      message: 'success',
+      data: [
+        {
+          ...accounts[0],
+          id: 7,
+          account_name: 'no_permission',
+          allowed_strategy_types: [],
+        },
+      ],
+    });
+
+    const { container } = render(
+      <StrategyForm
+        strategy={null}
+        onDone={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('7');
+    });
+    expect(screen.getByText('当前账号暂未开通策略，请联系管理员')).toBeInTheDocument();
+    expect(container.querySelector('.form-submit-btn')).toBeDisabled();
   });
 
   it('removes the simulation switch during create flow but keeps it for edit flow', async () => {
@@ -350,6 +396,90 @@ describe('StrategyForm', () => {
     expect(onDone).toHaveBeenCalledTimes(1);
   });
 
+  it('submits omission-random martin strategy config', async () => {
+    const user = userEvent.setup();
+    const onDone = vi.fn();
+
+    render(
+      <StrategyForm
+        strategy={null}
+        initialAccountId={1}
+        onDone={onDone}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
+    });
+
+    await user.type(document.getElementById('sf-name') as HTMLInputElement, 'random martin');
+    await user.click(screen.getByRole('button', { name: '遗漏随机马丁' }));
+    await user.click(screen.getByLabelText('球2'));
+    await user.click(screen.getByRole('button', { name: '5个' }));
+    await user.click(screen.getByRole('button', { name: '创建' }));
+
+    await waitFor(() => {
+      expect(mockCreateStrategy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          account_id: 1,
+          type: 'omission_random_martin',
+          play_code: 'OMR_BALL1,OMR_BALL2',
+          martin_sequence: [1, 2, 4, 8, 16],
+          strategy_config: {
+            pick_count: 5,
+            categories: ['ball1', 'ball2'],
+            weight_mode: 'omission_plus_random',
+          },
+          platform_type: 'JND28WEB',
+        }),
+      );
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it('submits ai-random martin strategy config', async () => {
+    const user = userEvent.setup();
+    const onDone = vi.fn();
+
+    render(
+      <StrategyForm
+        strategy={null}
+        initialAccountId={1}
+        onDone={onDone}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
+    });
+
+    await user.type(document.getElementById('sf-name') as HTMLInputElement, 'ai martin');
+    await user.click(screen.getByRole('button', { name: 'AI推荐马丁' }));
+    await user.click(screen.getByLabelText('球2'));
+    await user.click(screen.getByRole('button', { name: '6个' }));
+    await user.click(screen.getByRole('button', { name: '创建' }));
+
+    await waitFor(() => {
+      expect(mockCreateStrategy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          account_id: 1,
+          type: 'ai_random_martin',
+          play_code: 'OMR_BALL1,OMR_BALL2',
+          martin_sequence: [1, 2, 4, 8, 16],
+          strategy_config: {
+            pick_count: 6,
+            categories: ['ball1', 'ball2'],
+            weight_mode: 'pure_random',
+          },
+          platform_type: 'JND28WEB',
+        }),
+      );
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
   it('updates existing green-wave single strategy directions', async () => {
     const user = userEvent.setup();
     const onDone = vi.fn();
@@ -507,6 +637,7 @@ describe('StrategyForm', () => {
           verification_stale: false,
           summary_status_reason: null,
           allowed_strategy_platform_types: ['JND282'],
+          allowed_strategy_types: allStrategyPermissions,
           platform_capabilities: [
             { platform_type: 'JND282', verify_status: 'supported', market_state: 'open' },
           ],

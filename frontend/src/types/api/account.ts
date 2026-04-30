@@ -1,5 +1,7 @@
 /** Account API types aligned with backend account schemas. */
 
+import type { StrategyPermissionType } from './strategy';
+
 export type AccountGameType = 'JND28' | 'LUCKYSB';
 export type AccountPlatformType = 'JND28WEB' | 'JND282' | 'LUCKYSB';
 export type AccountVerifyStatus = 'supported' | 'unsupported' | 'probe_failed' | 'unknown';
@@ -40,6 +42,7 @@ export interface AccountInfo {
   password_masked: string;
   game_type?: AccountGameType | string;
   allowed_strategy_platform_types?: Array<AccountPlatformType | string>;
+  allowed_strategy_types?: StrategyPermissionType[];
   platform_capabilities?: AccountPlatformCapability[];
   latest_verification_run_id?: number | null;
   effective_verification_run_id?: number | null;

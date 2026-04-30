@@ -13,8 +13,15 @@ import {
   createOperator,
   updateOperator,
   updateOperatorStatus,
+  listOperatorStrategyPermissions,
+  updateAccountStrategyPermissions,
   fetchAdminDashboard,
   setGlobalKillSwitch,
+  listSharedMarketGroups,
+  listSharedMarketUncoveredUrls,
+  ignoreSharedMarketUncoveredUrl,
+  recheckSharedMarketUncoveredUrl,
+  joinSharedMarketUncoveredUrlGroup,
 } from './admin';
 
 vi.mock('@/api/request', () => ({
@@ -107,6 +114,30 @@ describe('updateOperatorStatus', () => {
   });
 });
 
+describe('account strategy permissions', () => {
+  it('读取操作者账号策略授权', async () => {
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: [] });
+
+    await listOperatorStrategyPermissions(7);
+
+    expect(mockRequest).toHaveBeenCalledWith('/admin/operators/7/strategy-permissions');
+  });
+
+  it('保存账号策略授权', async () => {
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
+
+    await updateAccountStrategyPermissions(7, 12, ['flat', 'martin']);
+
+    expect(mockRequest).toHaveBeenCalledWith(
+      '/admin/operators/7/accounts/12/strategy-permissions',
+      {
+        method: 'PUT',
+        body: JSON.stringify({ strategy_types: ['flat', 'martin'] }),
+      },
+    );
+  });
+});
+
 describe('fetchAdminDashboard', () => {
   it('调用 /admin/dashboard', async () => {
     mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: {} });
@@ -124,6 +155,45 @@ describe('setGlobalKillSwitch', () => {
     expect(mockRequest).toHaveBeenCalledWith('/admin/kill-switch', {
       method: 'POST',
       body: JSON.stringify({ enabled: true }),
+    });
+  });
+});
+
+describe('shared market urls', () => {
+  it('加载共享组', async () => {
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: [] });
+
+    await listSharedMarketGroups();
+
+    expect(mockRequest).toHaveBeenCalledWith('/admin/shared-market-groups');
+  });
+
+  it('加载待审核共享网址', async () => {
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: { items: [], total: 0, page: 1, page_size: 20 } });
+
+    await listSharedMarketUncoveredUrls({ page: 1, page_size: 20, status: 'pending' });
+
+    expect(mockRequest).toHaveBeenCalledWith('/admin/shared-market-uncovered-urls?page=1&page_size=20&status=pending');
+  });
+
+  it('忽略待审核记录', async () => {
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
+    await ignoreSharedMarketUncoveredUrl(12);
+    expect(mockRequest).toHaveBeenCalledWith('/admin/shared-market-uncovered-urls/12/ignore', { method: 'POST' });
+  });
+
+  it('重新检测待审核记录', async () => {
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
+    await recheckSharedMarketUncoveredUrl(12);
+    expect(mockRequest).toHaveBeenCalledWith('/admin/shared-market-uncovered-urls/12/recheck', { method: 'POST' });
+  });
+
+  it('加入共享组', async () => {
+    mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
+    await joinSharedMarketUncoveredUrlGroup(12, 9);
+    expect(mockRequest).toHaveBeenCalledWith('/admin/shared-market-uncovered-urls/12/join-shared-group', {
+      method: 'POST',
+      body: JSON.stringify({ shared_group_id: 9 }),
     });
   });
 });

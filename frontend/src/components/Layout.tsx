@@ -6,6 +6,7 @@
  */
 
 import { type ReactNode } from 'react';
+import { APP_VERSION_LABEL } from '@/appVersion';
 import AlertBadge from '@/components/AlertBadge';
 import './Layout.css';
 
@@ -34,7 +35,10 @@ export default function Layout({
   return (
     <div className="layout">
       <aside className="layout-sidebar">
-        <div className="sidebar-brand">投注平台</div>
+        <div className="sidebar-brand">
+          <span>投注平台</span>
+          <span className="sidebar-version">{APP_VERSION_LABEL}</span>
+        </div>
         <nav className="sidebar-nav" role="navigation">
           {navItems.map((item) => (
             <button

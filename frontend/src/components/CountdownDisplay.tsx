@@ -1,6 +1,7 @@
 /**
  * Countdown display component.
  */
+import { useState } from 'react';
 import { useLotteryCountdown } from '@/hooks/useLotteryCountdown';
 import { STATE_DISPLAY_MAP, LotteryStateEnum } from '@/types/api/lottery';
 import type { RecentLotteryResult } from '@/types/api/dashboard';
@@ -22,6 +23,7 @@ const SUM_RED = new Set([3, 6, 9, 12, 15, 18, 21, 24]);
 const SUM_GREEN = new Set([1, 4, 7, 10, 16, 19, 22, 25]);
 const SUM_BLUE = new Set([2, 5, 8, 11, 17, 20, 23, 26]);
 const SUM_SPECIAL = new Set([0, 13, 14, 27]);
+const COLLAPSED_RECENT_RESULT_COUNT = 3;
 
 function parseBalls(result: string): number[] | null {
   if (!result || !result.trim()) return null;
@@ -70,7 +72,14 @@ function ResultBalls({ result }: { result: string }) {
   );
 }
 
-function HistoryResultBalls({ result }: { result: string }) {
+function formatRecentTime(value: string | null | undefined) {
+  const text = value?.trim();
+  if (!text) return '-';
+  const timePart = text.includes(' ') ? text.split(' ').pop() : text;
+  return timePart?.slice(0, 5) || text;
+}
+
+function HistoryResultBalls({ result, showSum = true }: { result: string; showSum?: boolean }) {
   const balls = parseBalls(result);
   if (!balls) return <span className="recent-result-empty">-</span>;
   const sum = balls[0] + balls[1] + balls[2];
@@ -84,12 +93,13 @@ function HistoryResultBalls({ result }: { result: string }) {
           {value}
         </span>
       ))}
-      <span className={`recent-sum recent-sum-${getSumWave(sum)}`}>{sum}</span>
+      {showSum && <span className={`recent-sum recent-sum-${getSumWave(sum)}`}>{sum}</span>}
     </div>
   );
 }
 
 export function CountdownDisplay({ platformType, recentResults }: CountdownDisplayProps = {}) {
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const { data, closeCountdown, openCountdown, error, lastUpdateTime } = useLotteryCountdown({
     platformType,
   });
@@ -97,6 +107,11 @@ export function CountdownDisplay({ platformType, recentResults }: CountdownDispl
   const stateDisplay =
     STATE_DISPLAY_MAP[data?.state as LotteryStateEnum] ??
     STATE_DISPLAY_MAP[LotteryStateEnum.UNKNOWN];
+  const historyResults = recentResults ?? [];
+  const visibleHistoryResults = historyExpanded
+    ? historyResults
+    : historyResults.slice(0, COLLAPSED_RECENT_RESULT_COUNT);
+  const canToggleHistory = historyResults.length > COLLAPSED_RECENT_RESULT_COUNT;
 
   return (
     <div className="countdown-display">
@@ -138,29 +153,38 @@ export function CountdownDisplay({ platformType, recentResults }: CountdownDispl
         </div>
       </div>
 
-      {recentResults && recentResults.length > 0 && (
+      {historyResults.length > 0 && (
         <section className="recent-results-panel" aria-label="recent-results">
+          <div className="recent-results-header">
+            <strong className="recent-results-title">历史开奖</strong>
+            {canToggleHistory && (
+              <button
+                type="button"
+                className="recent-results-toggle"
+                aria-expanded={historyExpanded}
+                onClick={() => setHistoryExpanded((expanded) => !expanded)}
+              >
+                {historyExpanded ? '收起' : `展开全部 (${historyResults.length})`}
+              </button>
+            )}
+          </div>
           <div className="recent-results-list">
-            {recentResults.map((result) => {
+            {visibleHistoryResults.map((result) => {
               const tone = getSumWave(result.sum_value);
+              const resultTime = result.open_time || result.created_at;
               return (
                 <article
                   key={result.id}
                   className={`recent-result-card recent-result-card-${tone}`}
                 >
-                  <div className="recent-result-header">
-                    <strong className="recent-result-issue">{result.issue}</strong>
-                    <span className={`recent-result-sum-tag recent-result-sum-tag-${tone}`}>
-                      {`和值 ${result.sum_value}`}
-                    </span>
-                  </div>
-                  <HistoryResultBalls result={result.open_result} />
-                  <div className="recent-result-footer">
-                    <span className="recent-result-raw">{result.open_result || '-'}</span>
-                    <time className="recent-result-time">
-                      {result.open_time || result.created_at}
-                    </time>
-                  </div>
+                  <strong className="recent-result-issue">{result.issue}</strong>
+                  <HistoryResultBalls result={result.open_result} showSum={false} />
+                  <span className={`recent-result-sum-tag recent-result-sum-tag-${tone}`}>
+                    {`和值 ${result.sum_value}`}
+                  </span>
+                  <time className="recent-result-time" title={resultTime}>
+                    {formatRecentTime(resultTime)}
+                  </time>
                 </article>
               );
             })}

@@ -23,6 +23,18 @@ function readDismissed(key: string): string[] {
   }
 }
 
+function getStrategyTypeLabel(type: string): string {
+  if (type === 'flat') return '普通';
+  if (type === 'martin') return '马丁';
+  if (type === 'omission_random_flat') return '遗漏随机平注';
+  if (type === 'omission_random_martin') return '遗漏随机马丁';
+  if (type === 'ai_random_flat') return 'AI推荐平注';
+  if (type === 'ai_random_martin') return 'AI推荐马丁';
+  if (type === 'red_wave_double_martin') return '红波双马丁';
+  if (type === 'green_wave_single_martin') return '绿波追单';
+  return type;
+}
+
 export default function Dashboard({ onCreateStrategy }: DashboardProps) {
   const { data, loading, error, startAutoRefresh, stopAutoRefresh } = useDashboard();
   const { operatorId } = useAuth();
@@ -117,9 +129,11 @@ export default function Dashboard({ onCreateStrategy }: DashboardProps) {
           <h1 className="dashboard-title">仪表盘</h1>
           <p className="dashboard-subtitle">集中查看开奖、告警、平台更新和当前运行情况。</p>
         </div>
-        <button type="button" className="dashboard-primary-btn" onClick={onCreateStrategy}>
-          + 创建策略
-        </button>
+        {onCreateStrategy && (
+          <button type="button" className="dashboard-primary-btn" onClick={onCreateStrategy}>
+            + 创建策略
+          </button>
+        )}
       </div>
 
       <div className="countdown-section">
@@ -248,7 +262,7 @@ export default function Dashboard({ onCreateStrategy }: DashboardProps) {
                     {getPlayCodeDisplay(strategy.play_code_name, strategy.play_code)}
                   </span>
                   <span className="strategy-type">
-                    {strategy.type === 'flat' ? '普通' : '马丁'}
+                    {getStrategyTypeLabel(strategy.type)}
                   </span>
                   <span className={`strategy-pnl ${strategy.daily_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}`}>
                     今日 {strategy.daily_pnl > 0 ? '+' : ''}{strategy.daily_pnl.toFixed(2)}

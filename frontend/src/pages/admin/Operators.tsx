@@ -7,12 +7,42 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { listOperators, createOperator, updateOperatorStatus } from '@/api/admin';
+import {
+  listOperators,
+  createOperator,
+  updateOperatorStatus,
+  listOperatorStrategyPermissions,
+  updateAccountStrategyPermissions,
+  listSharedMarketUncoveredUrls,
+  listSharedMarketGroups,
+  ignoreSharedMarketUncoveredUrl,
+  recheckSharedMarketUncoveredUrl,
+  joinSharedMarketUncoveredUrlGroup,
+} from '@/api/admin';
 import { isApiError } from '@/api/request';
 import type { OperatorInfo } from '@/types/api/operator';
+import type {
+  AccountStrategyPermissionInfo,
+  SharedMarketGroupInfo,
+  SharedMarketUncoveredUrlInfo,
+  StrategyPermissionType,
+} from '@/types/api/strategy';
 import Toast from '@/components/Toast';
 import { useToast } from '@/hooks/useToast';
 import './Operators.css';
+
+const STRATEGY_PERMISSION_OPTIONS: Array<{ value: StrategyPermissionType; label: string }> = [
+  { value: 'flat', label: '平注' },
+  { value: 'martin', label: '马丁' },
+  { value: 'dw3_flat', label: '三字定位平注' },
+  { value: 'dw3_martin', label: '三字定位马丁' },
+  { value: 'omission_random_flat', label: '遗漏随机平注' },
+  { value: 'omission_random_martin', label: '遗漏随机马丁' },
+  { value: 'ai_random_flat', label: 'AI推荐平注' },
+  { value: 'ai_random_martin', label: 'AI推荐马丁' },
+  { value: 'red_wave_double_martin', label: '红波追双' },
+  { value: 'green_wave_single_martin', label: '绿波追单' },
+];
 
 export default function Operators() {
   const [operators, setOperators] = useState<OperatorInfo[]>([]);
@@ -28,6 +58,21 @@ export default function Operators() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState('');
   const { messages, showToast, removeToast } = useToast();
+  const [permissionOperator, setPermissionOperator] = useState<OperatorInfo | null>(null);
+  const [permissionRows, setPermissionRows] = useState<AccountStrategyPermissionInfo[]>([]);
+  const [permissionLoading, setPermissionLoading] = useState(false);
+  const [savingPermissionAccountId, setSavingPermissionAccountId] = useState<number | null>(null);
+
+  // 共享网址待审核
+  const [sharedReviewLoading, setSharedReviewLoading] = useState(false);
+  const [sharedReviewError, setSharedReviewError] = useState('');
+  const [sharedMarketUncoveredRows, setSharedMarketUncoveredRows] = useState<SharedMarketUncoveredUrlInfo[]>([]);
+  const [sharedMarketGroups, setSharedMarketGroups] = useState<SharedMarketGroupInfo[]>([]);
+  const [sharedReviewActionLoadingId, setSharedReviewActionLoadingId] = useState<number | null>(null);
+  const [sharedReviewPage, setSharedReviewPage] = useState(1);
+  const [sharedReviewTotal, setSharedReviewTotal] = useState(0);
+  const [sharedReviewPageSize] = useState(10);
+  const [sharedJoinSelection, setSharedJoinSelection] = useState<Record<number, string>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -69,6 +114,49 @@ export default function Operators() {
     }
   };
 
+  const loadSharedMarketReview = useCallback(async () => {
+    setSharedReviewLoading(true);
+    setSharedReviewError('');
+
+    try {
+      const groupRes = await listSharedMarketGroups();
+      setSharedMarketGroups(groupRes.data ?? []);
+    } catch (err) {
+      if (isApiError(err)) {
+        showToast(`加载共享组失败：${err.message}`);
+      } else {
+        showToast('加载共享组失败');
+      }
+      setSharedMarketGroups([]);
+    }
+
+    try {
+      const res = await listSharedMarketUncoveredUrls({
+        page: sharedReviewPage,
+        page_size: sharedReviewPageSize,
+        status: 'pending',
+      });
+      if (res.data) {
+        setSharedMarketUncoveredRows(res.data.items);
+        setSharedReviewTotal(res.data.total);
+      }
+    } catch (err) {
+      if (isApiError(err)) {
+        setSharedReviewError(err.message);
+      } else {
+        setSharedReviewError('加载待审核记录失败');
+      }
+      setSharedMarketUncoveredRows([]);
+      setSharedReviewTotal(0);
+    } finally {
+      setSharedReviewLoading(false);
+    }
+  }, [sharedReviewPage, sharedReviewPageSize, showToast]);
+
+  useEffect(() => {
+    void loadSharedMarketReview();
+  }, [loadSharedMarketReview]);
+
   const handleToggleStatus = async (op: OperatorInfo) => {
     const newStatus = op.status === 'active' ? 'disabled' : 'active';
     try {
@@ -79,7 +167,134 @@ export default function Operators() {
     }
   };
 
+  const openPermissionPanel = async (op: OperatorInfo) => {
+    setPermissionOperator(op);
+    setPermissionRows([]);
+    setPermissionLoading(true);
+    try {
+      const res = await listOperatorStrategyPermissions(op.id);
+      setPermissionRows(res.data ?? []);
+    } catch (err) {
+      if (isApiError(err)) showToast(err.message);
+      else showToast('加载策略授权失败');
+    } finally {
+      setPermissionLoading(false);
+    }
+  };
+
+  const handlePermissionToggle = async (
+    row: AccountStrategyPermissionInfo,
+    strategyType: StrategyPermissionType
+  ) => {
+    if (!permissionOperator) return;
+    const current = new Set(row.allowed_strategy_types);
+    if (current.has(strategyType)) current.delete(strategyType);
+    else current.add(strategyType);
+    const nextTypes = STRATEGY_PERMISSION_OPTIONS
+      .map((item) => item.value)
+      .filter((item) => current.has(item));
+
+    setSavingPermissionAccountId(row.account_id);
+    try {
+      const res = await updateAccountStrategyPermissions(
+        permissionOperator.id,
+        row.account_id,
+        nextTypes
+      );
+      if (res.data) {
+        setPermissionRows((previous) =>
+          previous.map((item) => item.account_id === row.account_id ? res.data! : item)
+        );
+      }
+    } catch (err) {
+      if (isApiError(err)) showToast(err.message);
+      else showToast('保存策略授权失败');
+    } finally {
+      setSavingPermissionAccountId(null);
+    }
+  };
+
+  const updateSharedReviewRow = (nextRow: SharedMarketUncoveredUrlInfo | null | undefined) => {
+    if (!nextRow) return;
+    setSharedMarketUncoveredRows((previous) =>
+      nextRow.status === 'pending'
+        ? previous.map((row) => (row.id === nextRow.id ? nextRow : row))
+        : previous.filter((row) => row.id !== nextRow.id),
+    );
+  };
+
+  const handleIgnoreSharedReview = async (recordId: number) => {
+    setSharedReviewActionLoadingId(recordId);
+    try {
+      const res = await ignoreSharedMarketUncoveredUrl(recordId);
+      updateSharedReviewRow(res.data);
+      showToast('已设置为忽略');
+    } catch (err) {
+      if (isApiError(err)) showToast(err.message);
+      else showToast('操作失败');
+    } finally {
+      setSharedReviewActionLoadingId(null);
+    }
+  };
+
+  const handleRecheckSharedReview = async (recordId: number) => {
+    setSharedReviewActionLoadingId(recordId);
+    try {
+      const res = await recheckSharedMarketUncoveredUrl(recordId);
+      updateSharedReviewRow(res.data);
+      showToast('已标记为重新检测');
+    } catch (err) {
+      if (isApiError(err)) showToast(err.message);
+      else showToast('操作失败');
+    } finally {
+      setSharedReviewActionLoadingId(null);
+    }
+  };
+
+  const handleJoinSharedGroup = async (recordId: number) => {
+    const selected = sharedJoinSelection[recordId];
+    if (!selected) {
+      showToast('请先选择共享组');
+      return;
+    }
+    const sharedGroupId = Number(selected);
+    if (Number.isNaN(sharedGroupId)) {
+      showToast('请先选择共享组');
+      return;
+    }
+    setSharedReviewActionLoadingId(recordId);
+    try {
+      const res = await joinSharedMarketUncoveredUrlGroup(recordId, sharedGroupId);
+      updateSharedReviewRow(res.data);
+      showToast('已加入共享组，待共享运行中重检');
+    } catch (err) {
+      if (isApiError(err)) showToast(err.message);
+      else showToast('操作失败');
+    } finally {
+      setSharedReviewActionLoadingId(null);
+    }
+  };
+
+  const sharedReviewPages = Math.ceil(sharedReviewTotal / sharedReviewPageSize) || 0;
+  const sharedReviewLabel = (status: string | undefined | null): string => {
+    switch (status) {
+      case 'pending':
+        return '待检测';
+      case 'review_required':
+        return '待审核';
+      case 'matched':
+        return '已匹配';
+      case 'ignored':
+        return '已忽略';
+      case 'detecting':
+        return '检测中';
+      default:
+        return status || '未知';
+    }
+  };
+
   const totalPages = Math.ceil(total / pageSize);
+  const permissionShortcutOperators = operators.filter((op) => op.role !== 'admin');
 
   return (
     <div className="operators-page">
@@ -90,6 +305,124 @@ export default function Operators() {
           + 创建操作者
         </button>
       </div>
+
+      <section className="shared-review-panel" aria-label="共享网址审核">
+        <h2 className="shared-review-title">共享网址审核</h2>
+        {sharedReviewLoading ? (
+          <p className="loading-text">加载中...</p>
+        ) : sharedReviewError ? (
+          <p className="operators-error">{sharedReviewError}</p>
+        ) : sharedMarketUncoveredRows.length === 0 ? (
+          <p className="empty-text">暂无待审核共享网址</p>
+        ) : (
+          <>
+            <div className="shared-review-table-wrap">
+              <table className="shared-review-table">
+                <thead>
+                  <tr>
+                    <th>网址</th>
+                    <th>平台类型</th>
+                    <th>命中次数</th>
+                    <th>检测状态</th>
+                    <th>失败原因</th>
+                    <th>最后发现时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sharedMarketUncoveredRows.map((item) => (
+                    <tr key={item.id}>
+                      <td data-label="网址" className="mono-url">
+                        <span className="shared-review-url">{item.normalized_url}</span>
+                      </td>
+                      <td data-label="平台类型">{item.last_platform_type || '-'}</td>
+                      <td data-label="命中次数">{item.hit_count}</td>
+                      <td data-label="检测状态">{sharedReviewLabel(item.detection_status || item.status)}</td>
+                      <td data-label="失败原因">{item.failure_reason || '-'}</td>
+                      <td data-label="最后发现时间">{item.last_seen_at}</td>
+                      <td data-label="操作">
+                        <div className="shared-review-actions">
+                          <button
+                            type="button"
+                            className="shared-review-btn shared-review-recheck"
+                            onClick={() => handleRecheckSharedReview(item.id)}
+                            disabled={sharedReviewActionLoadingId === item.id}
+                          >
+                            {sharedReviewActionLoadingId === item.id ? '处理中...' : '重新检测'}
+                          </button>
+                          <button
+                            type="button"
+                            className="shared-review-btn shared-review-ignore"
+                            onClick={() => handleIgnoreSharedReview(item.id)}
+                            disabled={sharedReviewActionLoadingId === item.id}
+                          >
+                            {sharedReviewActionLoadingId === item.id ? '处理中...' : '忽略'}
+                          </button>
+                          {sharedMarketGroups.length > 0 ? (
+                            <div className="shared-review-join">
+                              <select
+                                value={sharedJoinSelection[item.id] ?? ''}
+                                onChange={(e) => {
+                                  setSharedJoinSelection((previous) => ({
+                                    ...previous,
+                                    [item.id]: e.target.value,
+                                  }));
+                                }}
+                                disabled={sharedReviewActionLoadingId === item.id}
+                                aria-label="选择共享组"
+                              >
+                                <option value="">选择共享组</option>
+                                {sharedMarketGroups.map((group) => (
+                                  <option key={group.id} value={group.id}>
+                                    {group.group_key}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                className="shared-review-btn shared-review-join-btn"
+                                onClick={() => handleJoinSharedGroup(item.id)}
+                                disabled={sharedReviewActionLoadingId === item.id || !sharedJoinSelection[item.id]}
+                              >
+                                {sharedReviewActionLoadingId === item.id ? '处理中...' : '加入共享组'}
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="shared-review-no-group">暂无可用共享组</span>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {sharedReviewPages > 1 && (
+              <div className="operators-pagination">
+                <button
+                  type="button"
+                  className="page-btn"
+                  disabled={sharedReviewPage <= 1}
+                  onClick={() => setSharedReviewPage((pageNum) => pageNum - 1)}
+                >
+                  上一页
+                </button>
+                <span className="page-info">
+                  {sharedReviewPage} / {sharedReviewPages}
+                </span>
+                <button
+                  type="button"
+                  className="page-btn"
+                  disabled={sharedReviewPage >= sharedReviewPages}
+                  onClick={() => setSharedReviewPage((pageNum) => pageNum + 1)}
+                >
+                  下一页
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </section>
 
       {/* Create form */}
       {showCreate && (
@@ -118,6 +451,70 @@ export default function Operators() {
             </button>
             <button type="button" className="cancel-btn" onClick={() => setShowCreate(false)}>取消</button>
           </div>
+        </div>
+      )}
+
+      {!loading && permissionShortcutOperators.length > 0 && (
+        <section className="permission-shortcut-panel" aria-label="策略授权快捷入口">
+          <div className="permission-shortcut-header">
+            <h2>策略授权</h2>
+          </div>
+          <div className="permission-shortcut-list">
+            {permissionShortcutOperators.map((op) => (
+              <button
+                key={op.id}
+                type="button"
+                className="permission-shortcut-card"
+                onClick={() => openPermissionPanel(op)}
+              >
+                <span className="permission-shortcut-name">{op.username}</span>
+                <span className={`op-status op-status-${op.status}`}>
+                  {op.status === 'active' ? '活跃' : op.status === 'disabled' ? '禁用' : op.status}
+                </span>
+                <span className="permission-shortcut-action">给此操作者授权策略</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {permissionOperator && (
+        <div className="permission-panel">
+          <div className="permission-panel-header">
+            <h3 className="create-form-title">策略授权：{permissionOperator.username}</h3>
+            <button type="button" className="cancel-btn" onClick={() => setPermissionOperator(null)}>
+              关闭
+            </button>
+          </div>
+          {permissionLoading ? (
+            <p className="loading-text">加载中...</p>
+          ) : permissionRows.length === 0 ? (
+            <p className="empty-text">该操作者暂无绑定账号</p>
+          ) : (
+            <div className="permission-account-list">
+              {permissionRows.map((row) => (
+                <div key={row.account_id} className="permission-account">
+                  <div className="permission-account-title">
+                    <strong>{row.account_name}</strong>
+                    <span>{row.game_type}</span>
+                  </div>
+                  <div className="permission-options">
+                    {STRATEGY_PERMISSION_OPTIONS.map((option) => (
+                      <label key={option.value} className="permission-option">
+                        <input
+                          type="checkbox"
+                          checked={row.allowed_strategy_types.includes(option.value)}
+                          disabled={savingPermissionAccountId === row.account_id}
+                          onChange={() => handlePermissionToggle(row, option.value)}
+                        />
+                        <span>{option.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -155,6 +552,14 @@ export default function Operators() {
                     <td data-label="到期日期">{op.expire_date ?? '-'}</td>
                     <td data-label="操作">
                       {op.role !== 'admin' && (
+                        <div className="operator-actions">
+                          <button
+                            type="button"
+                            className="permission-btn"
+                            onClick={() => openPermissionPanel(op)}
+                          >
+                            策略授权
+                          </button>
                         <button
                           type="button"
                           className={`toggle-btn ${op.status === 'active' ? 'toggle-disable' : 'toggle-enable'}`}
@@ -162,6 +567,7 @@ export default function Operators() {
                         >
                           {op.status === 'active' ? '禁用' : '启用'}
                         </button>
+                        </div>
                       )}
                     </td>
                   </tr>
