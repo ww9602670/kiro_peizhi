@@ -1,6 +1,6 @@
 """Strategy API schemas."""
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -10,8 +10,43 @@ from app.utils.strategy_timing import (
     WAVE_STRATEGY_TYPES,
     normalize_wave_strategy_play_code,
 )
+from app.utils.omission_random import (
+    AI_RANDOM_WEIGHT_MODE,
+    OMISSION_WEIGHT_MODE,
+    build_omission_play_code,
+    is_ai_random_type,
+    is_random_pick_martin_type,
+    is_random_pick_type,
+    normalize_strategy_config,
+)
 
 PlatformType = Literal["JND28WEB", "JND282", "LUCKYSB"]
+StrategyPermissionType = Literal[
+    "flat",
+    "martin",
+    "dw3_flat",
+    "dw3_martin",
+    "red_wave_double_martin",
+    "green_wave_single_martin",
+    "omission_random_flat",
+    "omission_random_martin",
+    "ai_random_flat",
+    "ai_random_martin",
+]
+
+STRATEGY_PERMISSION_TYPES: tuple[str, ...] = (
+    "flat",
+    "martin",
+    "dw3_flat",
+    "dw3_martin",
+    "red_wave_double_martin",
+    "green_wave_single_martin",
+    "omission_random_flat",
+    "omission_random_martin",
+    "ai_random_flat",
+    "ai_random_martin",
+)
+_STRATEGY_PERMISSION_TYPE_SET = set(STRATEGY_PERMISSION_TYPES)
 
 DW3_BS_TOKENS: tuple[str, ...] = (
     "DW3_BS_BBB",
@@ -73,6 +108,22 @@ def has_dw3_prefix(play_code: str) -> bool:
     return any(token.startswith("DW3_") for token in split_play_codes(play_code))
 
 
+def normalize_strategy_permission_type(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in _STRATEGY_PERMISSION_TYPE_SET:
+        raise ValueError(f"unsupported strategy permission type: {value}")
+    return normalized
+
+
+def derive_strategy_permission_type(strategy_type: str, play_code: str) -> str:
+    normalized_type = (strategy_type or "").strip().lower()
+    if has_dw3_prefix(play_code) or is_dw3_group_play_code(play_code):
+        if normalized_type not in {"flat", "martin"}:
+            raise ValueError("DW3 permission only supports flat or martin")
+        return f"dw3_{normalized_type}"
+    return normalize_strategy_permission_type(normalized_type)
+
+
 class StrategyCreate(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
@@ -95,10 +146,20 @@ class StrategyCreate(BaseModel):
 
     account_id: int
     name: str = Field(..., min_length=1, max_length=64)
-    type: Literal["flat", "martin", "red_wave_double_martin", "green_wave_single_martin"]
+    type: Literal[
+        "flat",
+        "martin",
+        "red_wave_double_martin",
+        "green_wave_single_martin",
+        "omission_random_flat",
+        "omission_random_martin",
+        "ai_random_flat",
+        "ai_random_martin",
+    ]
     play_code: str = Field(..., min_length=1)
     base_amount: float = Field(..., gt=0)
     martin_sequence: Optional[list[float]] = None
+    strategy_config: Optional[dict[str, Any]] = None
     bet_timing: int = Field(default=30, ge=BET_TIMING_MIN, le=BET_TIMING_MAX)
     simulation: bool = False
     stop_loss: Optional[float] = Field(default=None, gt=0)
@@ -108,6 +169,25 @@ class StrategyCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_strategy(self):
+        if is_random_pick_type(self.type):
+            if not isinstance(self.strategy_config, dict):
+                raise ValueError("strategy_config")
+            weight_mode = AI_RANDOM_WEIGHT_MODE if is_ai_random_type(self.type) else OMISSION_WEIGHT_MODE
+            self.strategy_config = normalize_strategy_config(
+                self.strategy_config,
+                weight_mode=weight_mode,
+            )
+            self.play_code = build_omission_play_code(self.strategy_config["categories"])
+            if is_random_pick_martin_type(self.type):
+                if not self.martin_sequence:
+                    raise ValueError("martin_sequence")
+                for value in self.martin_sequence:
+                    if value <= 0:
+                        raise ValueError("martin_sequence item must be > 0")
+            else:
+                self.martin_sequence = None
+            return self
+
         if self.type == "martin" or self.type in WAVE_STRATEGY_TYPES:
             if not self.martin_sequence:
                 raise ValueError("martin_sequence")
@@ -142,6 +222,7 @@ class StrategyUpdate(BaseModel):
     base_amount: Optional[float] = Field(default=None, gt=0)
     play_code: Optional[str] = Field(default=None, min_length=1)
     martin_sequence: Optional[list[float]] = None
+    strategy_config: Optional[dict[str, Any]] = None
     bet_timing: Optional[int] = Field(default=None, ge=BET_TIMING_MIN, le=BET_TIMING_MAX)
     simulation: Optional[bool] = None
     stop_loss: Optional[float] = Field(default=None, gt=0)
@@ -154,6 +235,63 @@ class StrategyUpdate(BaseModel):
         if self.play_code and has_dw3_prefix(self.play_code):
             self.play_code = normalize_dw3_group_play_code(self.play_code)
         return self
+
+
+class StrategyPermissionUpdate(BaseModel):
+    strategy_types: list[StrategyPermissionType] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def normalize_strategy_types(self):
+        deduped: list[str] = []
+        for item in self.strategy_types:
+            normalized = normalize_strategy_permission_type(item)
+            if normalized not in deduped:
+                deduped.append(normalized)
+        self.strategy_types = deduped  # type: ignore[assignment]
+        return self
+
+
+class AccountStrategyPermissionInfo(BaseModel):
+    operator_id: int
+    account_id: int
+    account_name: str
+    game_type: str
+    allowed_strategy_types: list[StrategyPermissionType] = Field(default_factory=list)
+
+
+class SharedMarketUncoveredUrlInfo(BaseModel):
+    id: int
+    normalized_url: str
+    first_seen_at: str
+    last_seen_at: str
+    hit_count: int
+    detection_status: str
+    last_account_id: int | None = None
+    last_platform_type: str | None = None
+    sample_raw_url: str | None = None
+    status: str
+    failure_reason: str | None = None
+    shared_group_id: int | None = None
+    shared_group_key: str | None = None
+
+
+class SharedMarketGroupInfo(BaseModel):
+    id: int
+    group_key: str
+    enabled: bool | int
+    collector_platform_type: str | None = None
+    collector_account_name: str | None = None
+    primary_url: str | None = None
+    source_status: str | None = None
+    last_error: str | None = None
+    snapshot_issue: str | None = None
+    snapshot_pre_issue: str | None = None
+    snapshot_open_result: str | None = None
+    snapshot_fetched_at: str | None = None
+    snapshot_updated_at: str | None = None
+
+class SharedMarketUncoveredJoinGroupRequest(BaseModel):
+    shared_group_id: int
 
 
 class StrategyInfo(BaseModel):
@@ -187,6 +325,7 @@ class StrategyInfo(BaseModel):
     play_code: str
     base_amount: float
     martin_sequence: Optional[list[float]]
+    strategy_config: Optional[dict[str, Any]] = None
     bet_timing: int
     simulation: bool
     status: str

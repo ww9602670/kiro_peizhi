@@ -24,6 +24,7 @@ from app.models.db_ops import (
     bet_order_create,
     bet_order_update_status,
     odds_get_confirmed_map,
+    odds_get_latest_map,
     odds_has_records,
     simulation_bet_order_create,
     simulation_bet_order_update,
@@ -160,12 +161,9 @@ class BetExecutor:
         if not approved:
             return report
 
-        # 3. 从本地数据库读取已确认赔率（替代原 adapter.load_odds）
-        odds = await odds_get_confirmed_map(
-            self.db,
-            account_id=self.account_id,
-            platform_type=self.platform_type,
-        )
+        # 3. Resolve odds for this submit.
+        # Runtime resolution can use live/latest odds when confirmation lags.
+        odds = await self._resolve_execution_odds(install)
 
         if odds is None:
             has_records = await odds_has_records(
@@ -247,6 +245,65 @@ class BetExecutor:
                 install, betdata, orders_created,
             )
         return report
+
+    async def _resolve_execution_odds(
+        self, install: InstallInfo
+    ) -> dict[str, int] | None:
+        confirmed_odds = await odds_get_confirmed_map(
+            self.db,
+            account_id=self.account_id,
+            platform_type=self.platform_type,
+        )
+        if confirmed_odds is not None:
+            return confirmed_odds
+
+        live_odds = await self._load_live_odds_for_execution(install)
+        if live_odds:
+            return live_odds
+
+        latest_odds = await odds_get_latest_map(
+            self.db,
+            account_id=self.account_id,
+            platform_type=self.platform_type,
+        )
+        if latest_odds is not None:
+            logger.warning(
+                "using unconfirmed latest odds for execution account_id=%d platform=%s issue=%s",
+                self.account_id,
+                self.platform_type,
+                install.issue,
+            )
+            return latest_odds
+
+        return None
+
+    async def _load_live_odds_for_execution(
+        self, install: InstallInfo
+    ) -> dict[str, int] | None:
+        if install.state != 1 or install.close_countdown_sec <= SAFE_CLOSE_THRESHOLD:
+            return None
+
+        try:
+            live_odds = await self.adapter.load_odds(install.issue)
+        except Exception:
+            logger.exception(
+                "runtime odds refresh failed issue=%s account_id=%d",
+                install.issue,
+                self.account_id,
+            )
+            return None
+
+        live_non_zero = {
+            key: value for key, value in live_odds.items() if value > 0
+        }
+        if not live_non_zero:
+            logger.warning(
+                "runtime odds refresh returned empty issue=%s account_id=%d",
+                install.issue,
+                self.account_id,
+            )
+            return None
+        return live_non_zero
 
     def _log_request_summary(
         self,
@@ -460,6 +517,7 @@ class BetExecutor:
         当平台返回 succeed=5（赔率已变）时，自动从平台获取实时赔率并重试一次。
         """
         now_str = _now_bj()
+        effective_betdata = betdata
 
         try:
             result: BetResult = await self.adapter.place_bet(
@@ -517,8 +575,8 @@ class BetExecutor:
                 "赔率已变(succeed=5), 从平台获取实时赔率重试 issue=%s account_id=%d",
                 install.issue, self.account_id,
             )
-            result = await self._retry_with_live_odds(install, betdata)
-            if result is None:
+            retry_result = await self._retry_with_live_odds(install, betdata)
+            if retry_result is None:
                 # 获取实时赔率失败
                 fail_reason = "赔率已变, 重新获取实时赔率失败"
                 self._log_confirmbet_terminal(
@@ -534,12 +592,13 @@ class BetExecutor:
                 )
                 await self._send_bet_fail_alert(install.issue, fail_reason)
                 return
+            result, effective_betdata = retry_result
 
         if result.succeed == 1:
             retry_attempt = "retry" if bool((result.raw_response or {}).get("_retry_attempt")) else "initial"
             self._log_confirmbet_terminal(
                 issue=install.issue,
-                betdata=betdata,
+                betdata=effective_betdata,
                 result="confirmbet_success",
                 error_code="SUCCESS",
                 attempt=retry_attempt,
@@ -547,17 +606,27 @@ class BetExecutor:
                 message=result.message,
             )
             total_bet_amount = 0
+            effective_odds_by_key = {
+                str(item.get("KeyCode")): int(item.get("Odds", 0) or 0)
+                for item in effective_betdata
+            }
             for order in orders_created:
                 if order.get("simulation", 0) == 1:
                     continue
                 try:
+                    extra_fields = {
+                        "bet_at": now_str,
+                        "bet_response": str(result.raw_response),
+                    }
+                    effective_odds = effective_odds_by_key.get(str(order.get("key_code")))
+                    if effective_odds:
+                        extra_fields["odds"] = effective_odds
                     await bet_order_update_status(
                         self.db,
                         order_id=order["id"],
                         operator_id=self.operator_id,
                         status="bet_success",
-                        bet_at=now_str,
-                        bet_response=str(result.raw_response),
+                        **extra_fields,
                     )
                     total_bet_amount += order.get("amount", 0)
                 except Exception:
@@ -572,7 +641,7 @@ class BetExecutor:
             retry_attempt = "retry" if bool((result.raw_response or {}).get("_retry_attempt")) else "initial"
             self._log_confirmbet_terminal(
                 issue=install.issue,
-                betdata=betdata,
+                betdata=effective_betdata,
                 result="confirmbet_failed",
                 error_code=result.error_code,
                 attempt=retry_attempt,
@@ -590,7 +659,7 @@ class BetExecutor:
 
     async def _retry_with_live_odds(
         self, install: InstallInfo, betdata: list[dict]
-    ) -> BetResult | None:
+    ) -> tuple[BetResult, list[dict]] | None:
         """从平台实时获取赔率，用新赔率重建 betdata 并重试下注。"""
         if not await self._retry_window_is_open(install):
             return None
@@ -620,7 +689,7 @@ class BetExecutor:
                 logger.info(
                     "实时赔率中无此玩法 key_code=%s, 跳过", key_code,
                 )
-                continue
+                return None
             new_betdata.append({
                 "KeyCode": key_code,
                 "Amount": bet["Amount"],
@@ -641,7 +710,7 @@ class BetExecutor:
                 result.raw_response = {}
             result.raw_response["_retry_attempt"] = True
             result.raw_response["_retry_item_count"] = len(new_betdata)
-            return result
+            return result, new_betdata
         except Exception:
             logger.exception(
                 "实时赔率重试下注异常 issue=%s account_id=%d",

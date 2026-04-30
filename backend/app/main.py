@@ -70,6 +70,12 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("worker restore on startup is disabled")
 
+    try:
+        started_collectors = await engine.shared_market_runtime.ensure_enabled_collectors()
+        logger.info("shared_collectors_started=%d", started_collectors)
+    except Exception:
+        logger.exception("restore shared collectors failed")
+
     await engine.start_health_check(admin_operator_id=1)
     logger.info("backend ready")
 

@@ -8,10 +8,11 @@
 - 
 """
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from types import SimpleNamespace
 
 from app.api import accounts as accounts_api
 from app.engine.adapters.base import BalanceInfo, InstallInfo, LoginResult
@@ -368,6 +369,18 @@ async def test_unbind_account(client):
     list_resp = await client.get("/api/v1/accounts", headers=headers)
     assert len(list_resp.json()["data"]) == 0
 
+    create_again_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"unbind_{uid}",
+            "password": "pass456",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    assert create_again_resp.status_code == 200
+
 
 @pytest.mark.asyncio
 async def test_unbind_nonexistent_account(client):
@@ -635,6 +648,163 @@ async def test_verify_single_login_multi_platform_probe(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_verify_records_shared_market_url_when_runtime_exists(client, monkeypatch):
+    uid = _uid()
+    token, _ = await _create_operator(f"sharedrun_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    platform_url = _platform_url("JND28WEB")
+
+    runtime = AsyncMock()
+    runtime.discover_and_bind_uncovered_url.return_value = (1, None)
+    monkeypatch.setattr(app.state, "engine", SimpleNamespace(shared_market_runtime=runtime), raising=False)
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"shared_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": platform_url,
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert resp.status_code == 200
+    runtime.discover_and_bind_uncovered_url.assert_awaited_once_with(
+        platform_type="JND28WEB",
+        platform_url=platform_url,
+        account_id=account_id,
+        sample_raw_url=platform_url,
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_shared_market_url_tries_candidates_until_match(client, monkeypatch):
+    uid = _uid()
+    token, _ = await _create_operator(f"sharedrun_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    platform_url = _platform_url("JND282")
+
+    runtime = AsyncMock()
+    runtime.discover_and_bind_uncovered_url.side_effect = [
+        (None, None),
+        (12345, None),
+    ]
+    monkeypatch.setattr(app.state, "engine", SimpleNamespace(shared_market_runtime=runtime), raising=False)
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"shared_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": platform_url,
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert resp.status_code == 200
+    assert runtime.discover_and_bind_uncovered_url.await_count == 2
+    runtime.discover_and_bind_uncovered_url.assert_has_awaits(
+        [
+            call(
+                platform_type="JND28WEB",
+                platform_url=platform_url,
+                account_id=account_id,
+                sample_raw_url=platform_url,
+            ),
+            call(
+                platform_type="JND282",
+                platform_url=platform_url,
+                account_id=account_id,
+                sample_raw_url=platform_url,
+            ),
+        ],
+        any_order=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_shared_market_url_continues_after_platform_exception(client, monkeypatch):
+    uid = _uid()
+    token, _ = await _create_operator(f"sharedrun_exc_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    platform_url = _platform_url("JND282")
+
+    runtime = AsyncMock()
+    runtime.discover_and_bind_uncovered_url.side_effect = [
+        RuntimeError("transient runtime issue"),
+        (6789, None),
+    ]
+    monkeypatch.setattr(app.state, "engine", SimpleNamespace(shared_market_runtime=runtime), raising=False)
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"sharedexc_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": platform_url,
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert resp.status_code == 200
+    assert runtime.discover_and_bind_uncovered_url.await_count == 2
+    runtime.discover_and_bind_uncovered_url.assert_has_awaits(
+        [
+            call(
+                platform_type="JND28WEB",
+                platform_url=platform_url,
+                account_id=account_id,
+                sample_raw_url=platform_url,
+            ),
+            call(
+                platform_type="JND282",
+                platform_url=platform_url,
+                account_id=account_id,
+                sample_raw_url=platform_url,
+            ),
+        ],
+        any_order=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_login_alias_shared_market_hook_noop_when_runtime_missing(client, monkeypatch):
+    uid = _uid()
+    token, _ = await _create_operator(f"sharedmissing_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    platform_url = _platform_url("JND282")
+
+    monkeypatch.setattr(app.state, "engine", SimpleNamespace(shared_market_runtime=None), raising=False)
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"sharedmiss_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": platform_url,
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    resp = await client.post(
+        f"/api/v1/accounts/{account_id}/login?platform_type=JND282",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_latest_run_failure_does_not_override_effective(client, monkeypatch):
     uid = _uid()
     token, _ = await _create_operator(f"latestop_{uid}")
@@ -698,7 +868,7 @@ async def test_account_signal_need_confirm_odds_when_unconfirmed_exists(client):
 
     db = await get_shared_db()
     await db.execute(
-        "UPDATE account_odds SET confirmed=0, confirmed_at=NULL WHERE account_id=?",
+        "UPDATE account_odds SET odds_value=0, confirmed=0, confirmed_at=NULL WHERE account_id=?",
         (account_id,),
     )
     await db.commit()
@@ -708,6 +878,41 @@ async def test_account_signal_need_confirm_odds_when_unconfirmed_exists(client):
     account = list_resp.json()["data"][0]
     assert account["frontend_signal"] == "need_confirm_odds"
     assert account["frontend_signal_reason"] == "odds_unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_account_signal_normal_when_unconfirmed_positive_odds_exists(client):
+    uid = _uid()
+    token, _ = await _create_operator(f"oddsp_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"oddsp_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND28WEB"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    verify_resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert verify_resp.status_code == 200
+
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE account_odds SET odds_value=20530, confirmed=0, confirmed_at=NULL WHERE account_id=?",
+        (account_id,),
+    )
+    await db.commit()
+
+    list_resp = await client.get("/api/v1/accounts", headers=headers)
+    assert list_resp.status_code == 200
+    account = list_resp.json()["data"][0]
+    assert account["frontend_signal"] == "normal"
+    assert account["frontend_signal_reason"] is None
 
 
 @pytest.mark.asyncio

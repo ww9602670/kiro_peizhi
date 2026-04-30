@@ -595,6 +595,29 @@ class TestBetdataAssembly:
         assert betdata[0] == {"KeyCode": "DX1", "Amount": 500, "Odds": 20530}
 
     @pytest.mark.asyncio
+    async def test_unconfirmed_latest_odds_do_not_block_execution(
+        self, db, executor, setup_data
+    ):
+        await db.execute(
+            "UPDATE account_odds SET odds_value=20530, confirmed=0, confirmed_at=NULL "
+            "WHERE account_id=? AND key_code='DX1'",
+            (setup_data["account"]["id"],),
+        )
+        await db.commit()
+        executor.adapter.load_odds = AsyncMock(
+            side_effect=Exception("live odds unavailable")
+        )
+
+        signal = make_signal(
+            setup_data["strategy"]["id"], key_code="DX1", amount=500
+        )
+
+        await executor.execute(make_install(), [signal])
+
+        betdata = executor.adapter.place_bet.call_args[0][1]
+        assert betdata == [{"KeyCode": "DX1", "Amount": 500, "Odds": 20530}]
+
+    @pytest.mark.asyncio
     async def test_all_odds_zero_no_place_bet(self, db, executor, setup_data):
         """所有赔率为 0 时不调用 place_bet"""
         # 将 DB 中所有赔率设为 0
@@ -691,6 +714,7 @@ class TestConfirmbetZeroRetry:
             (signal.idempotent_id,),
         )).fetchone()
         assert row["status"] == "bet_success"
+        assert row["odds"] == 20530
 
     @pytest.mark.asyncio
     async def test_succeed_5_retry_also_fails(self, db, executor, setup_data):
@@ -808,14 +832,17 @@ class TestConfirmbetZeroRetry:
             raw_response={"succeed": 1},
         ))
 
-        result = await executor._retry_with_live_odds(
+        retry_result = await executor._retry_with_live_odds(
             make_install(),
             [{"KeyCode": "DX1", "Amount": 100, "Odds": 19800}],
         )
 
+        assert retry_result is not None
+        result, new_betdata = retry_result
         assert result is not None
         assert result.raw_response["_retry_attempt"] is True
         assert result.raw_response["_retry_item_count"] == 1
+        assert new_betdata == [{"KeyCode": "DX1", "Amount": 100, "Odds": 20530}]
 
     @pytest.mark.asyncio
     async def test_retry_window_logs_countdown_validation(self, executor):

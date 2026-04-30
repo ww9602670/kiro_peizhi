@@ -8,12 +8,14 @@ from app.database import get_shared_db
 from app.main import app
 from app.models.db_ops import (
     account_create,
+    account_strategy_permission_set,
     bet_order_create,
     operator_create,
     simulation_bet_order_create,
     simulation_strategy_stats_upsert,
     strategy_create,
 )
+from app.schemas.strategy import STRATEGY_PERMISSION_TYPES
 from app.utils.auth import create_token, persist_jti, register_session
 
 
@@ -44,6 +46,13 @@ async def _create_account_and_strategy(operator_id: int, *, simulation: int = 0)
         password="pwd",
         platform_type="JND282",
     )
+    await account_strategy_permission_set(
+        db,
+        operator_id=operator_id,
+        account_id=account["id"],
+        strategy_types=list(STRATEGY_PERMISSION_TYPES),
+        created_by=1,
+    )
     strategy = await strategy_create(
         db,
         operator_id=operator_id,
@@ -58,7 +67,13 @@ async def _create_account_and_strategy(operator_id: int, *, simulation: int = 0)
     return account["id"], strategy["id"]
 
 
-async def _create_real_order(operator_id: int, account_id: int, strategy_id: int) -> dict:
+async def _create_real_order(
+    operator_id: int,
+    account_id: int,
+    strategy_id: int,
+    *,
+    status: str = "settled",
+) -> dict:
     db = await get_shared_db()
     return await bet_order_create(
         db,
@@ -70,9 +85,18 @@ async def _create_real_order(operator_id: int, account_id: int, strategy_id: int
         key_code="DX1",
         amount=5000,
         odds=19800,
-        status="settled",
+        status=status,
         simulation=0,
     )
+
+
+async def _set_real_order_created_at(order_id: int, created_at: str) -> None:
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE bet_orders SET created_at=?, bet_at=? WHERE id=?",
+        (created_at, created_at, order_id),
+    )
+    await db.commit()
 
 
 async def _create_simulation_order(operator_id: int, account_id: int, strategy_id: int) -> dict:
@@ -138,6 +162,44 @@ async def test_list_real_bet_orders_reads_real_ledger_only(client):
     assert item["simulation"] is False
     assert item["issue"] == "202604210001"
     assert body["data"]["summary"]["total_amount"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_list_bet_orders_defaults_to_24h_and_clamps_query_to_3_days(client):
+    token, operator_id = await _create_operator(f"range_{_uid()}")
+    account_id, strategy_id = await _create_account_and_strategy(operator_id)
+    recent = await _create_real_order(operator_id, account_id, strategy_id, status="pending")
+    two_days_old = await _create_real_order(operator_id, account_id, strategy_id, status="pending")
+    four_days_old = await _create_real_order(operator_id, account_id, strategy_id, status="pending")
+
+    now = datetime.now(timezone(timedelta(hours=8)))
+    await _set_real_order_created_at(
+        recent["id"],
+        (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    await _set_real_order_created_at(
+        two_days_old["id"],
+        (now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    await _set_real_order_created_at(
+        four_days_old["id"],
+        (now - timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+    default_response = await client.get(
+        "/api/v1/bet-orders?ledger=real",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert default_response.status_code == 200
+    assert default_response.json()["data"]["paged"]["total"] == 1
+
+    old_date = (now - timedelta(days=10)).strftime("%Y-%m-%d")
+    query_response = await client.get(
+        f"/api/v1/bet-orders?ledger=real&date_from={old_date}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert query_response.status_code == 200
+    assert query_response.json()["data"]["paged"]["total"] == 2
 
 
 @pytest.mark.asyncio

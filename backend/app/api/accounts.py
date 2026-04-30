@@ -25,6 +25,7 @@ from app.models.db_ops import (
     account_platform_session_delete,
     account_platform_session_list,
     account_platform_session_upsert,
+    account_strategy_permission_list_by_account,
     account_platform_capability_list_by_run,
     account_verification_run_complete,
     account_verification_run_create,
@@ -39,6 +40,7 @@ from app.models.db_ops import (
     alert_create,
     odds_batch_upsert,
     odds_list_by_account,
+    strategy_running_exists_for_account_platform,
 )
 from app.schemas.account import (
     AccountCreate,
@@ -109,6 +111,10 @@ class PlatformCapabilityProbe:
 
 def _password_hash(raw: str) -> str:
     return hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
+
+
+def _safe_text(value: object) -> str:
+    return "" if value is None else str(value)
 
 
 def _now_bjt() -> str:
@@ -198,11 +204,24 @@ def _resolve_frontend_signal(
 async def _has_unconfirmed_odds(db, *, account_id: int) -> bool:
     row = await (
         await db.execute(
-            "SELECT 1 FROM account_odds WHERE account_id=? AND confirmed=0 LIMIT 1",
+            "SELECT 1 FROM account_odds "
+            "WHERE account_id=? AND confirmed=0 AND COALESCE(odds_value, 0) <= 0 LIMIT 1",
             (account_id,),
         )
     ).fetchone()
     return row is not None
+
+
+def _normal_positive_odds(raw_odds: dict[str, Any]) -> dict[str, int]:
+    normal: dict[str, int] = {}
+    for key, value in (raw_odds or {}).items():
+        try:
+            odds_value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if odds_value > 0:
+            normal[str(key)] = odds_value
+    return normal
 
 
 async def _collect_account_verification_view(
@@ -281,6 +300,7 @@ def _to_account_info(
     row: dict,
     *,
     allowed_strategy_platform_types: list[str] | None = None,
+    allowed_strategy_types: list[str] | None = None,
     platform_capabilities: list[dict[str, Any]] | None = None,
     latest_verification_run_id: int | None = None,
     effective_verification_run_id: int | None = None,
@@ -299,6 +319,7 @@ def _to_account_info(
         password_masked=mask_password(row["password"]),
         game_type=row["game_type"],
         allowed_strategy_platform_types=allowed_strategy_platform_types or [],
+        allowed_strategy_types=allowed_strategy_types or [],
         platform_capabilities=platform_capabilities or [],
         latest_verification_run_id=latest_verification_run_id,
         effective_verification_run_id=effective_verification_run_id,
@@ -375,6 +396,10 @@ async def _sync_odds(
     platform_type: str,
     new_odds: dict[str, int],
 ) -> None:
+    normal_odds = _normal_positive_odds(new_odds)
+    if not normal_odds:
+        return
+
     existing = await odds_list_by_account(
         db,
         account_id=account_id,
@@ -385,37 +410,53 @@ async def _sync_odds(
             db,
             account_id=account_id,
             platform_type=platform_type,
-            odds_map=new_odds,
+            odds_map=normal_odds,
             confirmed=True,
         )
         return
 
     old_map = {row["key_code"]: row["odds_value"] for row in existing}
-    if old_map == new_odds:
+    if old_map == normal_odds:
+        await odds_batch_upsert(
+            db,
+            account_id=account_id,
+            platform_type=platform_type,
+            odds_map=normal_odds,
+            confirmed=True,
+        )
         return
 
     await odds_batch_upsert(
         db,
         account_id=account_id,
         platform_type=platform_type,
-        odds_map=new_odds,
-        confirmed=False,
+        odds_map=normal_odds,
+        confirmed=True,
     )
 
     changes: list[str] = []
-    for key in sorted(set(old_map) | set(new_odds)):
+    for key in sorted(set(old_map) | set(normal_odds)):
         old_val = old_map.get(key)
-        new_val = new_odds.get(key)
+        new_val = normal_odds.get(key)
         if old_val != new_val:
             changes.append(f"{key}: {old_val} -> {new_val}")
+
+    has_running_strategy = await strategy_running_exists_for_account_platform(
+        db,
+        operator_id=operator_id,
+        account_id=account_id,
+        platform_type=platform_type,
+    )
+    if not has_running_strategy:
+        return
 
     await alert_create(
         db,
         operator_id=operator_id,
         type="odds_changed",
         level="warning",
-        title=f"odds changed account_id={account_id} platform={platform_type}",
-        detail="\n".join(changes),
+        title=f"赔率变动：账号 {account_id}，平台 {platform_type}",
+        detail="检测到运行中策略使用的平台赔率发生变化：\n" + "\n".join(changes),
     )
 
 
@@ -477,7 +518,7 @@ async def _probe_platform_capability(
             last_verified_at=last_verified_at,
         )
 
-    non_zero_odds = {key: value for key, value in raw_odds.items() if value > 0}
+    non_zero_odds = _normal_positive_odds(raw_odds)
     if not non_zero_odds:
         return PlatformCapabilityProbe(
             platform_type=platform_type,
@@ -541,6 +582,11 @@ async def _build_account_info(
     odds_message: str | None = None,
 ) -> AccountInfo:
     verification_view = await _collect_account_verification_view(db, row)
+    allowed_strategy_types = await account_strategy_permission_list_by_account(
+        db,
+        operator_id=row["operator_id"],
+        account_id=row["id"],
+    )
     has_unconfirmed_odds = await _has_unconfirmed_odds(db, account_id=row["id"])
     frontend_signal, frontend_signal_reason = _resolve_frontend_signal(
         verification_view=verification_view,
@@ -549,6 +595,7 @@ async def _build_account_info(
     return _to_account_info(
         row,
         allowed_strategy_platform_types=verification_view["allowed_strategy_platform_types"],
+        allowed_strategy_types=allowed_strategy_types,
         platform_capabilities=verification_view["platform_capabilities"],
         latest_verification_run_id=verification_view["latest_verification_run_id"],
         effective_verification_run_id=verification_view["effective_verification_run_id"],
@@ -616,7 +663,12 @@ async def unbind_account(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    deleted = await account_delete(db, account_id=account_id, operator_id=operator["id"])
+    try:
+        deleted = await account_delete(db, account_id=account_id, operator_id=operator["id"])
+    except ValueError as exc:
+        if str(exc) == "account has running strategies":
+            raise BizError(4003, "请先停止该账号下的策略，再解绑账号", status_code=400)
+        raise
     if not deleted:
         raise BizError(4001, "account not found", status_code=404)
     return ApiResponse(data=None)
@@ -693,11 +745,49 @@ async def _run_account_verification_flow(
         await adapter.close()
 
 
+async def _record_shared_market_url(
+    request: Request,
+    *,
+    account: dict,
+) -> None:
+    engine = getattr(request.app.state, "engine", None)
+    runtime = getattr(engine, "shared_market_runtime", None)
+    if runtime is None:
+        return
+
+    platform_url = account.get("platform_url")
+    if not platform_url:
+        return
+
+    game_type = _safe_text(account.get("game_type"))
+    candidate_platform_types = get_allowed_platform_types(game_type)
+    if not candidate_platform_types:
+        return
+
+    for candidate_platform_type in candidate_platform_types:
+        try:
+            discovered_group_id, _ = await runtime.discover_and_bind_uncovered_url(
+                platform_type=candidate_platform_type,
+                platform_url=platform_url,
+                account_id=int(account.get("id") or 0),
+                sample_raw_url=platform_url,
+            )
+            if discovered_group_id is not None:
+                break
+        except Exception:
+            logger.exception(
+                "shared_market_discovery_hook_failed account_id=%s platform=%s",
+                account.get("id"),
+                candidate_platform_type,
+            )
+
+
 async def _verify_account(
     *,
     account_id: int,
     operator: dict,
     db,
+    request: Request,
 ) -> ApiResponse[AccountInfo]:
     account = await account_get_by_id(db, account_id=account_id, operator_id=operator["id"])
     if not account:
@@ -798,6 +888,10 @@ async def _verify_account(
     elif capabilities:
         odds_message = capabilities[0].odds_message
 
+    await _record_shared_market_url(
+        request=request,
+        account=refreshed_row,
+    )
     return ApiResponse[AccountInfo](
         data=await _build_account_info(
             db=db,
@@ -812,21 +906,33 @@ async def _verify_account(
 @router.post("/accounts/{account_id}/verify")
 async def verify_account(
     account_id: int,
+    request: Request,
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    return await _verify_account(account_id=account_id, operator=operator, db=db)
+    return await _verify_account(
+        account_id=account_id,
+        operator=operator,
+        db=db,
+        request=request,
+    )
 
 
 @router.post("/accounts/{account_id}/login", deprecated=True)
 async def manual_login_alias(
     account_id: int,
+    request: Request,
     platform_type: str | None = Query(default=None),
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
     _ = platform_type
-    return await _verify_account(account_id=account_id, operator=operator, db=db)
+    return await _verify_account(
+        account_id=account_id,
+        operator=operator,
+        db=db,
+        request=request,
+    )
 
 
 @router.post("/accounts/{account_id}/logout")

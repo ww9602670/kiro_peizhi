@@ -76,6 +76,142 @@ async def test_list_operators(client, admin_headers):
 
 
 @pytest.mark.asyncio
+async def test_list_shared_market_uncovered_urls(client, admin_headers):
+    """待审核共享网址可列出（默认 pending）"""
+    db = await get_shared_db()
+    from app.models.db_ops import shared_market_uncovered_url_touch
+
+    uid = _uid()
+    url = f"https://shared.example.com/{uid}"
+    row = await shared_market_uncovered_url_touch(
+        db,
+        normalized_url=url,
+        sample_raw_url=f"{url}?a=1",
+        platform_type="JND28WEB",
+        failure_reason="检测失败",
+        seen_at="2026-04-30 10:00:00",
+    )
+    assert row["id"] is not None
+
+    resp = await client.get(
+        "/api/v1/admin/shared-market-uncovered-urls?status=pending",
+        headers=admin_headers,
+    )
+    body = resp.json()
+    assert body["code"] == 0
+    items = body["data"]["items"]
+    assert any(item["normalized_url"] == url for item in items)
+
+
+@pytest.mark.asyncio
+async def test_list_shared_market_groups(client, admin_headers):
+    """可拉取可用共享组"""
+    db = await get_shared_db()
+    await db.execute(
+        """INSERT INTO shared_market_groups
+           (group_key, enabled, collector_platform_type, collector_account_name,
+            collector_password_enc, freshness_threshold_sec, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "test-list-group",
+            1,
+            "JND28WEB",
+            "collector",
+            "abc",
+            30,
+            "2026-04-30 10:00:00",
+            "2026-04-30 10:00:00",
+        ),
+    )
+    await db.commit()
+
+    resp = await client.get(
+        "/api/v1/admin/shared-market-groups",
+        headers=admin_headers,
+    )
+    body = resp.json()
+    assert body["code"] == 0
+    assert any(group["group_key"] == "test-list-group" for group in body["data"])
+
+
+@pytest.mark.asyncio
+async def test_admin_shared_market_uncovered_ignore_recheck(client, admin_headers):
+    """可忽略并重置为待重检"""
+    db = await get_shared_db()
+    from app.models.db_ops import shared_market_uncovered_url_touch
+
+    row = await shared_market_uncovered_url_touch(
+        db,
+        normalized_url="https://shared.example.com/ignore",
+        sample_raw_url="https://shared.example.com/ignore?a=1",
+        platform_type="JND28WEB",
+        seen_at="2026-04-30 10:00:00",
+    )
+
+    ignore_resp = await client.post(
+        f"/api/v1/admin/shared-market-uncovered-urls/{row['id']}/ignore",
+        headers=admin_headers,
+    )
+    assert ignore_resp.status_code == 200
+    ignore_body = ignore_resp.json()
+    assert ignore_body["code"] == 0
+    assert ignore_body["data"]["status"] == "ignored"
+
+    recheck_resp = await client.post(
+        f"/api/v1/admin/shared-market-uncovered-urls/{row['id']}/recheck",
+        headers=admin_headers,
+    )
+    assert recheck_resp.status_code == 200
+    recheck_body = recheck_resp.json()
+    assert recheck_body["code"] == 0
+    assert recheck_body["data"]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_admin_join_shared_market_uncovered_to_group(client, admin_headers):
+    """可将待审核网址加入共享组"""
+    db = await get_shared_db()
+    from app.models.db_ops import shared_market_uncovered_url_touch
+
+    row = await shared_market_uncovered_url_touch(
+        db,
+        normalized_url="https://shared.example.com/join",
+        sample_raw_url="https://shared.example.com/join?a=1",
+        platform_type="JND28WEB",
+        seen_at="2026-04-30 10:00:00",
+    )
+
+    cursor = await db.execute(
+        """INSERT INTO shared_market_groups
+           (group_key, enabled, collector_platform_type, collector_account_name,
+            collector_password_enc, freshness_threshold_sec, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "test-group",
+            1,
+            "JND28WEB",
+            "collector",
+            "abc",
+            30,
+            "2026-04-30 10:00:00",
+            "2026-04-30 10:00:00",
+        ),
+    )
+    group_id = int(cursor.lastrowid)
+    await db.commit()
+
+    join_resp = await client.post(
+        f"/api/v1/admin/shared-market-uncovered-urls/{row['id']}/join-shared-group",
+        headers=admin_headers,
+        json={"shared_group_id": group_id},
+    )
+    assert join_resp.status_code == 200
+    join_body = join_resp.json()
+    assert join_body["code"] == 0
+    assert join_body["data"]["shared_group_id"] == group_id
+
+
+@pytest.mark.asyncio
 async def test_list_operators_pagination(client, admin_headers):
     """"""
     uid = _uid()
@@ -140,6 +276,45 @@ async def test_create_operator_defaults(client, admin_headers):
     op = body["data"]
     assert op["max_accounts"] == 1
     assert op["expire_date"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_can_set_and_list_account_strategy_permissions(client, admin_headers):
+    uid = _uid()
+    token, op_id = await _create_operator_via_db(f"permop_{uid}")
+    operator_headers = {"Authorization": f"Bearer {token}"}
+    db = await get_shared_db()
+    from app.models.db_ops import account_create
+
+    account = await account_create(
+        db,
+        operator_id=op_id,
+        account_name=f"permacc_{uid}",
+        password="pw1234",
+        game_type="JND28",
+        platform_url="https://jnd.example.com",
+    )
+
+    list_resp = await client.get(
+        f"/api/v1/admin/operators/{op_id}/strategy-permissions",
+        headers=admin_headers,
+    )
+    assert list_resp.json()["code"] == 0
+    first_row = next(row for row in list_resp.json()["data"] if row["account_id"] == account["id"])
+    assert first_row["allowed_strategy_types"] == []
+
+    update_resp = await client.put(
+        f"/api/v1/admin/operators/{op_id}/accounts/{account['id']}/strategy-permissions",
+        headers=admin_headers,
+        json={"strategy_types": ["flat", "martin", "flat"]},
+    )
+    assert update_resp.json()["code"] == 0
+    assert update_resp.json()["data"]["allowed_strategy_types"] == ["flat", "martin"]
+
+    account_resp = await client.get("/api/v1/accounts", headers=operator_headers)
+    assert account_resp.json()["code"] == 0
+    account_row = next(row for row in account_resp.json()["data"] if row["id"] == account["id"])
+    assert account_row["allowed_strategy_types"] == ["flat", "martin"]
 
 
 @pytest.mark.asyncio

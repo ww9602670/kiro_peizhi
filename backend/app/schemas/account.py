@@ -92,6 +92,7 @@ class AccountInfo(BaseModel):
                 "password_masked": "my****",
                 "game_type": "JND28",
                 "allowed_strategy_platform_types": ["JND28WEB"],
+                "allowed_strategy_types": ["flat", "martin"],
                 "platform_capabilities": [
                     {
                         "platform_type": "JND28WEB",
@@ -135,6 +136,7 @@ class AccountInfo(BaseModel):
     password_masked: str
     game_type: str
     allowed_strategy_platform_types: list[str]
+    allowed_strategy_types: list[str] = Field(default_factory=list)
     platform_capabilities: list[PlatformCapability] = Field(default_factory=list)
     latest_verification_run_id: Optional[int] = None
     effective_verification_run_id: Optional[int] = None

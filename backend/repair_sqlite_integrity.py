@@ -181,6 +181,7 @@ def _ensure_bocai_schema(db_path: Path) -> None:
             play_code TEXT NOT NULL,
             base_amount INTEGER NOT NULL,
             martin_sequence TEXT,
+            strategy_config TEXT,
             bet_timing INTEGER NOT NULL DEFAULT 30,
             simulation INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'stopped',

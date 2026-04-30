@@ -43,8 +43,8 @@ class TestSingleWrite:
     async def test_single_insert(self, db, wq):
         """ WriteQueue """
         await wq.execute(
-            "INSERT INTO gambling_accounts (operator_id, account_name, password, platform_type) "
-            "VALUES (1, 'acc1', 'pwd', 'JND28WEB')"
+            "INSERT INTO gambling_accounts (operator_id, account_name, password, game_type, platform_url) "
+            "VALUES (1, 'acc1', 'pwd', 'JND28', 'https://example.test')"
         )
         cursor = await db.execute("SELECT COUNT(*) as cnt FROM gambling_accounts")
         row = await cursor.fetchone()
@@ -53,25 +53,26 @@ class TestSingleWrite:
     async def test_single_write_with_params(self, db, wq):
         """"""
         await wq.execute(
-            "INSERT INTO gambling_accounts (operator_id, account_name, password, platform_type) "
-            "VALUES (?, ?, ?, ?)",
-            (1, "acc_param", "pwd", "JND282"),
+            "INSERT INTO gambling_accounts (operator_id, account_name, password, game_type, platform_url) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (1, "acc_param", "pwd", "JND28", "https://example.test/2"),
         )
         cursor = await db.execute(
-            "SELECT account_name, platform_type FROM gambling_accounts WHERE account_name = ?",
+            "SELECT account_name, game_type, platform_url FROM gambling_accounts WHERE account_name = ?",
             ("acc_param",),
         )
         row = await cursor.fetchone()
         assert row["account_name"] == "acc_param"
-        assert row["platform_type"] == "JND282"
+        assert row["game_type"] == "JND28"
+        assert row["platform_url"] == "https://example.test/2"
 
     async def test_single_write_error_propagates(self, db, wq):
         """"""
         with pytest.raises(aiosqlite.IntegrityError):
             # operator_id=999 
             await wq.execute(
-                "INSERT INTO gambling_accounts (operator_id, account_name, password, platform_type) "
-                "VALUES (999, 'bad', 'pwd', 'JND28WEB')"
+                "INSERT INTO gambling_accounts (operator_id, account_name, password, game_type, platform_url) "
+                "VALUES (999, 'bad', 'pwd', 'JND28', 'https://example.test')"
             )
 
 

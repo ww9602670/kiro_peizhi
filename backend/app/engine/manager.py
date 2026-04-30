@@ -10,6 +10,10 @@ from typing import Any, Optional
 
 import aiosqlite
 
+from app.config import (
+    BOCAI_SHARED_DETECTOR_ACCOUNT,
+    BOCAI_SHARED_DETECTOR_PASSWORD,
+)
 from app.engine.adapters.base import PlatformAdapter
 from app.engine.adapters.factory import create_platform_adapter
 from app.engine.alert import AlertService
@@ -101,6 +105,18 @@ def _is_platform_verified_for_restore(account: dict[str, Any], platform_type: st
         return False
     allowed_platforms = _parse_allowed_platform_types(account.get("allowed_strategy_platform_types"))
     return (platform_type or "").upper() in allowed_platforms
+
+
+def _is_detector_betting_account(account: dict[str, Any]) -> bool:
+    detector_account = (BOCAI_SHARED_DETECTOR_ACCOUNT or "").strip()
+    detector_password = (BOCAI_SHARED_DETECTOR_PASSWORD or "").strip()
+    if not detector_account:
+        return False
+    if str(account.get("account_name") or "").strip() != detector_account:
+        return False
+    if not detector_password:
+        return True
+    return str(account.get("password") or "").strip() == detector_password
 
 
 def _runtime_key_matches_account(runtime_key: RuntimeKeyLike, account_id: int) -> bool:
@@ -235,6 +251,19 @@ class EngineManager:
         strategies: Optional[list[dict[str, Any]]] = None,
     ) -> AccountWorker:
         runtime_key = make_runtime_key(account_id, platform_type)
+        if _is_detector_betting_account(
+            {
+                "account_name": account_name,
+                "password": password,
+            }
+        ):
+            logger.warning(
+                "skip start worker operator_id=%d account_id=%d reason=shared_detector",
+                operator_id,
+                account_id,
+            )
+            raise RuntimeError("shared detector account cannot be used for betting worker")
+
         logger.info(
             "start_worker operator_id=%d account_id=%d platform=%s strategies_count=%d",
             operator_id,
@@ -245,6 +274,8 @@ class EngineManager:
 
         existing = await self.registry.get(runtime_key)
         if existing and existing.running:
+            if getattr(existing, "settling_only", False):
+                existing.exit_settling_mode()
             return await self._hot_update_worker(existing, strategies)
 
         adapter = self._create_adapter(runtime_key[1], platform_url)
@@ -411,6 +442,13 @@ class EngineManager:
             accounts = await db_ops.account_list_by_operator(self.db, operator_id=operator_id)
             strategies = await db_ops.strategy_list_by_operator(self.db, operator_id=operator_id)
             for account in accounts:
+                if _is_detector_betting_account(account):
+                    logger.info(
+                        "skip restore worker operator_id=%d account_id=%d reason=shared_detector",
+                        operator_id,
+                        account["id"],
+                    )
+                    continue
                 grouped: dict[str, list[dict[str, Any]]] = {}
                 for strategy in strategies:
                     if strategy.get("account_id") != account["id"] or strategy.get("status") != "running":
@@ -560,7 +598,19 @@ class EngineManager:
     def _build_strategy_runner(self, strategy_data: dict[str, Any]) -> Optional[StrategyRunner]:
         import app.engine.strategies  # noqa: F401
         from app.engine.strategies.dw3 import DW3FlatStrategy, DW3MartinStrategy
+        from app.engine.strategies.omission_random import (
+            AiRandomFlatStrategy,
+            AiRandomMartinStrategy,
+            OmissionRandomFlatStrategy,
+            OmissionRandomMartinStrategy,
+        )
         from app.engine.strategies.registry import get_strategy_class
+        from app.utils.omission_random import (
+            AI_RANDOM_FLAT_TYPE,
+            AI_RANDOM_MARTIN_TYPE,
+            OMISSION_RANDOM_FLAT_TYPE,
+            OMISSION_RANDOM_MARTIN_TYPE,
+        )
 
         strategy_type = strategy_data.get("type", "flat")
         play_code = strategy_data.get("play_code", "DX1")
@@ -582,6 +632,22 @@ class EngineManager:
                     seq_values = [float(x.strip()) for x in seq_str.split(",")]
             elif isinstance(seq_str, list):
                 seq_values = [float(x) for x in seq_str]
+
+        strategy_config: dict[str, Any] = {}
+        raw_strategy_config = strategy_data.get("strategy_config")
+        if raw_strategy_config:
+            if isinstance(raw_strategy_config, str):
+                import json as _json
+
+                try:
+                    parsed_config = _json.loads(raw_strategy_config)
+                    if isinstance(parsed_config, dict):
+                        strategy_config = parsed_config
+                except (ValueError, TypeError):
+                    logger.warning("invalid strategy_config strategy_id=%s", strategy_data.get("id"))
+                    return None
+            elif isinstance(raw_strategy_config, dict):
+                strategy_config = raw_strategy_config
 
         if is_dw3_group_strategy:
             if gate_window_issues <= 0:
@@ -614,7 +680,35 @@ class EngineManager:
                 logger.warning("unknown strategy type=%s", strategy_type)
                 return None
 
-            if strategy_type == "flat":
+            if strategy_type in (OMISSION_RANDOM_FLAT_TYPE, AI_RANDOM_FLAT_TYPE):
+                kwargs = {
+                    "base_amount": base_amount,
+                    "config": strategy_config,
+                    "strategy_name": str(strategy_data.get("name") or strategy_type),
+                }
+                strategy_cls = (
+                    AiRandomFlatStrategy
+                    if strategy_type == AI_RANDOM_FLAT_TYPE
+                    else OmissionRandomFlatStrategy
+                )
+            elif strategy_type in (OMISSION_RANDOM_MARTIN_TYPE, AI_RANDOM_MARTIN_TYPE):
+                if not seq_values:
+                    logger.warning("missing martin_sequence strategy_id=%s", strategy_data.get("id"))
+                    return None
+                kwargs = {
+                    "base_amount": base_amount,
+                    "config": strategy_config,
+                    "sequence": seq_values,
+                    "strategy_name": str(strategy_data.get("name") or strategy_type),
+                    "alert_service": self.alert_service,
+                    "operator_id": int(strategy_data.get("operator_id") or 0),
+                }
+                strategy_cls = (
+                    AiRandomMartinStrategy
+                    if strategy_type == AI_RANDOM_MARTIN_TYPE
+                    else OmissionRandomMartinStrategy
+                )
+            elif strategy_type == "flat":
                 kwargs: dict[str, Any] = {
                     "key_codes": key_codes,
                     "base_amount": base_amount,

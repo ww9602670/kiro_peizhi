@@ -308,6 +308,67 @@ class TestRestoreWorkersOnStartup:
         manager.start_worker.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_restore_workers_does_not_start_shared_collectors(self):
+        manager = _make_manager()
+        manager.shared_market_runtime.ensure_enabled_collectors = AsyncMock(return_value=3)
+
+        with patch("app.engine.manager.db_ops") as mock_ops:
+            mock_ops.operator_list_all = AsyncMock(return_value=[{"id": 1, "status": "active", "username": "op1"}])
+            mock_ops.account_list_by_operator = AsyncMock(return_value=[])
+            mock_ops.strategy_list_by_operator = AsyncMock(return_value=[])
+            manager.start_worker = AsyncMock()
+
+            restored = await manager.restore_workers_on_startup()
+
+        assert restored == 0
+        manager.shared_market_runtime.ensure_enabled_collectors.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restore_skips_shared_detector_account(self):
+        manager = _make_manager()
+
+        with patch("app.engine.manager.db_ops") as mock_ops:
+            mock_ops.operator_list_all = AsyncMock(return_value=[
+                {"id": 1, "status": "active", "username": "op1"},
+            ])
+            mock_ops.account_list_by_operator = AsyncMock(return_value=[
+                {
+                    "id": 100,
+                    "account_name": "jiance11",
+                    "password": "Qq1122",
+                    "status": "online",
+                    "platform_type": "JND28WEB",
+                    "operator_id": 1,
+                    "effective_verification_run_id": 11,
+                    "verification_stale": False,
+                    "allowed_strategy_platform_types": ["JND28WEB"],
+                },
+                {
+                    "id": 200,
+                    "account_name": "ceshi11",
+                    "password": "Jq2233",
+                    "status": "online",
+                    "platform_type": "JND28WEB",
+                    "operator_id": 1,
+                    "effective_verification_run_id": 22,
+                    "verification_stale": False,
+                    "allowed_strategy_platform_types": ["JND28WEB"],
+                },
+            ])
+            mock_ops.strategy_list_by_operator = AsyncMock(return_value=[
+                {"id": 10, "account_id": 100, "status": "running", "type": "flat", "play_code": "DX1", "base_amount": 100},
+                {"id": 20, "account_id": 200, "status": "running", "type": "flat", "play_code": "DX1", "base_amount": 200},
+            ])
+            manager.start_worker = AsyncMock(return_value=_make_mock_worker())
+
+            restored = await manager.restore_workers_on_startup()
+
+        assert restored == 1
+        call_args = manager.start_worker.await_args_list
+        assert len(call_args) == 1
+        assert call_args[0].kwargs["account_id"] == 200
+
+    @pytest.mark.asyncio
     async def test_skip_offline_accounts(self):
         """ online """
         manager = _make_manager()
@@ -448,6 +509,21 @@ class TestStartWorker:
         worker.start.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_start_worker_rejects_shared_detector_account(self):
+        manager = _make_manager()
+
+        with pytest.raises(RuntimeError, match="shared detector account"):
+            await manager.start_worker(
+                operator_id=1,
+                account_id=101,
+                account_name="jiance11",
+                password="Qq1122",
+                platform_type="JND28WEB",
+                platform_url="https://example.test",
+                strategies=[],
+            )
+
+    @pytest.mark.asyncio
     async def test_start_worker_unregisters_failed_worker_startup(self):
         manager = _make_manager()
         worker = _make_mock_worker(account_id=321, operator_id=9, running=False)
@@ -500,6 +576,47 @@ class TestStartWorker:
             profiles,
             apply_next_issue_only=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_start_worker_reactivates_settling_worker_before_hot_update(self):
+        manager = _make_manager()
+        worker = _make_mock_worker(
+            account_id=321,
+            operator_id=9,
+            running=True,
+            status="settling",
+        )
+        worker.settling_only = True
+        worker.exit_settling_mode = MagicMock()
+        worker.replace_strategy_snapshot = MagicMock()
+        runners = {7: MagicMock()}
+        profiles = {7: MagicMock()}
+
+        await manager.registry.register(make_runtime_key(321, "JND282"), worker)
+
+        with patch.object(
+            manager,
+            "_build_strategy_snapshot",
+            return_value=(runners, profiles),
+        ):
+            result = await manager.start_worker(
+                operator_id=9,
+                account_id=321,
+                account_name="acc321",
+                password="pw321",
+                platform_type="JND282",
+                platform_url="https://example.test",
+                strategies=[{"id": 7, "status": "running"}],
+            )
+
+        assert result is worker
+        worker.exit_settling_mode.assert_called_once_with()
+        worker.replace_strategy_snapshot.assert_called_once_with(
+            runners,
+            profiles,
+            apply_next_issue_only=False,
+        )
+        worker.start.assert_not_called()
 
 
 # 
@@ -638,6 +755,7 @@ class TestAdapterFactory:
         manager = _make_manager()
         adapter = manager._create_adapter("JND282")
         assert isinstance(adapter, JNDAdapter)
+        assert adapter.lottery_type == "JND282"
 
     def test_custom_url_passed_to_adapter(self):
         """鑷畾涔?URL 搴斾紶閫掔粰 adapter"""
@@ -646,6 +764,17 @@ class TestAdapterFactory:
         manager = _make_manager()
         adapter = manager._create_adapter("JND28WEB", platform_url="https://custom.example.com")
         assert isinstance(adapter, JNDAdapter)
+        assert adapter.base_url == "https://custom.example.com"
+
+    def test_custom_url_preserves_jnd282_lottery_type(self):
+        """Custom platform URLs must not force JND282 back to JND28WEB."""
+        from app.engine.adapters.jnd import JNDAdapter
+
+        manager = _make_manager()
+        adapter = manager._create_adapter("JND282", platform_url="https://custom.example.com")
+        assert isinstance(adapter, JNDAdapter)
+        assert adapter.base_url == "https://custom.example.com"
+        assert adapter.lottery_type == "JND282"
 
     def test_luckysb_creates_member_site_placeholder(self):
         """LUCKYSB must not be routed to JNDAdapter."""

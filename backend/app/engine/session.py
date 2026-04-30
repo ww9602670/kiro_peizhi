@@ -202,6 +202,13 @@ class SessionManager:
 
     def stop_heartbeat(self) -> None:
         if self.heartbeat_task and not self.heartbeat_task.done():
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            if self.heartbeat_task is current_task:
+                self.heartbeat_task = None
+                return
             self.heartbeat_task.cancel()
             self.heartbeat_task = None
 
@@ -229,20 +236,29 @@ class SessionManager:
                 )
 
             if consecutive_fails >= HEARTBEAT_MAX_FAILS:
-                await self.alert_service.send(
-                    operator_id=self.operator_id,
-                    alert_type="session_lost",
-                    title="Session lost",
-                    detail=f"Account {self.account_name} platform={self.platform_type} heartbeat failed",
-                    account_id=self.account_id,
-                )
-                await self._reconnect()
-                consecutive_fails = 0
+                reconnect_ok = await self._reconnect()
+                if not reconnect_ok:
+                    await self.alert_service.send(
+                        operator_id=self.operator_id,
+                        alert_type="session_lost",
+                        title="会话已断开，自动重连失败",
+                        detail=(
+                            f"账号 {self.account_name}（{self.platform_type}）"
+                            f"连续 {HEARTBEAT_MAX_FAILS} 次心跳失败，自动重连未成功，"
+                            "请检查账号登录状态或手动重新登录。"
+                        ),
+                        account_id=self.account_id,
+                    )
+                return
 
-    async def _reconnect(self) -> None:
+    async def _reconnect(self) -> bool:
         self.stop_heartbeat()
-        self.session_token = None
-        await self._persist_platform_session(status="reconnecting")
+        await account_platform_session_upsert(
+            self.db,
+            account_id=self.account_id,
+            platform_type=self.platform_type,
+            status="reconnecting",
+        )
 
         if hasattr(self.adapter, "refresh_token"):
             try:
@@ -250,8 +266,16 @@ class SessionManager:
                 if new_token:
                     self.session_token = new_token
                     await self._persist_platform_session(status="online")
+                    await account_update(
+                        self.db,
+                        account_id=self.account_id,
+                        operator_id=self.operator_id,
+                        status="online",
+                        last_login_at=self._now(),
+                        login_fail_count=0,
+                    )
                     self._start_heartbeat()
-                    return
+                    return True
             except Exception as exc:
                 logger.warning(
                     "Refresh token failed for account %d platform=%s: %s",
@@ -262,11 +286,14 @@ class SessionManager:
 
         success = await self.login()
         if not success:
+            self.session_token = None
+            await self._persist_platform_session(status="login_error")
             logger.error(
                 "Reconnect failed for account %d platform=%s",
                 self.account_id,
                 self.platform_type,
             )
+        return success
 
     @property
     def is_logged_in(self) -> bool:

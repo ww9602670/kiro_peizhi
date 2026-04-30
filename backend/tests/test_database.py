@@ -26,8 +26,18 @@ EXPECTED_TABLES = {
     "lottery_results",
     "reconcile_records",
     "account_odds",
+    "account_platform_capabilities",
+    "account_platform_sessions",
+    "account_strategy_permissions",
+    "account_verification_runs",
     "bet_order_platform_records",
     "backtest_tasks",
+    "shared_market_group_urls",
+    "shared_market_groups",
+    "shared_market_snapshots",
+    "shared_market_uncovered_urls",
+    "simulation_bet_orders",
+    "simulation_strategy_stats",
 }
 
 
@@ -186,6 +196,62 @@ class TestLegacySchemaResetGuard:
         finally:
             await database_module.close_shared_db()
 
+    async def test_init_db_adds_missing_columns_before_indexes_for_legacy_uncovered_urls(
+        self, tmp_path
+    ):
+        db_path = str(tmp_path / "legacy_uncovered_urls.db")
+        legacy_conn = await aiosqlite.connect(db_path)
+        await legacy_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shared_market_uncovered_urls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                normalized_url TEXT NOT NULL UNIQUE,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 1,
+                sample_raw_url TEXT,
+                last_account_id INTEGER,
+                last_platform_type TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+            """
+        )
+        await legacy_conn.commit()
+        await legacy_conn.close()
+
+        try:
+            await init_db(db_path)
+
+            verify_conn = await aiosqlite.connect(db_path)
+            verify_conn.row_factory = aiosqlite.Row
+            cols = {
+                row["name"]
+                for row in await (
+                    await verify_conn.execute(
+                        "PRAGMA table_info(shared_market_uncovered_urls)"
+                    )
+                ).fetchall()
+            }
+            assert "detection_status" in cols
+            assert "review_status" in cols
+            assert "last_checked_at" in cols
+            assert "detection_error" in cols
+            assert "matched_shared_group_id" in cols
+
+            index_row = await (
+                await verify_conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type='index' AND name='idx_shared_market_uncovered_detection_status'
+                    """
+                )
+            ).fetchone()
+            assert index_row is not None
+            await verify_conn.close()
+        finally:
+            await database_module.close_shared_db()
+
 
 class TestTerminalStateTrigger:
     """bet_failed / settled / reconcile_error """
@@ -196,8 +262,8 @@ class TestTerminalStateTrigger:
         #  gambling_account
         await db.execute(
             """INSERT OR IGNORE INTO gambling_accounts
-               (id, operator_id, account_name, password, platform_type)
-               VALUES (1, 1, 'test_acc', 'pwd', 'JND28WEB')"""
+               (id, operator_id, account_name, password, game_type, platform_url)
+               VALUES (1, 1, 'test_acc', 'pwd', 'JND28', 'https://example.test')"""
         )
         #  strategy
         await db.execute(
@@ -266,8 +332,8 @@ class TestIdempotentIdUnique:
     async def _setup_refs(self, db):
         await db.execute(
             """INSERT OR IGNORE INTO gambling_accounts
-               (id, operator_id, account_name, password, platform_type)
-               VALUES (1, 1, 'test_acc', 'pwd', 'JND28WEB')"""
+               (id, operator_id, account_name, password, game_type, platform_url)
+               VALUES (1, 1, 'test_acc', 'pwd', 'JND28', 'https://example.test')"""
         )
         await db.execute(
             """INSERT OR IGNORE INTO strategies
@@ -363,8 +429,8 @@ class TestPBT_P24_TerminalStateTrigger:
             # Setup: create required foreign key rows
             await conn.execute(
                 """INSERT OR IGNORE INTO gambling_accounts
-                   (id, operator_id, account_name, password, platform_type)
-                   VALUES (1, 1, 'test_acc', 'pwd', 'JND28WEB')"""
+                   (id, operator_id, account_name, password, game_type, platform_url)
+                   VALUES (1, 1, 'test_acc', 'pwd', 'JND28', 'https://example.test')"""
             )
             await conn.execute(
                 """INSERT OR IGNORE INTO strategies

@@ -17,6 +17,7 @@ from app.main import app
 from app.database import get_shared_db
 from app.models.db_ops import (
     account_create,
+    account_strategy_permission_set,
     account_verification_run_complete,
     account_verification_run_create,
     alert_create,
@@ -100,6 +101,13 @@ async def test_operator_dashboard_with_data(client):
     )
     await db.execute(
         "UPDATE gambling_accounts SET balance=10000 WHERE id=?", (acc["id"],)
+    )
+    await account_strategy_permission_set(
+        db,
+        operator_id=op_id,
+        account_id=acc["id"],
+        strategy_types=["flat"],
+        created_by=1,
     )
     await db.commit()
 

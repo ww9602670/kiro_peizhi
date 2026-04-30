@@ -29,7 +29,7 @@ from app.schemas.dashboard import OperatorDashboard, RecentLotteryResult
 from app.schemas.strategy import StrategyInfo
 
 #  strategies 
-from app.api.strategies import _to_strategy_info
+from app.api.strategies import _filter_rows_by_strategy_permissions, _to_strategy_info
 
 router = APIRouter()
 
@@ -93,10 +93,15 @@ async def get_dashboard(
 
     # 2.   running  + 
     strategies = await strategy_list_by_operator(db, operator_id=operator_id)
+    visible_strategies = await _filter_rows_by_strategy_permissions(
+        db,
+        operator_id=operator_id,
+        rows=strategies,
+    )
     # 构建 account_id -> {name, platform_type} 映射
     acct_map = {a["id"]: a for a in accounts}
     running_strategies = []
-    for s in strategies:
+    for s in visible_strategies:
         if s["status"] == "running":
             info = _to_strategy_info(s)
             acct = acct_map.get(s["account_id"])

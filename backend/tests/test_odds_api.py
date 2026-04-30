@@ -240,7 +240,7 @@ async def test_list_and_confirm_odds_with_verified_platform(client):
     assert list_body["code"] == 0
     assert list_body["data"]["platform_type"] == "JND28WEB"
     assert len(list_body["data"]["items"]) == 2
-    assert list_body["data"]["has_unconfirmed"] is True
+    assert list_body["data"]["has_unconfirmed"] is False
 
     confirm_resp = await client.post(
         f"/api/v1/accounts/{account_id}/odds/confirm",

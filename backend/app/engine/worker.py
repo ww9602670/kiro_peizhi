@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+import json
 import logging
 import time
 import uuid
@@ -589,6 +590,22 @@ class AccountWorker:
             logger.exception(
                 "缁撶畻妯″紡鏃ュ織璁板綍寮傚父 account_id=%d", self.account_id,
             )
+
+    def exit_settling_mode(self) -> None:
+        """Resume normal betting when a settling-only worker is started again."""
+        if not self.settling_only:
+            return
+
+        self.settling_only = False
+        self._settling_deadline = None
+        self._on_settle_complete = None
+        if self.running:
+            self.status = "running"
+        logger.info(
+            "Worker exited settling mode operator_id=%d account_id=%d",
+            self.operator_id,
+            self.account_id,
+        )
 
     # ------------------------------------------------------------------
     # 
@@ -1328,7 +1345,7 @@ class AccountWorker:
         if orders:
             await self.settler._mark_orders_settle_failed(orders)
             logger.warning(
-                "缁撶畻妯″紡瓒呮椂锛?d 绗旇鍗曟爣璁颁负 settle_failed account_id=%d",
+                "settling mode timeout: marked %d orders settle_failed account_id=%d",
                 len(orders),
                 self.account_id,
             )
@@ -1986,15 +2003,27 @@ class AccountWorker:
         rows = [dict(row) for row in rows]
 
         issue_scope_rows: dict[int, list] = defaultdict(list)
+        category_scope_rows: dict[tuple[int, str], list] = defaultdict(list)
         for row in rows:
             strategy_id = int(row["strategy_id"])
             runner = self.strategies.get(strategy_id)
             if runner is None:
                 continue
             strategy = getattr(runner, "strategy", None)
-            if getattr(strategy, "settlement_scope", "order") == "issue":
+            settlement_scope = getattr(strategy, "settlement_scope", "order")
+            if settlement_scope == "issue":
                 issue_scope_rows[strategy_id].append(row)
                 continue
+            if settlement_scope == "category":
+                category_for_key_code = getattr(strategy, "category_for_key_code", None)
+                category = (
+                    category_for_key_code(row["key_code"])
+                    if callable(category_for_key_code)
+                    else None
+                )
+                if category:
+                    category_scope_rows[(strategy_id, str(category))].append(row)
+                    continue
             await self._apply_settlement_feedback(
                 strategy_id,
                 runner,
@@ -2033,6 +2062,35 @@ class AccountWorker:
                 martin_level=martin_level,
             )
 
+        for (strategy_id, category), grouped_rows in category_scope_rows.items():
+            runner = self.strategies.get(strategy_id)
+            if runner is None:
+                continue
+            total_pnl = sum(int(row["pnl"] or 0) for row in grouped_rows)
+            if any(int(row["is_win"] or 0) == 1 for row in grouped_rows):
+                category_result = 1
+            elif any(int(row["is_win"] or 0) == 0 for row in grouped_rows):
+                category_result = 0
+            else:
+                category_result = -1
+            martin_level = next(
+                (
+                    row.get("martin_level")
+                    for row in grouped_rows
+                    if row.get("martin_level") is not None
+                ),
+                None,
+            )
+            await self._apply_settlement_feedback(
+                strategy_id,
+                runner,
+                category_result,
+                total_pnl,
+                issue,
+                key_code=category,
+                martin_level=martin_level,
+            )
+
     async def _apply_settlement_feedback(
         self,
         strategy_id: int,
@@ -2055,6 +2113,7 @@ class AccountWorker:
                 pnl,
                 **feedback_kwargs,
             )
+            await self._persist_strategy_runtime_config(strategy_id, runner)
             if (
                 isinstance(stop_request, StrategyStopRequest)
                 and stop_request.should_stop
@@ -2079,6 +2138,34 @@ class AccountWorker:
                 "莽录聛忙鈥櫬睹р€⒙幻┞嶁劉氓露鈥懊€郝ヂモ€毰∶喡?strategy_id=%d issue=%s account_id=%d",
                 strategy_id,
                 issue,
+                self.account_id,
+            )
+
+    async def _persist_strategy_runtime_config(
+        self,
+        strategy_id: int,
+        runner: StrategyRunner,
+    ) -> None:
+        strategy = getattr(runner, "strategy", None)
+        export_config = getattr(strategy, "export_config", None)
+        if not callable(export_config):
+            return
+        try:
+            strategy_config = export_config()
+            await self.db.execute(
+                "UPDATE strategies SET strategy_config=?, updated_at=datetime('now', '+8 hours') "
+                "WHERE id=? AND operator_id=?",
+                (
+                    json.dumps(strategy_config, ensure_ascii=False),
+                    strategy_id,
+                    self.operator_id,
+                ),
+            )
+            await self.db.commit()
+        except Exception:
+            logger.exception(
+                "persist strategy runtime config failed strategy_id=%d account_id=%d",
+                strategy_id,
                 self.account_id,
             )
 

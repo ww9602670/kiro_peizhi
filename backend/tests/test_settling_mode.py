@@ -108,6 +108,19 @@ async def _create_memory_db() -> aiosqlite.Connection:
             created_at TEXT DEFAULT (datetime('now', '+8 hours'))
         )
     """)
+    await db.execute("""
+        CREATE TABLE simulation_bet_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            operator_id INTEGER NOT NULL,
+            issue TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'bet_success',
+            key_code TEXT DEFAULT '',
+            amount REAL DEFAULT 0,
+            simulation INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+        )
+    """)
     await db.commit()
     return db
 
@@ -264,6 +277,21 @@ class TestEnterSettlingModeSetsState:
         assert before + 600 <= worker._settling_deadline <= after + 600
         # strategies 已清空
         assert len(worker.strategies) == 0
+
+    def test_exit_settling_mode_restores_running_state_and_clears_callback(self):
+        worker = _make_mock_worker()
+        worker.running = True
+        worker.status = "settling"
+        worker.settling_only = True
+        worker._settling_deadline = time.time() + 600
+        worker._on_settle_complete = AsyncMock()
+
+        worker.exit_settling_mode()
+
+        assert worker.settling_only is False
+        assert worker.status == "running"
+        assert worker._settling_deadline is None
+        assert worker._on_settle_complete is None
 
 
 # ==================================================================

@@ -7,7 +7,7 @@ import logging
 
 from fastapi import APIRouter, Depends, Query
 
-from app.api.accounts import _login_platform_account, _sync_odds
+from app.api.accounts import _login_platform_account, _normal_positive_odds, _sync_odds
 from app.api.dependencies import get_current_operator, get_db_conn
 from app.engine.adapters.factory import create_platform_adapter
 from app.models.db_ops import (
@@ -158,7 +158,7 @@ async def get_account_odds(
         OddsItem(
             key_code=row["key_code"],
             odds_value=row["odds_value"],
-            confirmed=bool(row["confirmed"]),
+            confirmed=bool(row["confirmed"]) or int(row["odds_value"] or 0) > 0,
             fetched_at=row["fetched_at"],
             confirmed_at=row["confirmed_at"],
         )
@@ -265,7 +265,7 @@ async def refresh_account_odds(
                 )
             )
 
-        non_zero = {key: value for key, value in raw_odds.items() if value > 0}
+        non_zero = _normal_positive_odds(raw_odds)
         if not non_zero:
             return ApiResponse[OddsRefreshResponse](
                 data=_build_refresh_response(

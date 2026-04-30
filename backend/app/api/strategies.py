@@ -19,6 +19,8 @@ from app.api.dependencies import get_current_operator, get_db_conn
 from app.models.db_ops import (
     account_get_by_id,
     account_platform_capability_list_by_run,
+    account_strategy_permission_list_by_account,
+    account_strategy_permission_map_for_operator,
     account_verification_run_get_effective,
     account_verification_run_get_latest,
     account_verification_run_get_latest_completed,
@@ -34,6 +36,7 @@ from app.schemas.strategy import (
     StrategyCreate,
     StrategyInfo,
     StrategyUpdate,
+    derive_strategy_permission_type,
     has_dw3_prefix,
     is_dw3_group_play_code,
     normalize_dw3_group_play_code,
@@ -51,6 +54,16 @@ from app.utils.strategy_timing import (
 )
 from app.utils.response import BizError
 from app.utils.key_code_map import get_key_code_name
+from app.utils.omission_random import (
+    AI_RANDOM_WEIGHT_MODE,
+    OMISSION_WEIGHT_MODE,
+    build_omission_play_code,
+    is_ai_random_type,
+    is_random_pick_type,
+    normalize_strategy_config,
+    omission_play_code_name,
+    parse_omission_play_code,
+)
 from app.utils.luckysb_play_codes import (
     LUCKYSB_PLATFORM_TYPE,
     get_luckysb_play_code_name,
@@ -99,6 +112,8 @@ def _fen_to_yuan_optional(fen: Optional[int]) -> Optional[float]:
 def _get_play_code_name(platform_type: str, play_code: str) -> str:
     if platform_type == LUCKYSB_PLATFORM_TYPE:
         return get_luckysb_play_code_name(play_code)
+    if any(code.strip().upper().startswith("OMR_") for code in play_code.split(",")):
+        return omission_play_code_name(play_code)
     if is_dw3_group_play_code(play_code):
         return ", ".join(DW3_PLAY_CODE_LABELS.get(c, c) for c in play_code.split(","))
     return ", ".join(get_key_code_name(c) for c in play_code.split(","))
@@ -282,6 +297,58 @@ def _validate_strategy_platform_type_for_account(
     )
 
 
+async def _ensure_strategy_permission_or_raise(
+    db,
+    *,
+    operator_id: int,
+    account_id: int,
+    strategy_type: str,
+    play_code: str,
+) -> str:
+    try:
+        permission_type = derive_strategy_permission_type(strategy_type, play_code)
+    except ValueError as exc:
+        raise BizError(1002, str(exc), status_code=400)
+
+    allowed = await account_strategy_permission_list_by_account(
+        db,
+        operator_id=operator_id,
+        account_id=account_id,
+    )
+    if permission_type not in allowed:
+        raise BizError(
+            4003,
+            "当前账号暂未开通该策略，请联系管理员",
+            status_code=403,
+        )
+    return permission_type
+
+
+async def _filter_rows_by_strategy_permissions(
+    db,
+    *,
+    operator_id: int,
+    rows: list[dict],
+) -> list[dict]:
+    permission_map = await account_strategy_permission_map_for_operator(
+        db,
+        operator_id=operator_id,
+    )
+    visible: list[dict] = []
+    for row in rows:
+        account_id = int(row.get("account_id") or 0)
+        try:
+            permission_type = derive_strategy_permission_type(
+                str(row.get("type") or ""),
+                str(row.get("play_code") or ""),
+            )
+        except ValueError:
+            continue
+        if permission_type in permission_map.get(account_id, []):
+            visible.append(row)
+    return visible
+
+
 def _is_dw3_timing_conflict_exempt(play_code: str) -> bool:
     """Policy A: DW3 does not join generic save-time timing auto-allocation."""
     return is_dw3_group_play_code(play_code)
@@ -341,6 +408,13 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
     # martin_sequence: JSON   list[float]
     ms_raw = row.get("martin_sequence")
     martin_sequence = json.loads(ms_raw) if ms_raw else None
+    config_raw = row.get("strategy_config")
+    strategy_config = None
+    if config_raw:
+        try:
+            strategy_config = json.loads(config_raw) if isinstance(config_raw, str) else config_raw
+        except (TypeError, json.JSONDecodeError):
+            strategy_config = None
 
     # daily_pnl 日期检查：如果 daily_pnl_date 不是今天，返回 0
     from datetime import datetime, timezone, timedelta
@@ -358,6 +432,7 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
         play_code_name=_get_play_code_name(platform_type, row["play_code"]),
         base_amount=_fen_to_yuan(row["base_amount"]),
         martin_sequence=martin_sequence,
+        strategy_config=strategy_config,
         bet_timing=row["bet_timing"],
         simulation=bool(row["simulation"]),
         status=row["status"],
@@ -380,6 +455,11 @@ async def list_strategies(
 ):
     """"""
     rows = await strategy_list_by_operator(db, operator_id=operator["id"])
+    rows = await _filter_rows_by_strategy_permissions(
+        db,
+        operator_id=operator["id"],
+        rows=rows,
+    )
     items = [_to_strategy_info(r) for r in rows]
     return ApiResponse[list[StrategyInfo]](data=items)
 
@@ -412,8 +492,21 @@ async def create_strategy(
 
     # 2. 
     play_code = body.play_code
+    strategy_config_json = (
+        json.dumps(body.strategy_config, ensure_ascii=False)
+        if body.strategy_config is not None
+        else None
+    )
     if strategy_platform_type == LUCKYSB_PLATFORM_TYPE:
         _validate_luckysb_or_raise(body.type, play_code)
+
+    await _ensure_strategy_permission_or_raise(
+        db,
+        operator_id=operator["id"],
+        account_id=body.account_id,
+        strategy_type=body.type,
+        play_code=play_code,
+    )
 
     resolved_bet_timing = await _resolve_bet_timing_for_save(
         db,
@@ -440,6 +533,7 @@ async def create_strategy(
         play_code=play_code,
         base_amount=_yuan_to_fen(body.base_amount),
         martin_sequence=martin_seq_json,
+        strategy_config=strategy_config_json,
         bet_timing=resolved_bet_timing,
         simulation=1 if body.simulation else 0,
         stop_loss=_yuan_to_fen(body.stop_loss) if body.stop_loss is not None else None,
@@ -490,6 +584,12 @@ async def update_strategy(
     if body.play_code is not None:
         if requested_platform_type == LUCKYSB_PLATFORM_TYPE:
             update_fields["play_code"] = body.play_code
+        elif is_random_pick_type(existing["type"]):
+            try:
+                categories = parse_omission_play_code(body.play_code)
+                update_fields["play_code"] = build_omission_play_code(categories)
+            except ValueError as exc:
+                raise BizError(1002, str(exc), status_code=400)
         elif is_wave_strategy_type(existing["type"]):
             try:
                 update_fields["play_code"] = normalize_wave_strategy_play_code(
@@ -516,6 +616,23 @@ async def update_strategy(
             if v <= 0:
                 raise BizError(1002, " 0", status_code=400)
         update_fields["martin_sequence"] = json.dumps(body.martin_sequence)
+    if body.strategy_config is not None:
+        if not is_random_pick_type(existing["type"]):
+            raise BizError(1002, "strategy_config is only supported for random pick strategies", status_code=400)
+        try:
+            weight_mode = (
+                AI_RANDOM_WEIGHT_MODE
+                if is_ai_random_type(existing["type"])
+                else OMISSION_WEIGHT_MODE
+            )
+            normalized_config = normalize_strategy_config(
+                body.strategy_config,
+                weight_mode=weight_mode,
+            )
+        except ValueError as exc:
+            raise BizError(1002, str(exc), status_code=400)
+        update_fields["strategy_config"] = json.dumps(normalized_config, ensure_ascii=False)
+        update_fields["play_code"] = build_omission_play_code(normalized_config["categories"])
     if body.bet_timing is not None:
         update_fields["bet_timing"] = body.bet_timing
     if body.simulation is not None:
@@ -541,6 +658,14 @@ async def update_strategy(
         _validate_luckysb_or_raise(existing["type"], final_play_code)
     if is_dw3_group_play_code(final_play_code) and final_gate_window_issues is None:
         raise BizError(1002, "gate_window_issues is required for DW3 play_code", status_code=400)
+
+    await _ensure_strategy_permission_or_raise(
+        db,
+        operator_id=operator["id"],
+        account_id=existing["account_id"],
+        strategy_type=existing["type"],
+        play_code=final_play_code,
+    )
 
     candidate = build_timing_candidate(
         strategy_id=existing["id"],
@@ -570,10 +695,8 @@ async def delete_strategy(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
-    """删除策略（仅 stopped 状态）
-
-    force=true 时级联删除关联的投注记录。
-    """
+    """Soft-delete a stopped strategy while preserving order history."""
+    del force  # accepted for backward-compatible clients; no hard deletion is performed.
     existing = await strategy_get_by_id(
         db, strategy_id=strategy_id, operator_id=operator["id"]
     )
@@ -583,12 +706,9 @@ async def delete_strategy(
     if existing["status"] != "stopped":
         raise BizError(4003, "只能删除已停止的策略", status_code=400)
 
-    try:
-        deleted = await strategy_delete(
-            db, strategy_id=strategy_id, operator_id=operator["id"], force=force
-        )
-    except ValueError as e:
-        raise BizError(4003, str(e), status_code=400)
+    deleted = await strategy_delete(
+        db, strategy_id=strategy_id, operator_id=operator["id"]
+    )
 
     if not deleted:
         raise BizError(4001, "策略不存在", status_code=404)
@@ -687,6 +807,13 @@ async def _transition_strategy(
             account=account,
             strategy_platform_type=strategy_platform_type,
             error_code=4002,
+        )
+        await _ensure_strategy_permission_or_raise(
+            db,
+            operator_id=operator["id"],
+            account_id=existing["account_id"],
+            strategy_type=existing["type"],
+            play_code=existing["play_code"],
         )
         all_strategies = await strategy_list_by_operator(db, operator_id=operator["id"])
         running_strategies = [

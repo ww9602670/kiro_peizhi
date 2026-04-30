@@ -16,6 +16,9 @@ import app.database as _db_module
 from app.database import close_shared_db, get_shared_db
 from app.engine.adapters.base import BalanceInfo, InstallInfo, LoginResult
 from app.main import app
+from app.models.db_ops import account_strategy_permission_set
+from app.schemas.strategy import STRATEGY_PERMISSION_TYPES
+from app.utils.auth import decode_token
 
 
 def _uid() -> str:
@@ -185,6 +188,15 @@ async def test_full_api_flow(client):
     verified_account = resp.json()["data"]
     assert "JND28WEB" in verified_account["allowed_strategy_platform_types"]
     assert verified_account["effective_verification_run_id"] is not None
+    assert verified_account["allowed_strategy_types"] == []
+
+    resp = await client.put(
+        f"/api/v1/admin/operators/{op_id}/accounts/{account_id}/strategy-permissions",
+        headers=admin_headers,
+        json={"strategy_types": ["flat", "martin"]},
+    )
+    assert resp.json()["code"] == 0
+    assert resp.json()["data"]["allowed_strategy_types"] == ["flat", "martin"]
 
     # 6. 
     resp = await client.get("/api/v1/accounts", headers=op_headers)
@@ -351,6 +363,17 @@ async def _create_account_for(client, headers, *, verify: bool = True) -> int:
     if verify:
         verify_resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
         assert verify_resp.json()["code"] == 0
+    token = headers.get("Authorization", "").replace("Bearer ", "", 1)
+    operator_id = int(decode_token(token)["sub"])
+    db = await get_shared_db()
+    permissions = await account_strategy_permission_set(
+        db,
+        operator_id=operator_id,
+        account_id=account_id,
+        strategy_types=list(STRATEGY_PERMISSION_TYPES),
+        created_by=1,
+    )
+    assert permissions is not None
     return account_id
 
 

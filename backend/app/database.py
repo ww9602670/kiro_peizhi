@@ -62,6 +62,8 @@ DDL_STATEMENTS = [
         single_bet_limit INTEGER,
         daily_limit     INTEGER,
         period_limit    INTEGER,
+        deleted_at      TEXT,
+        deleted_account_name TEXT,
         created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         UNIQUE(operator_id, account_name, game_type)
@@ -140,6 +142,7 @@ DDL_STATEMENTS = [
         play_code       TEXT NOT NULL,
         base_amount     INTEGER NOT NULL,
         martin_sequence TEXT,
+        strategy_config TEXT,
         bet_timing      INTEGER NOT NULL DEFAULT 30,
         simulation      INTEGER NOT NULL DEFAULT 0,
         status          TEXT NOT NULL DEFAULT 'stopped',
@@ -151,10 +154,26 @@ DDL_STATEMENTS = [
         daily_pnl_date  TEXT,
         gate_window_issues INTEGER,
         platform_type   TEXT NOT NULL DEFAULT 'JND28WEB',
+        deleted_at      TEXT,
         created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
+
+    """
+    CREATE TABLE IF NOT EXISTS account_strategy_permissions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator_id     INTEGER NOT NULL REFERENCES operators(id),
+        account_id      INTEGER NOT NULL REFERENCES gambling_accounts(id) ON DELETE CASCADE,
+        strategy_type   TEXT NOT NULL,
+        enabled         INTEGER NOT NULL DEFAULT 1,
+        created_by      INTEGER REFERENCES operators(id),
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        UNIQUE(account_id, strategy_type)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_account_strategy_permissions_operator ON account_strategy_permissions(operator_id, account_id);",
 
     # 4. bet_orders
     """
@@ -364,17 +383,27 @@ DDL_STATEMENTS = [
     # 15. shared_market_uncovered_urls
     """
     CREATE TABLE IF NOT EXISTS shared_market_uncovered_urls (
-        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-        normalized_url     TEXT NOT NULL UNIQUE,
-        first_seen_at      TEXT NOT NULL,
-        last_seen_at       TEXT NOT NULL,
-        hit_count          INTEGER NOT NULL DEFAULT 1,
-        last_account_id    INTEGER,
-        last_platform_type TEXT,
-        sample_raw_url     TEXT
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        normalized_url          TEXT NOT NULL UNIQUE,
+        first_seen_at           TEXT NOT NULL,
+        last_seen_at            TEXT NOT NULL,
+        hit_count               INTEGER NOT NULL DEFAULT 1,
+        sample_raw_url          TEXT,
+        last_account_id         INTEGER,
+        last_platform_type      TEXT,
+        detection_status        TEXT NOT NULL DEFAULT 'pending',
+        review_status           TEXT,
+        detection_error         TEXT,
+        matched_shared_group_id  INTEGER REFERENCES shared_market_groups(id),
+        last_checked_at         TEXT,
+        shared_group_id         INTEGER REFERENCES shared_market_groups(id),
+        status                  TEXT NOT NULL DEFAULT 'pending',
+        failure_reason          TEXT,
+        reviewed_at             TEXT
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_shared_market_uncovered_last_seen ON shared_market_uncovered_urls(last_seen_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_uncovered_detection_status ON shared_market_uncovered_urls(detection_status, last_checked_at);",
 
     # 16. simulation_bet_orders
     """
@@ -423,6 +452,21 @@ DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_simulation_strategy_stats_operator ON simulation_strategy_stats(operator_id, account_id);",
 ]
+
+
+def _split_ddl_statements():
+    """Split DDL into schema-defining statements and dependent statements."""
+    create_and_trigger_stmts: list[str] = []
+    dependent_stmts: list[str] = []
+
+    for stmt in DDL_STATEMENTS:
+        normalized = stmt.lstrip().upper()
+        if normalized.startswith("CREATE TABLE") or normalized.startswith("CREATE TRIGGER"):
+            create_and_trigger_stmts.append(stmt)
+        else:
+            dependent_stmts.append(stmt)
+
+    return create_and_trigger_stmts, dependent_stmts
 
 
 #  SQL
@@ -578,10 +622,13 @@ async def init_db(db_path: str | None = None) -> None:
     db = await get_db(path)
     try:
         await _reset_legacy_platform_binding_schema(db)
-        for stmt in DDL_STATEMENTS:
+        schema_ddl, dependent_ddl = _split_ddl_statements()
+        for stmt in schema_ddl:
             await db.execute(stmt)
         # 自动迁移：检测并添加缺失列
         await _auto_migrate(db)
+        for stmt in dependent_ddl:
+            await db.execute(stmt)
         # 
         if BOCAI_DEFAULT_ADMIN_ENABLED:
             await db.execute(INSERT_DEFAULT_ADMIN)

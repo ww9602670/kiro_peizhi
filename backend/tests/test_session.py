@@ -389,36 +389,28 @@ async def test_heartbeat_calls_adapter(session, mock_adapter):
 
 @pytest.mark.asyncio
 async def test_heartbeat_3_fails_triggers_reconnect(session, mock_adapter, mock_alert_service):
-    """ 3  reconnect + session_lost """
+    """ 3  reconnect """
     mock_adapter.heartbeat.return_value = False
     reconnect_called = False
 
     async def mock_reconnect():
         nonlocal reconnect_called
         reconnect_called = True
+        return True
 
     session._reconnect = mock_reconnect
 
-    call_count = 0
-
-    async def mock_sleep(seconds):
-        nonlocal call_count
-        call_count += 1
-        if call_count > HEARTBEAT_MAX_FAILS + 1:
-            raise asyncio.CancelledError()
-
-    with patch("app.engine.session.asyncio.sleep", side_effect=mock_sleep):
-        with pytest.raises(asyncio.CancelledError):
-            await session._heartbeat_loop()
+    with patch("app.engine.session.asyncio.sleep", new_callable=AsyncMock):
+        await session._heartbeat_loop()
 
     assert reconnect_called is True
 
-    # session_lost 
+    # reconnect success should not alert session_lost
     session_lost_calls = [
         c for c in mock_alert_service.send.call_args_list
         if c.kwargs.get("alert_type") == "session_lost"
     ]
-    assert len(session_lost_calls) >= 1
+    assert len(session_lost_calls) == 0
 
 
 @pytest.mark.asyncio
@@ -467,20 +459,12 @@ async def test_heartbeat_exception_counts_as_failure(session, mock_adapter):
     async def mock_reconnect():
         nonlocal reconnect_called
         reconnect_called = True
+        return True
 
     session._reconnect = mock_reconnect
 
-    call_count = 0
-
-    async def mock_sleep(seconds):
-        nonlocal call_count
-        call_count += 1
-        if call_count > HEARTBEAT_MAX_FAILS + 1:
-            raise asyncio.CancelledError()
-
-    with patch("app.engine.session.asyncio.sleep", side_effect=mock_sleep):
-        with pytest.raises(asyncio.CancelledError):
-            await session._heartbeat_loop()
+    with patch("app.engine.session.asyncio.sleep", new_callable=AsyncMock):
+        await session._heartbeat_loop()
 
     assert reconnect_called is True
 
@@ -495,10 +479,11 @@ async def test_reconnect_tries_refresh_first(session, mock_adapter):
     mock_adapter.refresh_token = AsyncMock(return_value="new_token")
     session.session_token = "old_token"
 
-    await session._reconnect()
+    result = await session._reconnect()
 
     mock_adapter.refresh_token.assert_called_once()
     assert session.session_token == "new_token"
+    assert result is True
     # login 
     mock_adapter.login.assert_not_called()
 
@@ -510,11 +495,31 @@ async def test_reconnect_falls_back_to_login(session, mock_adapter):
     mock_adapter.login.return_value = LoginResult(success=True, token="relogin_tok")
 
     with patch("app.engine.session.asyncio.sleep", new_callable=AsyncMock):
-        await session._reconnect()
+        result = await session._reconnect()
 
     mock_adapter.refresh_token.assert_called_once()
     mock_adapter.login.assert_called()
     assert session.session_token == "relogin_tok"
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_reconnect_keeps_existing_token_while_reconnecting(session, mock_adapter):
+    """Reconnect should not clear the persisted token before replacement login finishes."""
+    from app.engine import session as session_module
+
+    mock_adapter.refresh_token = AsyncMock(return_value=None)
+    mock_adapter.login.return_value = LoginResult(success=True, token="relogin_tok")
+    session.session_token = "old_token"
+
+    with patch("app.engine.session.asyncio.sleep", new_callable=AsyncMock):
+        result = await session._reconnect()
+
+    first_call = session_module.account_platform_session_upsert.await_args_list[0]
+    assert first_call.kwargs["status"] == "reconnecting"
+    assert "session_token" not in first_call.kwargs
+    assert session.session_token == "relogin_tok"
+    assert result is True
 
 
 @pytest.mark.asyncio
@@ -525,10 +530,27 @@ async def test_reconnect_without_refresh_support(session, mock_adapter):
     mock_adapter.login.return_value = LoginResult(success=True, token="relogin_tok")
 
     with patch("app.engine.session.asyncio.sleep", new_callable=AsyncMock):
-        await session._reconnect()
+        result = await session._reconnect()
 
     mock_adapter.login.assert_called()
     assert session.session_token == "relogin_tok"
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_reconnect_from_heartbeat_task_does_not_cancel_current_task(session, mock_adapter):
+    """reconnect from heartbeat should not cancel the running task itself."""
+    mock_adapter.refresh_token = AsyncMock(return_value="new_token")
+    session.session_token = "old_token"
+    session.heartbeat_task = asyncio.current_task()
+    session._start_heartbeat = MagicMock()
+
+    result = await session._reconnect()
+
+    assert result is True
+    assert asyncio.current_task().cancelled() is False
+    assert session.session_token == "new_token"
+    session._start_heartbeat.assert_called_once()
 
 
 # 
@@ -566,27 +588,21 @@ async def test_alert_captcha_fail_type(session, mock_adapter, mock_alert_service
 
 @pytest.mark.asyncio
 async def test_alert_session_lost_type(session, mock_adapter, mock_alert_service):
-    """ 3  session_lost """
+    """ reconnect failed sends session_lost """
     mock_adapter.heartbeat.return_value = False
 
-    # Mock reconnect to avoid actual login
-    session._reconnect = AsyncMock()
+    # Mock reconnect failure to avoid actual login
+    session._reconnect = AsyncMock(return_value=False)
 
-    call_count = 0
-
-    async def mock_sleep(seconds):
-        nonlocal call_count
-        call_count += 1
-        if call_count > HEARTBEAT_MAX_FAILS + 1:
-            raise asyncio.CancelledError()
-
-    with patch("app.engine.session.asyncio.sleep", side_effect=mock_sleep):
-        with pytest.raises(asyncio.CancelledError):
-            await session._heartbeat_loop()
+    with patch("app.engine.session.asyncio.sleep", new_callable=AsyncMock):
+        await session._heartbeat_loop()
 
     send_calls = mock_alert_service.send.call_args_list
     alert_types = [c.kwargs.get("alert_type") for c in send_calls]
     assert "session_lost" in alert_types
+    session_lost = next(c for c in send_calls if c.kwargs.get("alert_type") == "session_lost")
+    assert session_lost.kwargs["title"] == "会话已断开，自动重连失败"
+    assert "自动重连未成功" in session_lost.kwargs["detail"]
 
 
 @pytest.mark.asyncio

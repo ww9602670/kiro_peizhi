@@ -20,11 +20,14 @@ from app.main import app
 from app.database import get_shared_db
 from app.models.db_ops import (
     account_create,
+    account_strategy_permission_set,
     account_verification_run_complete,
     account_verification_run_create,
+    bet_order_create,
     operator_create,
 )
 from app.schemas.strategy import validate_state_transition
+from app.schemas.strategy import STRATEGY_PERMISSION_TYPES
 from app.utils.auth import create_token, register_session, persist_jti
 
 
@@ -38,6 +41,7 @@ async def _create_operator_with_account(
     game_type: str = "JND28",
     platform_url: str | None = None,
     create_effective_verification: bool = True,
+    grant_strategy_permissions: bool = True,
 ) -> tuple[str, int, int]:
     """ +  (token, operator_id, account_id)"""
     db = await get_shared_db()
@@ -88,6 +92,14 @@ async def _create_operator_with_account(
     await db.execute(
         "UPDATE gambling_accounts SET status='online' WHERE id=?", (acc["id"],)
     )
+    if grant_strategy_permissions:
+        await account_strategy_permission_set(
+            db,
+            operator_id=op["id"],
+            account_id=acc["id"],
+            strategy_types=list(STRATEGY_PERMISSION_TYPES),
+            created_by=1,
+        )
     await db.commit()
     return token, op["id"], acc["id"]
 
@@ -298,6 +310,57 @@ class TestSchemaValidation:
         assert s.martin_sequence == [1, 2, 4]
         assert s.play_code == "B1LM_D,DS3"
 
+    def test_omission_random_flat_normalizes_config(self):
+        from app.schemas.strategy import StrategyCreate
+        s = StrategyCreate(
+            account_id=1,
+            name="random_flat",
+            type="omission_random_flat",
+            play_code="placeholder",
+            base_amount=10.0,
+            strategy_config={"pick_count": 5, "categories": ["ball2", "ball1"]},
+            martin_sequence=[1, 2, 4],
+        )
+        assert s.play_code == "OMR_BALL1,OMR_BALL2"
+        assert s.strategy_config == {
+            "pick_count": 5,
+            "categories": ["ball1", "ball2"],
+            "weight_mode": "omission_plus_random",
+        }
+        assert s.martin_sequence is None
+
+    def test_omission_random_martin_requires_sequence(self):
+        from app.schemas.strategy import StrategyCreate
+        with pytest.raises(Exception):
+            StrategyCreate(
+                account_id=1,
+                name="random_martin",
+                type="omission_random_martin",
+                play_code="placeholder",
+                base_amount=10.0,
+                strategy_config={"pick_count": 5, "categories": ["ball1"]},
+                martin_sequence=None,
+            )
+
+    def test_ai_random_flat_normalizes_config(self):
+        from app.schemas.strategy import StrategyCreate
+        s = StrategyCreate(
+            account_id=1,
+            name="ai_random",
+            type="ai_random_flat",
+            play_code="placeholder",
+            base_amount=10.0,
+            strategy_config={"pick_count": 6, "categories": ["sum", "ball1"]},
+            martin_sequence=[1, 2, 4],
+        )
+        assert s.play_code == "OMR_BALL1,OMR_SUM"
+        assert s.strategy_config == {
+            "pick_count": 6,
+            "categories": ["ball1", "sum"],
+            "weight_mode": "pure_random",
+        }
+        assert s.martin_sequence is None
+
 
 # 
 # 5.  API
@@ -338,6 +401,33 @@ async def test_create_flat_strategy(client):
 
 
 @pytest.mark.asyncio
+async def test_create_strategy_rejected_without_account_strategy_permission(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(
+        f"noperm_{uid}",
+        grant_strategy_permissions=False,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "flat_no_permission",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["code"] == 4003
+    assert "暂未开通" in body["message"]
+
+
+@pytest.mark.asyncio
 async def test_create_martin_strategy(client):
     """"""
     uid = _uid()
@@ -368,6 +458,74 @@ async def test_create_martin_strategy(client):
     assert data["martin_sequence"] == [1, 2, 4, 8]
     assert data["base_amount"] == 5.0
     assert data["bet_timing"] == 45
+
+
+@pytest.mark.asyncio
+async def test_create_omission_random_martin_strategy(client):
+    uid = _uid()
+    token, op_id, acc_id = await _create_operator_with_account(f"omr_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "omission_random",
+            "type": "omission_random_martin",
+            "play_code": "placeholder",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+            "strategy_config": {
+                "pick_count": 5,
+                "categories": ["ball1", "ball2"],
+            },
+            "bet_timing": 45,
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["type"] == "omission_random_martin"
+    assert data["play_code"] == "OMR_BALL1,OMR_BALL2"
+    assert data["play_code_name"] == "球1, 球2"
+    assert data["strategy_config"]["pick_count"] == 5
+    assert data["strategy_config"]["categories"] == ["ball1", "ball2"]
+    assert data["martin_sequence"] == [1, 2, 4]
+
+
+@pytest.mark.asyncio
+async def test_create_ai_random_martin_strategy(client):
+    uid = _uid()
+    token, op_id, acc_id = await _create_operator_with_account(f"air_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "ai_random",
+            "type": "ai_random_martin",
+            "play_code": "placeholder",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+            "strategy_config": {
+                "pick_count": 4,
+                "categories": ["ball1", "sum"],
+            },
+            "bet_timing": 45,
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["type"] == "ai_random_martin"
+    assert data["play_code"] == "OMR_BALL1,OMR_SUM"
+    assert data["strategy_config"]["pick_count"] == 4
+    assert data["strategy_config"]["categories"] == ["ball1", "sum"]
+    assert data["strategy_config"]["weight_mode"] == "pure_random"
+    assert data["martin_sequence"] == [1, 2, 4]
 
 
 @pytest.mark.asyncio
@@ -698,6 +856,39 @@ async def test_list_strategies(client):
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
     assert len(resp.json()["data"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_strategies_hides_revoked_strategy_permissions(client):
+    uid = _uid()
+    token, op_id, acc_id = await _create_operator_with_account(f"list_revoked_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "hidden_after_revoke",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+    assert create_resp.status_code == 200
+
+    db = await get_shared_db()
+    await account_strategy_permission_set(
+        db,
+        operator_id=op_id,
+        account_id=acc_id,
+        strategy_types=[],
+        created_by=1,
+    )
+
+    resp = await client.get("/api/v1/strategies", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["data"] == []
 
 
 @pytest.mark.asyncio
@@ -1056,6 +1247,51 @@ async def test_update_strategy(client):
 
 
 @pytest.mark.asyncio
+async def test_stop_edit_restart_uses_updated_strategy_params(client, mock_engine):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"restart_update_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "restart_update",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+            "bet_timing": 30,
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    start_resp = await client.post(f"/api/v1/strategies/{sid}/start", headers=headers)
+    assert start_resp.status_code == 200
+
+    stop_resp = await client.post(f"/api/v1/strategies/{sid}/stop", headers=headers)
+    assert stop_resp.status_code == 200
+    assert stop_resp.json()["data"]["status"] == "stopped"
+
+    update_resp = await client.put(
+        f"/api/v1/strategies/{sid}",
+        headers=headers,
+        json={"base_amount": 25.0, "bet_timing": 55},
+    )
+    assert update_resp.status_code == 200
+
+    mock_engine.start_worker.reset_mock()
+    restart_resp = await client.post(f"/api/v1/strategies/{sid}/start", headers=headers)
+    assert restart_resp.status_code == 200
+
+    kwargs = mock_engine.start_worker.call_args.kwargs
+    restarted = next(s for s in kwargs["strategies"] if int(s["id"]) == sid)
+    assert restarted["status"] == "running"
+    assert restarted["base_amount"] == 2500
+    assert restarted["bet_timing"] == 55
+
+
+@pytest.mark.asyncio
 async def test_update_red_wave_strategy_play_code(client):
     uid = _uid()
     token, _, acc_id = await _create_operator_with_account(f"updred_{uid}")
@@ -1252,7 +1488,7 @@ async def test_update_running_strategy_rejected(client):
 async def test_delete_strategy(client):
     """ stopped """
     uid = _uid()
-    token, _, acc_id = await _create_operator_with_account(f"del_{uid}")
+    token, operator_id, acc_id = await _create_operator_with_account(f"del_{uid}")
     headers = {"Authorization": f"Bearer {token}"}
 
     create_resp = await client.post(
@@ -1267,6 +1503,18 @@ async def test_delete_strategy(client):
         },
     )
     sid = create_resp.json()["data"]["id"]
+    db = await get_shared_db()
+    await bet_order_create(
+        db,
+        idempotent_id=f"delete-keep-{uid}",
+        operator_id=operator_id,
+        account_id=acc_id,
+        strategy_id=sid,
+        issue="202604210001",
+        key_code="DX1",
+        amount=1000,
+        status="settled",
+    )
 
     resp = await client.delete(f"/api/v1/strategies/{sid}", headers=headers)
     assert resp.status_code == 200
@@ -1275,6 +1523,13 @@ async def test_delete_strategy(client):
     # 
     list_resp = await client.get("/api/v1/strategies", headers=headers)
     assert len(list_resp.json()["data"]) == 0
+
+    orders_resp = await client.get(
+        f"/api/v1/bet-orders?strategy_id={sid}",
+        headers=headers,
+    )
+    assert orders_resp.status_code == 200
+    assert orders_resp.json()["data"]["paged"]["total"] == 1
 
 
 @pytest.mark.asyncio
@@ -1665,6 +1920,7 @@ async def test_strategies_table_has_gate_window_issues_column():
     rows = await (await db.execute("PRAGMA table_info(strategies)")).fetchall()
     column_names = {row["name"] for row in rows}
     assert "gate_window_issues" in column_names
+    assert "strategy_config" in column_names
 
 
 @pytest.mark.asyncio

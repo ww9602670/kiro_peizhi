@@ -168,7 +168,10 @@ async def account_get_by_id(
     db: aiosqlite.Connection, *, account_id: int, operator_id: int
 ) -> dict[str, Any] | None:
     row = await (await db.execute(
-        "SELECT * FROM gambling_accounts WHERE id=? AND operator_id=?",
+        """SELECT * FROM gambling_accounts
+           WHERE id=? AND operator_id=?
+             AND deleted_at IS NULL
+             AND status <> 'deleted'""",
         (account_id, operator_id),
     )).fetchone()
     record = _row_to_dict(row)
@@ -181,7 +184,11 @@ async def account_list_by_operator(
     db: aiosqlite.Connection, *, operator_id: int
 ) -> list[dict[str, Any]]:
     rows = await (await db.execute(
-        "SELECT * FROM gambling_accounts WHERE operator_id=? ORDER BY id",
+        """SELECT * FROM gambling_accounts
+           WHERE operator_id=?
+             AND deleted_at IS NULL
+             AND status <> 'deleted'
+           ORDER BY id""",
         (operator_id,),
     )).fetchall()
     records = _rows_to_list(rows)
@@ -234,45 +241,174 @@ async def account_update(
     return await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
 
 
+async def account_strategy_permission_list_by_account(
+    db: aiosqlite.Connection,
+    *,
+    operator_id: int,
+    account_id: int,
+) -> list[str]:
+    rows = await (
+        await db.execute(
+            """SELECT p.strategy_type
+               FROM account_strategy_permissions p
+               JOIN gambling_accounts a ON a.id = p.account_id
+              WHERE p.operator_id=?
+                AND p.account_id=?
+                AND a.operator_id=?
+                AND a.deleted_at IS NULL
+                AND a.status <> 'deleted'
+                AND p.enabled=1
+              ORDER BY p.strategy_type""",
+            (operator_id, account_id, operator_id),
+        )
+    ).fetchall()
+    return [str(row["strategy_type"]) for row in rows]
+
+
+async def account_strategy_permission_map_for_operator(
+    db: aiosqlite.Connection,
+    *,
+    operator_id: int,
+) -> dict[int, list[str]]:
+    rows = await (
+        await db.execute(
+            """SELECT account_id, strategy_type
+               FROM account_strategy_permissions
+              WHERE operator_id=? AND enabled=1
+              ORDER BY account_id, strategy_type""",
+            (operator_id,),
+        )
+    ).fetchall()
+    result: dict[int, list[str]] = {}
+    for row in rows:
+        result.setdefault(int(row["account_id"]), []).append(str(row["strategy_type"]))
+    return result
+
+
+async def account_strategy_permission_set(
+    db: aiosqlite.Connection,
+    *,
+    operator_id: int,
+    account_id: int,
+    strategy_types: list[str],
+    created_by: int,
+) -> list[str] | None:
+    from app.schemas.strategy import normalize_strategy_permission_type
+
+    account = await (
+        await db.execute(
+            """SELECT id FROM gambling_accounts
+               WHERE id=? AND operator_id=?
+                 AND deleted_at IS NULL
+                 AND status <> 'deleted'""",
+            (account_id, operator_id),
+        )
+    ).fetchone()
+    if account is None:
+        return None
+
+    normalized: list[str] = []
+    for item in strategy_types:
+        value = normalize_strategy_permission_type(item)
+        if value not in normalized:
+            normalized.append(value)
+
+    now = _now()
+    await db.execute(
+        "DELETE FROM account_strategy_permissions WHERE operator_id=? AND account_id=?",
+        (operator_id, account_id),
+    )
+    for strategy_type in normalized:
+        await db.execute(
+            """INSERT INTO account_strategy_permissions
+               (operator_id, account_id, strategy_type, enabled, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, 1, ?, ?, ?)""",
+            (operator_id, account_id, strategy_type, created_by, now, now),
+        )
+    await db.commit()
+    return normalized
+
+
 async def account_delete(
     db: aiosqlite.Connection, *, account_id: int, operator_id: int
 ) -> bool:
+    """Soft-delete an account while preserving strategy and order history."""
+    row = await (
+        await db.execute(
+            """SELECT * FROM gambling_accounts
+               WHERE id=? AND operator_id=?
+                 AND deleted_at IS NULL
+                 AND status <> 'deleted'""",
+            (account_id, operator_id),
+        )
+    ).fetchone()
+    if row is None:
+        return False
+
+    running = await (
+        await db.execute(
+            """SELECT COUNT(*) AS cnt
+               FROM strategies
+              WHERE account_id=? AND operator_id=?
+                AND deleted_at IS NULL
+                AND status='running'""",
+            (account_id, operator_id),
+        )
+    ).fetchone()
+    if running and int(running["cnt"]) > 0:
+        raise ValueError("account has running strategies")
+
+    now = _now()
+    account_name = str(row["account_name"])
+    archived_name = f"{account_name}#deleted#{account_id}"
+    await db.execute(
+        """UPDATE strategies
+              SET status='deleted', deleted_at=?, updated_at=?
+            WHERE account_id=? AND operator_id=?
+              AND deleted_at IS NULL""",
+        (now, now, account_id, operator_id),
+    )
+    await db.execute(
+        "DELETE FROM account_strategy_permissions WHERE operator_id=? AND account_id=?",
+        (operator_id, account_id),
+    )
+    await db.execute(
+        """UPDATE account_platform_sessions
+              SET status='inactive',
+                  session_token=NULL,
+                  worker_lock_token=NULL,
+                  worker_lock_ts=NULL,
+                  updated_at=?
+            WHERE account_id=?""",
+        (now, account_id),
+    )
+    cursor = await db.execute(
+        """UPDATE gambling_accounts
+              SET status='deleted',
+                  deleted_at=?,
+                  deleted_account_name=?,
+                  account_name=?,
+                  session_token=NULL,
+                  kill_switch=1,
+                  updated_at=?
+            WHERE id=? AND operator_id=?
+              AND deleted_at IS NULL
+              AND status <> 'deleted'""",
+        (now, account_name, archived_name, now, account_id, operator_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
     """删除账号，级联清理所有关联数据。
 
     删除顺序（按外键依赖）：
     bet_orders → strategies → reconcile_records → account_odds → gambling_accounts
     """
     # 1. 删除该账号下所有投注记录
-    await db.execute(
-        "DELETE FROM bet_orders WHERE account_id=? AND operator_id=?",
-        (account_id, operator_id),
-    )
     # 2. 删除该账号下所有策略
-    await db.execute(
-        "DELETE FROM strategies WHERE account_id=? AND operator_id=?",
-        (account_id, operator_id),
-    )
     # 3. 删除对账记录（reconcile_records 引用 gambling_accounts 但无 CASCADE）
-    await db.execute(
-        "DELETE FROM reconcile_records WHERE account_id=?",
-        (account_id,),
-    )
     # 4. 删除赔率记录（account_odds 有 ON DELETE CASCADE，但显式删除更安全）
-    await db.execute(
-        "DELETE FROM account_odds WHERE account_id=?",
-        (account_id,),
-    )
-    await db.execute(
-        "DELETE FROM account_platform_sessions WHERE account_id=?",
-        (account_id,),
-    )
     # 5. 删除账号本身
-    cursor = await db.execute(
-        "DELETE FROM gambling_accounts WHERE id=? AND operator_id=?",
-        (account_id, operator_id),
-    )
-    await db.commit()
-    return cursor.rowcount > 0
 
 
 # 
@@ -753,6 +889,7 @@ async def strategy_create(
     play_code: str,
     base_amount: int,
     martin_sequence: str | None = None,
+    strategy_config: str | None = None,
     bet_timing: int = 30,
     simulation: int = 0,
     stop_loss: int | None = None,
@@ -764,11 +901,11 @@ async def strategy_create(
     cursor = await db.execute(
         """INSERT INTO strategies
            (operator_id, account_id, name, type, play_code, base_amount,
-            martin_sequence, bet_timing, simulation, stop_loss, take_profit,
+            martin_sequence, strategy_config, bet_timing, simulation, stop_loss, take_profit,
             gate_window_issues, platform_type, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (operator_id, account_id, name, type, play_code, base_amount,
-         martin_sequence, bet_timing, simulation, stop_loss, take_profit,
+         martin_sequence, strategy_config, bet_timing, simulation, stop_loss, take_profit,
          gate_window_issues, platform_type, now, now),
     )
     await db.commit()
@@ -822,10 +959,36 @@ async def strategy_list_by_operator(
              ON ss.strategy_id = s.id
             AND ss.operator_id = s.operator_id
            WHERE s.operator_id=?
+             AND s.deleted_at IS NULL
+             AND s.status <> 'deleted'
            ORDER BY s.id""",
         (operator_id,),
     )).fetchall()
     return [_merge_strategy_simulation_stats(dict(row)) for row in rows]
+
+
+async def strategy_running_exists_for_account_platform(
+    db: aiosqlite.Connection,
+    *,
+    operator_id: int,
+    account_id: int,
+    platform_type: str,
+) -> bool:
+    normalized_platform_type = platform_type.strip().upper()
+    row = await (
+        await db.execute(
+            """SELECT 1
+                 FROM strategies
+                WHERE operator_id=?
+                  AND account_id=?
+                  AND UPPER(platform_type)=?
+                  AND status='running'
+                  AND deleted_at IS NULL
+                LIMIT 1""",
+            (operator_id, account_id, normalized_platform_type),
+        )
+    ).fetchone()
+    return row is not None
 
 
 async def strategy_update(
@@ -839,6 +1002,7 @@ async def strategy_update(
         return await strategy_get_by_id(db, strategy_id=strategy_id, operator_id=operator_id)
     allowed = {
         "name", "play_code", "base_amount", "martin_sequence",
+        "strategy_config",
         "bet_timing", "simulation", "status", "martin_level",
         "stop_loss", "take_profit", "daily_pnl", "total_pnl", "daily_pnl_date",
         "gate_window_issues", "platform_type",
@@ -860,30 +1024,14 @@ async def strategy_update(
 async def strategy_delete(
     db: aiosqlite.Connection, *, strategy_id: int, operator_id: int, force: bool = False
 ) -> bool:
-    """删除策略。
-
-    force=False（默认）：如果存在关联 bet_orders，抛出 ValueError 提示用户。
-    force=True：级联删除关联的 bet_orders 后再删除策略。
-    """
-    # 检查是否有关联的 bet_orders
-    count_row = await (await db.execute(
-        "SELECT COUNT(*) as cnt FROM bet_orders WHERE strategy_id=? AND operator_id=?",
-        (strategy_id, operator_id),
-    )).fetchone()
-    bet_count = count_row["cnt"] if count_row else 0
-
-    if bet_count > 0 and not force:
-        raise ValueError(f"该策略关联了 {bet_count} 条投注记录，请使用强制删除或先清理投注记录")
-
-    if bet_count > 0 and force:
-        await db.execute(
-            "DELETE FROM bet_orders WHERE strategy_id=? AND operator_id=?",
-            (strategy_id, operator_id),
-        )
-
+    """Soft-delete a stopped strategy while preserving all order history."""
+    del force  # kept for API compatibility; strategy history is never hard-deleted here.
+    now = _now()
     cursor = await db.execute(
-        "DELETE FROM strategies WHERE id=? AND operator_id=?",
-        (strategy_id, operator_id),
+        """UPDATE strategies
+              SET status='deleted', deleted_at=?, updated_at=?
+            WHERE id=? AND operator_id=? AND deleted_at IS NULL""",
+        (now, now, strategy_id, operator_id),
     )
     await db.commit()
     return cursor.rowcount > 0
@@ -1020,13 +1168,37 @@ async def account_platform_session_clear_locks(
 def _resolve_bet_order_ledger_sql(ledger: str = "real") -> tuple[str, str]:
     resolved = (ledger or "real").strip().lower()
     if resolved == "real":
-        return "bet_orders", "SELECT * FROM bet_orders"
+        return (
+            "bet_orders",
+            """SELECT b.*, s.name AS strategy_name,
+                      COALESCE(NULLIF(a.deleted_account_name, ''), a.account_name) AS account_name
+                 FROM bet_orders b
+                 LEFT JOIN strategies s
+                   ON b.strategy_id = s.id AND b.operator_id = s.operator_id
+                 LEFT JOIN gambling_accounts a
+                   ON b.account_id = a.id AND b.operator_id = a.operator_id""",
+        )
     if resolved == "simulation":
         return (
             "simulation_bet_orders",
-            "SELECT *, 1 AS simulation, NULL AS martin_level FROM simulation_bet_orders",
+            """SELECT b.*, 1 AS simulation, NULL AS martin_level,
+                      s.name AS strategy_name,
+                      COALESCE(NULLIF(a.deleted_account_name, ''), a.account_name) AS account_name
+                 FROM simulation_bet_orders b
+                 LEFT JOIN strategies s
+                   ON b.strategy_id = s.id AND b.operator_id = s.operator_id
+                 LEFT JOIN gambling_accounts a
+                   ON b.account_id = a.id AND b.operator_id = a.operator_id""",
         )
     raise ValueError(f"invalid ledger={ledger}")
+
+
+def _normalize_order_date_start(value: str) -> str:
+    return f"{value} 00:00:00" if len(value) == 10 else value
+
+
+def _normalize_order_date_end(value: str) -> str:
+    return f"{value} 23:59:59" if len(value) == 10 else value
 
 
 async def bet_order_create(
@@ -1069,7 +1241,7 @@ async def bet_order_get_by_id(
 ) -> dict[str, Any] | None:
     _, select_sql = _resolve_bet_order_ledger_sql(ledger)
     row = await (await db.execute(
-        f"{select_sql} WHERE id=? AND operator_id=?",
+        f"{select_sql} WHERE b.id=? AND b.operator_id=?",
         (order_id, operator_id),
     )).fetchone()
     return _row_to_dict(row)
@@ -1090,38 +1262,38 @@ async def bet_order_list_by_operator(
 ) -> tuple[list[dict[str, Any]], int]:
     """ (items, total)"""
     table_name, select_sql = _resolve_bet_order_ledger_sql(ledger)
-    conditions = ["operator_id=?"]
+    conditions = ["b.operator_id=?"]
     params: list[Any] = [operator_id]
 
     if date_from:
-        conditions.append("created_at >= ?")
-        params.append(date_from)
+        conditions.append("b.created_at >= ?")
+        params.append(_normalize_order_date_start(date_from))
     if date_to:
-        conditions.append("created_at <= ?")
-        params.append(date_to + " 23:59:59")
+        conditions.append("b.created_at <= ?")
+        params.append(_normalize_order_date_end(date_to))
     if strategy_id is not None:
-        conditions.append("strategy_id=?")
+        conditions.append("b.strategy_id=?")
         params.append(strategy_id)
     if status == "settled":
-        conditions.append("status='settled'")
+        conditions.append("b.status='settled'")
     elif status == "pending":
-        conditions.append("status IN ('bet_success','settling','pending_match')")
+        conditions.append("b.status IN ('bet_success','settling','pending_match')")
     if account_id is not None:
-        conditions.append("account_id=?")
+        conditions.append("b.account_id=?")
         params.append(account_id)
 
     where = " AND ".join(conditions)
 
     # total count
     count_row = await (await db.execute(
-        f"SELECT COUNT(*) as cnt FROM {table_name} WHERE {where}", tuple(params)
+        f"SELECT COUNT(*) as cnt FROM {table_name} b WHERE {where}", tuple(params)
     )).fetchone()
     total = count_row["cnt"] if count_row else 0
 
     # paginated results
     offset = (page - 1) * page_size
     rows = await (await db.execute(
-        f"{select_sql} WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        f"{select_sql} WHERE {where} ORDER BY b.created_at DESC LIMIT ? OFFSET ?",
         tuple(params) + (page_size, offset),
     )).fetchall()
 
@@ -1141,24 +1313,24 @@ async def bet_order_summary_by_operator(
 ) -> dict[str, Any]:
     """返回筛选条件下的汇总统计：total_amount, total_payout"""
     table_name, _ = _resolve_bet_order_ledger_sql(ledger)
-    conditions = ["operator_id=?"]
+    conditions = ["b.operator_id=?"]
     params: list[Any] = [operator_id]
 
     if date_from:
-        conditions.append("created_at >= ?")
-        params.append(date_from)
+        conditions.append("b.created_at >= ?")
+        params.append(_normalize_order_date_start(date_from))
     if date_to:
-        conditions.append("created_at <= ?")
-        params.append(date_to + " 23:59:59")
+        conditions.append("b.created_at <= ?")
+        params.append(_normalize_order_date_end(date_to))
     if strategy_id is not None:
-        conditions.append("strategy_id=?")
+        conditions.append("b.strategy_id=?")
         params.append(strategy_id)
     if status == "settled":
-        conditions.append("status='settled'")
+        conditions.append("b.status='settled'")
     elif status == "pending":
-        conditions.append("status IN ('bet_success','settling','pending_match')")
+        conditions.append("b.status IN ('bet_success','settling','pending_match')")
     if account_id is not None:
-        conditions.append("account_id=?")
+        conditions.append("b.account_id=?")
         params.append(account_id)
 
     where = " AND ".join(conditions)
@@ -1167,7 +1339,7 @@ async def bet_order_summary_by_operator(
         f"""SELECT COALESCE(SUM(amount), 0) as total_amount,
                    COALESCE(SUM(CASE WHEN status='settled' AND pnl IS NOT NULL
                                      THEN amount + pnl ELSE 0 END), 0) as total_payout
-            FROM {table_name} WHERE {where}""",
+            FROM {table_name} b WHERE {where}""",
         tuple(params),
     )).fetchone()
 
@@ -1185,7 +1357,8 @@ async def bet_order_list_pending_by_operator(
 ) -> list[dict[str, Any]]:
     """查询待结算投注（JOIN 策略名+账户名），最多 limit 条"""
     rows = await (await db.execute(
-        """SELECT b.*, s.name AS strategy_name, a.account_name AS account_name
+        """SELECT b.*, s.name AS strategy_name,
+                  COALESCE(NULLIF(a.deleted_account_name, ''), a.account_name) AS account_name
            FROM bet_orders b
            JOIN strategies s ON b.strategy_id = s.id
            JOIN gambling_accounts a ON b.account_id = a.id
@@ -1541,10 +1714,29 @@ async def odds_get_confirmed_map(
 
     result: dict[str, int] = {}
     for r in rows:
-        if r["confirmed"] == 0:
+        odds_value = int(r["odds_value"] or 0)
+        if r["confirmed"] == 0 and odds_value <= 0:
             return None
-        result[r["key_code"]] = r["odds_value"]
+        result[r["key_code"]] = odds_value
     return result
+
+
+async def odds_get_latest_map(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str,
+) -> dict[str, int] | None:
+    """Return the latest stored odds regardless of manual confirmation state."""
+    rows = await (await db.execute(
+        "SELECT key_code, odds_value FROM account_odds "
+        "WHERE account_id=? AND platform_type=?",
+        (account_id, platform_type),
+    )).fetchall()
+
+    if not rows:
+        return None
+    return {r["key_code"]: r["odds_value"] for r in rows}
 
 
 async def odds_confirm_all(
@@ -1682,6 +1874,42 @@ async def shared_market_snapshot_get_latest(
     return _row_to_dict(row)
 
 
+async def shared_market_group_url_exists(
+    db: aiosqlite.Connection,
+    *,
+    normalized_url: str,
+) -> dict[str, Any] | None:
+    row = await (await db.execute(
+        "SELECT * FROM shared_market_group_urls WHERE normalized_url=?",
+        (normalized_url,),
+    )).fetchone()
+    return _row_to_dict(row)
+
+
+async def shared_market_group_url_add(
+    db: aiosqlite.Connection,
+    *,
+    shared_group_id: int,
+    normalized_url: str,
+) -> dict[str, Any]:
+    now = _now()
+    await db.execute(
+        """INSERT INTO shared_market_group_urls
+           (shared_group_id, normalized_url, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(normalized_url) DO UPDATE SET
+              shared_group_id=excluded.shared_group_id,
+              updated_at=excluded.updated_at""",
+        (shared_group_id, normalized_url, now, now),
+    )
+    await db.commit()
+    row = await (await db.execute(
+        "SELECT * FROM shared_market_group_urls WHERE normalized_url=?",
+        (normalized_url,),
+    )).fetchone()
+    return _row_to_dict(row)  # type: ignore
+
+
 async def shared_market_uncovered_url_touch(
     db: aiosqlite.Connection,
     *,
@@ -1689,21 +1917,37 @@ async def shared_market_uncovered_url_touch(
     sample_raw_url: str | None = None,
     last_account_id: int | None = None,
     last_platform_type: str | None = None,
+    platform_type: str | None = None,
     seen_at: str | None = None,
+    failure_reason: str | None = None,
 ) -> dict[str, Any]:
+    resolved_platform_type = platform_type or last_platform_type
     at = seen_at or _now()
     await db.execute(
         """INSERT INTO shared_market_uncovered_urls
-           (normalized_url, first_seen_at, last_seen_at, hit_count,
-            last_account_id, last_platform_type, sample_raw_url)
-           VALUES (?, ?, ?, 1, ?, ?, ?)
-           ON CONFLICT(normalized_url) DO UPDATE SET
-               last_seen_at=excluded.last_seen_at,
-               hit_count=shared_market_uncovered_urls.hit_count + 1,
-               last_account_id=COALESCE(excluded.last_account_id, shared_market_uncovered_urls.last_account_id),
-               last_platform_type=COALESCE(excluded.last_platform_type, shared_market_uncovered_urls.last_platform_type),
-               sample_raw_url=COALESCE(excluded.sample_raw_url, shared_market_uncovered_urls.sample_raw_url)""",
-        (normalized_url, at, at, last_account_id, last_platform_type, sample_raw_url),
+           (normalized_url, first_seen_at, last_seen_at, hit_count, sample_raw_url,
+            last_account_id, last_platform_type, detection_status, status, detection_error, failure_reason)
+           VALUES (?, ?, ?, 1, ?, ?, ?, 'pending', 'pending', ?, ?)
+            ON CONFLICT(normalized_url) DO UPDATE SET
+                last_seen_at=excluded.last_seen_at,
+                hit_count=shared_market_uncovered_urls.hit_count + 1,
+                last_account_id=COALESCE(excluded.last_account_id, shared_market_uncovered_urls.last_account_id),
+                last_platform_type=COALESCE(excluded.last_platform_type, shared_market_uncovered_urls.last_platform_type),
+                sample_raw_url=COALESCE(excluded.sample_raw_url, shared_market_uncovered_urls.sample_raw_url),
+                detection_error=COALESCE(excluded.detection_error, shared_market_uncovered_urls.detection_error),
+                failure_reason=COALESCE(excluded.failure_reason, shared_market_uncovered_urls.failure_reason),
+                status='pending',
+                detection_status='pending'""",
+        (
+            normalized_url,
+            at,
+            at,
+            sample_raw_url,
+            last_account_id,
+            resolved_platform_type,
+            failure_reason,
+            failure_reason,
+        ),
     )
     await db.commit()
     row = await (await db.execute(
@@ -1712,6 +1956,251 @@ async def shared_market_uncovered_url_touch(
     )).fetchone()
     return _row_to_dict(row)  # type: ignore
 
+
+async def shared_market_uncovered_url_list(
+    db: aiosqlite.Connection,
+    *,
+    status: str = "pending",
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    where_clause = ""
+    params: list[Any] = []
+    if status:
+        where_clause = "WHERE (u.detection_status=? OR u.status=?)"
+        params.append(status)
+        params.append(status)
+    count_row = await (await db.execute(
+        f"SELECT COUNT(*) as cnt FROM shared_market_uncovered_urls u {where_clause}",
+        tuple(params),
+    )).fetchone()
+    total = count_row["cnt"] if count_row else 0
+
+    offset = (page - 1) * page_size
+    rows = await (await db.execute(
+        f"""
+        SELECT u.*,
+               g.group_key
+        FROM shared_market_uncovered_urls u
+        LEFT JOIN shared_market_groups g ON g.id = u.shared_group_id
+        {where_clause}
+        ORDER BY u.last_seen_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (*params, page_size, offset),
+    )).fetchall()
+    return _rows_to_list(rows), total
+
+
+async def shared_market_uncovered_url_list_pending(
+    db: aiosqlite.Connection,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    return await shared_market_uncovered_url_list(
+        db,
+        status="pending",
+        page=page,
+        page_size=page_size,
+    )
+
+
+async def shared_market_uncovered_url_get(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+) -> dict[str, Any] | None:
+    row = await (await db.execute(
+        "SELECT * FROM shared_market_uncovered_urls WHERE id=?",
+        (row_id,),
+    )).fetchone()
+    return _row_to_dict(row)
+
+
+async def shared_market_uncovered_url_set_status(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+    status: str,
+    failure_reason: str | None = None,
+    reviewed_at: str | None = None,
+) -> dict[str, Any] | None:
+    at = _now() if reviewed_at is None else reviewed_at
+    await db.execute(
+        """UPDATE shared_market_uncovered_urls
+           SET status=?, detection_status=?, review_status=?,
+               failure_reason=?, detection_error=?,
+               reviewed_at=?, last_checked_at=?
+          WHERE id=?""",
+        (
+            status,
+            status,
+            status,
+            failure_reason,
+            failure_reason,
+            at,
+            at,
+            row_id,
+        ),
+    )
+    await db.commit()
+    return await shared_market_uncovered_url_get(db, row_id=row_id)
+
+
+async def shared_market_uncovered_url_mark_detecting(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+    checked_at: str | None = None,
+) -> dict[str, Any] | None:
+    at = checked_at or _now()
+    await db.execute(
+        """UPDATE shared_market_uncovered_urls
+           SET detection_status='detecting',
+               status='detecting',
+               reviewed_at=?,
+               last_checked_at=?
+         WHERE id=?""",
+        (at, at, row_id),
+    )
+    await db.commit()
+    return await shared_market_uncovered_url_get(db, row_id=row_id)
+
+
+async def shared_market_uncovered_url_mark_matched(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+    shared_group_id: int,
+    reviewed_at: str | None = None,
+) -> dict[str, Any] | None:
+    at = reviewed_at or _now()
+    row = await shared_market_uncovered_url_get(db, row_id=row_id)
+    if row is None:
+        return None
+
+    await db.execute(
+        """UPDATE shared_market_uncovered_urls
+           SET detection_status='matched',
+               status='matched',
+               review_status='matched',
+               matched_shared_group_id=?,
+               shared_group_id=?,
+               reviewed_at=?,
+               last_checked_at=?,
+               detection_error=NULL,
+               failure_reason=NULL
+         WHERE id=?""",
+        (shared_group_id, shared_group_id, at, at, row_id),
+    )
+    await db.commit()
+    normalized_url = row.get("normalized_url")
+    if normalized_url:
+        await shared_market_group_url_add(
+            db,
+            shared_group_id=shared_group_id,
+            normalized_url=str(normalized_url),
+        )
+    return await shared_market_uncovered_url_get(db, row_id=row_id)
+
+
+async def shared_market_uncovered_url_mark_review_required(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+    review_status: str = "review_required",
+    failure_reason: str | None = None,
+    checked_at: str | None = None,
+) -> dict[str, Any] | None:
+    at = checked_at or _now()
+    await db.execute(
+        """UPDATE shared_market_uncovered_urls
+           SET detection_status='review_required',
+               status='review_required',
+               review_status=?,
+               detection_error=?,
+               failure_reason=?,
+               reviewed_at=?,
+               last_checked_at=?
+         WHERE id=?""",
+        (review_status, failure_reason, failure_reason, at, at, row_id),
+    )
+    await db.commit()
+    return await shared_market_uncovered_url_get(db, row_id=row_id)
+
+
+async def shared_market_uncovered_url_bind_group(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+    shared_group_id: int | None,
+    failure_reason: str | None = None,
+) -> dict[str, Any] | None:
+    at = _now()
+    await db.execute(
+        """UPDATE shared_market_uncovered_urls
+           SET shared_group_id=?,
+               matched_shared_group_id=?,
+               status='pending',
+               detection_status='pending',
+               failure_reason=?,
+               reviewed_at=?,
+               last_checked_at=?
+          WHERE id=?""",
+        (shared_group_id, shared_group_id, failure_reason, at, at, row_id),
+    )
+    await db.commit()
+    if shared_group_id is not None:
+        row = await shared_market_uncovered_url_get(db, row_id=row_id)
+        if row is not None:
+            normalized_url = row.get("normalized_url")
+            if normalized_url:
+                await shared_market_group_url_add(
+                    db,
+                    shared_group_id=shared_group_id,
+                    normalized_url=str(normalized_url),
+                )
+    return await shared_market_uncovered_url_get(db, row_id=row_id)
+
+
+async def shared_market_group_list(
+    db: aiosqlite.Connection,
+    *,
+    include_disabled: bool = False,
+) -> list[dict[str, Any]]:
+    sql = (
+        "SELECT g.id, g.group_key, g.enabled, g.collector_platform_type, "
+        "g.collector_account_name, g.collector_password_enc, "
+        "g.freshness_threshold_sec, "
+        "s.issue AS snapshot_issue, s.pre_issue AS snapshot_pre_issue, "
+        "s.open_result AS snapshot_open_result, s.source_status, "
+        "s.last_error, s.fetched_at AS snapshot_fetched_at, "
+        "s.updated_at AS snapshot_updated_at, "
+        "(SELECT u.normalized_url FROM shared_market_group_urls u "
+        " WHERE u.shared_group_id=g.id ORDER BY u.id LIMIT 1) AS primary_url "
+        "FROM shared_market_groups g "
+        "LEFT JOIN shared_market_snapshots s ON s.shared_group_id=g.id"
+    )
+    if not include_disabled:
+        sql += " WHERE g.enabled=1"
+    rows = await (await db.execute(sql)).fetchall()
+    return _rows_to_list(rows)
+
+
+async def shared_market_group_get(
+    db: aiosqlite.Connection,
+    *,
+    shared_group_id: int,
+) -> dict[str, Any] | None:
+    row = await (await db.execute(
+        "SELECT g.*, "
+        "(SELECT u.normalized_url FROM shared_market_group_urls u "
+        " WHERE u.shared_group_id=g.id ORDER BY u.id LIMIT 1) AS primary_url "
+        "FROM shared_market_groups g WHERE g.id=?",
+        (shared_group_id,),
+    )).fetchone()
+    return _row_to_dict(row)
 
 async def simulation_bet_order_create(
     db: aiosqlite.Connection,

@@ -52,7 +52,7 @@ class JNDAdapter(PlatformAdapter):
             base_url = cfg.get("base_url", "")
             lottery_type = cfg.get("lottery_type", platform_type)
         self.base_url = (base_url or "").rstrip("/")
-        self.lottery_type = lottery_type or "JND28WEB"
+        self.lottery_type = lottery_type or platform_type or "JND28WEB"
         self._session = session
         self._token: Optional[str] = None
 

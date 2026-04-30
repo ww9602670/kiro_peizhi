@@ -8,11 +8,17 @@ PUT    /admin/operators/{id}/status  /
 from __future__ import annotations
 
 import json
+from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.dependencies import get_db_conn, require_admin
 from app.models.db_ops import (
+    account_get_by_id,
+    account_list_by_operator,
+    account_strategy_permission_map_for_operator,
+    account_strategy_permission_set,
     audit_log_create,
     operator_create,
     operator_get_by_id,
@@ -21,6 +27,12 @@ from app.models.db_ops import (
     operator_list_paged,
     operator_update,
     operator_update_status,
+    shared_market_group_get,
+    shared_market_group_list,
+    shared_market_uncovered_url_bind_group,
+    shared_market_uncovered_url_get,
+    shared_market_uncovered_url_list,
+    shared_market_uncovered_url_set_status,
     strategy_list_by_operator,
 )
 from app.schemas.common import ApiResponse, PagedData
@@ -32,6 +44,13 @@ from app.schemas.operator import (
     OperatorInfo,
     OperatorUpdate,
     StatusUpdate,
+)
+from app.schemas.strategy import (
+    AccountStrategyPermissionInfo,
+    SharedMarketGroupInfo,
+    SharedMarketUncoveredJoinGroupRequest,
+    SharedMarketUncoveredUrlInfo,
+    StrategyPermissionUpdate,
 )
 from app.utils.response import BizError
 
@@ -188,6 +207,98 @@ async def update_operator_status(
     return ApiResponse[OperatorInfo](data=_to_operator_info(row))
 
 
+def _to_account_strategy_permission_info(
+    *,
+    operator_id: int,
+    account: dict,
+    allowed_strategy_types: list[str],
+) -> AccountStrategyPermissionInfo:
+    return AccountStrategyPermissionInfo(
+        operator_id=operator_id,
+        account_id=account["id"],
+        account_name=account["account_name"],
+        game_type=account["game_type"],
+        allowed_strategy_types=allowed_strategy_types,
+    )
+
+
+@router.get("/admin/operators/{operator_id}/strategy-permissions")
+async def list_operator_strategy_permissions(
+    operator_id: int,
+    admin: dict = Depends(require_admin),
+    db=Depends(get_db_conn),
+):
+    existing = await operator_get_by_id(db, operator_id=operator_id)
+    if not existing:
+        raise BizError(4001, "operator not found", status_code=404)
+
+    accounts = await account_list_by_operator(db, operator_id=operator_id)
+    permission_map = await account_strategy_permission_map_for_operator(
+        db,
+        operator_id=operator_id,
+    )
+    return ApiResponse[list[AccountStrategyPermissionInfo]](
+        data=[
+            _to_account_strategy_permission_info(
+                operator_id=operator_id,
+                account=account,
+                allowed_strategy_types=permission_map.get(account["id"], []),
+            )
+            for account in accounts
+        ]
+    )
+
+
+@router.put("/admin/operators/{operator_id}/accounts/{account_id}/strategy-permissions")
+async def update_account_strategy_permissions(
+    operator_id: int,
+    account_id: int,
+    body: StrategyPermissionUpdate,
+    request: Request,
+    admin: dict = Depends(require_admin),
+    db=Depends(get_db_conn),
+):
+    existing = await operator_get_by_id(db, operator_id=operator_id)
+    if not existing:
+        raise BizError(4001, "operator not found", status_code=404)
+
+    allowed_strategy_types = await account_strategy_permission_set(
+        db,
+        operator_id=operator_id,
+        account_id=account_id,
+        strategy_types=list(body.strategy_types),
+        created_by=admin["id"],
+    )
+    if allowed_strategy_types is None:
+        raise BizError(4001, "account not found", status_code=404)
+
+    account = await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
+    if not account:
+        raise BizError(4001, "account not found", status_code=404)
+
+    await audit_log_create(
+        db,
+        operator_id=admin["id"],
+        action="update_account_strategy_permissions",
+        target_type="account",
+        target_id=account_id,
+        detail=json.dumps(
+            {
+                "operator_id": operator_id,
+                "strategy_types": allowed_strategy_types,
+            }
+        ),
+        ip_address=_get_client_ip(request),
+    )
+    return ApiResponse[AccountStrategyPermissionInfo](
+        data=_to_account_strategy_permission_info(
+            operator_id=operator_id,
+            account=account,
+            allowed_strategy_types=allowed_strategy_types,
+        )
+    )
+
+
 @router.post("/admin/kill-switch")
 async def global_kill_switch(
     body: GlobalKillSwitchRequest,
@@ -261,3 +372,189 @@ async def admin_dashboard(
         operator_summaries=summaries,
     )
     return ApiResponse[AdminDashboard](data=dashboard)
+
+
+def _to_shared_market_uncovered_info(row: dict[str, Any]) -> SharedMarketUncoveredUrlInfo:
+    return SharedMarketUncoveredUrlInfo(
+        id=row["id"],
+        normalized_url=row["normalized_url"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        hit_count=row["hit_count"],
+        detection_status=row.get("detection_status") or "pending",
+        last_account_id=row.get("last_account_id"),
+        last_platform_type=row.get("last_platform_type"),
+        sample_raw_url=row.get("sample_raw_url"),
+        status=row.get("status") or "pending",
+        failure_reason=row.get("failure_reason"),
+        shared_group_id=row.get("shared_group_id"),
+        shared_group_key=row.get("group_key"),
+    )
+
+
+@router.get("/admin/shared-market-groups")
+async def list_shared_market_groups(
+    include_disabled: bool = False,
+    admin: dict = Depends(require_admin),
+    db=Depends(get_db_conn),
+):
+    groups = await shared_market_group_list(
+        db,
+        include_disabled=include_disabled,
+    )
+    return ApiResponse[list[SharedMarketGroupInfo]](
+        data=[
+            SharedMarketGroupInfo(
+                id=row["id"],
+                group_key=row["group_key"],
+                enabled=row["enabled"],
+                collector_platform_type=row.get("collector_platform_type"),
+                collector_account_name=row.get("collector_account_name"),
+                primary_url=row.get("primary_url"),
+                source_status=row.get("source_status"),
+                last_error=row.get("last_error"),
+                snapshot_issue=row.get("snapshot_issue"),
+                snapshot_pre_issue=row.get("snapshot_pre_issue"),
+                snapshot_open_result=row.get("snapshot_open_result"),
+                snapshot_fetched_at=row.get("snapshot_fetched_at"),
+                snapshot_updated_at=row.get("snapshot_updated_at"),
+            )
+            for row in groups
+        ]
+    )
+
+
+@router.get("/admin/shared-market-uncovered-urls")
+async def list_shared_market_uncovered_urls(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    status: str = Query(default="pending"),
+    admin: dict = Depends(require_admin),
+    db=Depends(get_db_conn),
+):
+    items, total = await shared_market_uncovered_url_list(
+        db,
+        status=status,
+        page=page,
+        page_size=page_size,
+    )
+    paged = PagedData[SharedMarketUncoveredUrlInfo](
+        items=[_to_shared_market_uncovered_info(item) for item in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+    return ApiResponse[PagedData[SharedMarketUncoveredUrlInfo]](data=paged)
+
+
+@router.post("/admin/shared-market-uncovered-urls/{record_id}/ignore")
+async def ignore_shared_market_uncovered_url(
+    record_id: int,
+    request: Request,
+    admin: dict = Depends(require_admin),
+    db=Depends(get_db_conn),
+):
+    row = await shared_market_uncovered_url_get(db, row_id=record_id)
+    if row is None:
+        raise BizError(4001, "record not found", status_code=404)
+    review = await shared_market_uncovered_url_set_status(
+        db,
+        row_id=record_id,
+        status="ignored",
+        reviewed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        failure_reason="管理员手动忽略",
+    )
+    if review is None:
+        raise BizError(4001, "record not found", status_code=404)
+
+    await audit_log_create(
+        db,
+        operator_id=admin["id"],
+        action="ignore_shared_market_uncovered_url",
+        target_type="shared_market_uncovered_url",
+        target_id=record_id,
+        detail='{"status":"ignored"}',
+        ip_address=_get_client_ip(request),
+    )
+    return ApiResponse[SharedMarketUncoveredUrlInfo](
+        data=_to_shared_market_uncovered_info(review)
+    )
+
+
+@router.post("/admin/shared-market-uncovered-urls/{record_id}/recheck")
+async def recheck_shared_market_uncovered_url(
+    record_id: int,
+    request: Request,
+    admin: dict = Depends(require_admin),
+    db=Depends(get_db_conn),
+):
+    row = await shared_market_uncovered_url_get(db, row_id=record_id)
+    if row is None:
+        raise BizError(4001, "record not found", status_code=404)
+
+    review = await shared_market_uncovered_url_set_status(
+        db,
+        row_id=record_id,
+        status="pending",
+        reviewed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        failure_reason="管理员已重新检测",
+    )
+    if review is None:
+        raise BizError(4001, "record not found", status_code=404)
+
+    await audit_log_create(
+        db,
+        operator_id=admin["id"],
+        action="recheck_shared_market_uncovered_url",
+        target_type="shared_market_uncovered_url",
+        target_id=record_id,
+        detail='{"status":"pending"}',
+        ip_address=_get_client_ip(request),
+    )
+    return ApiResponse[SharedMarketUncoveredUrlInfo](
+        data=_to_shared_market_uncovered_info(review)
+    )
+
+
+@router.post("/admin/shared-market-uncovered-urls/{record_id}/join-shared-group")
+async def join_shared_market_uncovered_url(
+    record_id: int,
+    request: Request,
+    body: SharedMarketUncoveredJoinGroupRequest,
+    admin: dict = Depends(require_admin),
+    db=Depends(get_db_conn),
+):
+    row = await shared_market_uncovered_url_get(db, row_id=record_id)
+    if row is None:
+        raise BizError(4001, "record not found", status_code=404)
+
+    group = await shared_market_group_get(db, shared_group_id=body.shared_group_id)
+    if group is None:
+        raise BizError(4002, "shared group not found", status_code=404)
+
+    if group.get("enabled", 1) == 0:
+        raise BizError(4002, "shared group is disabled", status_code=400)
+
+    review = await shared_market_uncovered_url_bind_group(
+        db,
+        row_id=record_id,
+        shared_group_id=body.shared_group_id,
+        failure_reason="已加入共享组，待共享运行中自动重检",
+    )
+    if review is None:
+        raise BizError(4001, "record not found", status_code=404)
+
+    await audit_log_create(
+        db,
+        operator_id=admin["id"],
+        action="join_shared_market_uncovered_url_group",
+        target_type="shared_market_uncovered_url",
+        target_id=record_id,
+        detail=json.dumps(
+            {"shared_group_id": body.shared_group_id, "normalized_url": row["normalized_url"]}
+        ),
+        ip_address=_get_client_ip(request),
+    )
+    return ApiResponse[SharedMarketUncoveredUrlInfo](
+        data=_to_shared_market_uncovered_info(review)
+    )

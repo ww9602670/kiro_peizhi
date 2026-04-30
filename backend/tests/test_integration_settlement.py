@@ -33,6 +33,8 @@ from app.models.db_ops import (
     bet_order_get_by_id,
     bet_order_update_status,
     operator_create,
+    simulation_bet_order_create,
+    simulation_bet_order_update,
     strategy_create,
     strategy_get_by_id,
 )
@@ -88,6 +90,43 @@ async def _create_order(db, setup, *, issue="20240101001", key_code="DX1",
                         simulation=0, idempotent_id=None):
     """创建订单并推进到指定状态"""
     idem = idempotent_id or f"{issue}-{setup['strategy']['id']}-{key_code}-sim{simulation}-{amount}"
+    if simulation:
+        order = await simulation_bet_order_create(
+            db,
+            idempotent_id=idem,
+            operator_id=setup["operator"]["id"],
+            account_id=setup["account"]["id"],
+            strategy_id=setup["strategy"]["id"],
+            issue=issue,
+            platform_type="JND28WEB",
+            key_code=key_code,
+            amount=amount,
+            odds=odds,
+            status="pending",
+        )
+        if status == "bet_success":
+            await simulation_bet_order_update(
+                db, order_id=order["id"],
+                operator_id=setup["operator"]["id"],
+                status="bet_success",
+            )
+        elif status in {"settle_timeout", "settle_failed"}:
+            await simulation_bet_order_update(
+                db, order_id=order["id"],
+                operator_id=setup["operator"]["id"],
+                status="bet_success",
+            )
+            await simulation_bet_order_update(
+                db, order_id=order["id"],
+                operator_id=setup["operator"]["id"],
+                status=status,
+            )
+        return await bet_order_get_by_id(
+            db, order_id=order["id"],
+            operator_id=setup["operator"]["id"],
+            ledger="simulation",
+        )
+
     order = await bet_order_create(
         db,
         idempotent_id=idem,
@@ -216,9 +255,10 @@ class TestEndToEndSettlement:
         assert real["pnl"] == 980
 
         # 6. 验证模拟订单
-        sim = await bet_order_get_by_id(db, order_id=sim_order["id"], operator_id=op_id)
+        sim = await bet_order_get_by_id(
+            db, order_id=sim_order["id"], operator_id=op_id, ledger="simulation"
+        )
         assert sim["status"] == "settled"
-        assert sim["match_source"] == "local"
         assert sim["is_win"] == 1
         # pnl = 500 * 19800 // 10000 - 500 = 990 - 500 = 490
         assert sim["pnl"] == 490
@@ -342,9 +382,10 @@ class TestMixedModeSettlement:
         assert settle_call_order == ["simulated", "real"]
 
         # 验证模拟订单结果
-        sim = await bet_order_get_by_id(db, order_id=sim_order["id"], operator_id=op_id)
+        sim = await bet_order_get_by_id(
+            db, order_id=sim_order["id"], operator_id=op_id, ledger="simulation"
+        )
         assert sim["status"] == "settled"
-        assert sim["match_source"] == "local"
 
         # 验证真实订单结果
         real = await bet_order_get_by_id(db, order_id=real_order["id"], operator_id=op_id)
@@ -395,9 +436,10 @@ class TestMixedModeSettlement:
         assert real["is_win"] == 1
 
         # 模拟订单不中奖（DX2=小，sum=15 是大）
-        sim = await bet_order_get_by_id(db, order_id=sim_small["id"], operator_id=op_id)
+        sim = await bet_order_get_by_id(
+            db, order_id=sim_small["id"], operator_id=op_id, ledger="simulation"
+        )
         assert sim["status"] == "settled"
-        assert sim["match_source"] == "local"
         assert sim["is_win"] == 0
         assert sim["pnl"] == -500
 
@@ -698,10 +740,10 @@ class TestLockRaceCondition:
 
         # 模拟 A 卡顿超过 TTL（5 分钟）：直接修改 DB 中的 lock_ts 为 6 分钟前
         await db.execute(
-            "UPDATE gambling_accounts "
+            "UPDATE account_platform_sessions "
             "SET worker_lock_ts=datetime('now', '-6 minutes') "
-            "WHERE id=?",
-            (acc_id,),
+            "WHERE account_id=? AND platform_type=?",
+            (acc_id, "JND28WEB"),
         )
         await db.commit()
 
@@ -763,10 +805,10 @@ class TestLockRaceCondition:
 
         # 模拟超时
         await db.execute(
-            "UPDATE gambling_accounts "
+            "UPDATE account_platform_sessions "
             "SET worker_lock_ts=datetime('now', '-6 minutes') "
-            "WHERE id=?",
-            (acc_id,),
+            "WHERE account_id=? AND platform_type=?",
+            (acc_id, "JND28WEB"),
         )
         await db.commit()
 
@@ -788,8 +830,9 @@ class TestLockRaceCondition:
         # B 的锁不受影响
         row = await (
             await db.execute(
-                "SELECT worker_lock_token FROM gambling_accounts WHERE id=?",
-                (acc_id,),
+                "SELECT worker_lock_token FROM account_platform_sessions "
+                "WHERE account_id=? AND platform_type=?",
+                (acc_id, "JND28WEB"),
             )
         ).fetchone()
         assert row["worker_lock_token"] == token_b
@@ -815,10 +858,10 @@ class TestLockRaceCondition:
 
         # 模拟超时
         await db.execute(
-            "UPDATE gambling_accounts "
+            "UPDATE account_platform_sessions "
             "SET worker_lock_ts=datetime('now', '-6 minutes') "
-            "WHERE id=?",
-            (acc_id,),
+            "WHERE account_id=? AND platform_type=?",
+            (acc_id, "JND28WEB"),
         )
         await db.commit()
 
@@ -848,8 +891,9 @@ class TestLockRaceCondition:
         await worker_b._release_lock()
         row = await (
             await db.execute(
-                "SELECT worker_lock_token FROM gambling_accounts WHERE id=?",
-                (acc_id,),
+                "SELECT worker_lock_token FROM account_platform_sessions "
+                "WHERE account_id=? AND platform_type=?",
+                (acc_id, "JND28WEB"),
             )
         ).fetchone()
         assert row["worker_lock_token"] is None

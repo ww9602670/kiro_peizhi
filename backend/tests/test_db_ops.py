@@ -19,19 +19,27 @@ from app.models.db_ops import (
     # strategies
     strategy_create, strategy_get_by_id, strategy_list_by_operator,
     strategy_update, strategy_delete, strategy_update_status, strategy_update_pnl,
+    strategy_running_exists_for_account_platform,
     # bet_orders
     bet_order_create, bet_order_get_by_id, bet_order_list_by_operator,
     bet_order_update_status,
+    simulation_bet_order_create,
     # alerts
     alert_create, alert_list_by_operator, alert_mark_read,
     alert_mark_all_read, alert_get_unread_count,
+    odds_list_by_account,
     # audit_logs
     audit_log_create, audit_log_list_by_operator,
     # lottery_results
     lottery_result_get_by_issue, lottery_result_list_recent, lottery_result_save,
     # reconcile_records
     reconcile_record_create, reconcile_record_list_by_account,
+    # shared_market
+    shared_market_group_url_exists,
+    shared_market_uncovered_url_mark_matched,
+    shared_market_uncovered_url_touch,
 )
+from app.api.accounts import _sync_odds
 
 
 @pytest.fixture
@@ -141,6 +149,80 @@ class TestAccountsCRUD:
         deleted = await account_delete(db, account_id=acc["id"], operator_id=op_a["id"])
         assert deleted is True
         assert await account_get_by_id(db, account_id=acc["id"], operator_id=op_a["id"]) is None
+        assert await account_list_by_operator(db, operator_id=op_a["id"]) == []
+
+    async def test_delete_preserves_simulation_history_and_allows_rebind(self, db, two_operators):
+        op_a, _ = two_operators
+        acc = await account_create(
+            db, operator_id=op_a["id"], account_name="softdel", password="p", platform_type="JND28WEB"
+        )
+        strat = await strategy_create(
+            db,
+            operator_id=op_a["id"],
+            account_id=acc["id"],
+            name="sim-history",
+            type="flat",
+            play_code="DX1",
+            base_amount=100,
+            simulation=1,
+        )
+        await simulation_bet_order_create(
+            db,
+            idempotent_id="softdel-sim-1",
+            operator_id=op_a["id"],
+            account_id=acc["id"],
+            strategy_id=strat["id"],
+            issue="001",
+            platform_type="JND28WEB",
+            key_code="DX1",
+            amount=100,
+        )
+
+        assert await account_delete(db, account_id=acc["id"], operator_id=op_a["id"])
+        deleted_strategy = await strategy_get_by_id(db, strategy_id=strat["id"], operator_id=op_a["id"])
+        assert deleted_strategy is not None
+        assert deleted_strategy["status"] == "deleted"
+
+        items, total = await bet_order_list_by_operator(
+            db,
+            operator_id=op_a["id"],
+            strategy_id=strat["id"],
+            ledger="simulation",
+        )
+        assert total == 1
+        assert items[0]["account_name"] == "softdel"
+        assert items[0]["strategy_name"] == "sim-history"
+
+        rebound = await account_create(
+            db, operator_id=op_a["id"], account_name="softdel", password="new", platform_type="JND28WEB"
+        )
+        assert rebound["id"] != acc["id"]
+
+    async def test_delete_rejects_running_strategy(self, db, two_operators):
+        op_a, _ = two_operators
+        acc = await account_create(
+            db, operator_id=op_a["id"], account_name="running", password="p", platform_type="JND28WEB"
+        )
+        strat = await strategy_create(
+            db,
+            operator_id=op_a["id"],
+            account_id=acc["id"],
+            name="running-strategy",
+            type="flat",
+            play_code="DX1",
+            base_amount=100,
+        )
+        await strategy_update_status(
+            db,
+            strategy_id=strat["id"],
+            operator_id=op_a["id"],
+            status="running",
+        )
+
+        with pytest.raises(ValueError, match="account has running strategies"):
+            await account_delete(db, account_id=acc["id"], operator_id=op_a["id"])
+
+        assert await account_get_by_id(db, account_id=acc["id"], operator_id=op_a["id"]) is not None
 
     async def test_get_by_id_wrong_operator(self, db, two_operators):
         """operator_id  None"""
@@ -192,6 +274,44 @@ class TestStrategiesCRUD:
 
         deleted = await strategy_delete(db, strategy_id=strat["id"], operator_id=op_a["id"])
         assert deleted is True
+        assert await strategy_list_by_operator(db, operator_id=op_a["id"]) == []
+        deleted_row = await strategy_get_by_id(db, strategy_id=strat["id"], operator_id=op_a["id"])
+        assert deleted_row is not None
+        assert deleted_row["status"] == "deleted"
+        assert deleted_row["deleted_at"] is not None
+
+    async def test_delete_preserves_bet_orders(self, db, two_operators):
+        op_a, _ = two_operators
+        acc = await self._make_account(db, op_a["id"])
+        strat = await strategy_create(
+            db,
+            operator_id=op_a["id"],
+            account_id=acc["id"],
+            name="preserve",
+            type="flat",
+            play_code="DX1",
+            base_amount=100,
+        )
+        await bet_order_create(
+            db,
+            idempotent_id="preserve-1",
+            operator_id=op_a["id"],
+            account_id=acc["id"],
+            strategy_id=strat["id"],
+            issue="001",
+            key_code="DX1",
+            amount=100,
+        )
+
+        assert await strategy_delete(db, strategy_id=strat["id"], operator_id=op_a["id"])
+        items, total = await bet_order_list_by_operator(
+            db,
+            operator_id=op_a["id"],
+            strategy_id=strat["id"],
+        )
+
+        assert total == 1
+        assert items[0]["strategy_name"] == "preserve"
 
     async def test_update_status(self, db, two_operators):
         op_a, _ = two_operators
@@ -210,6 +330,122 @@ class TestStrategiesCRUD:
         )
         assert updated["daily_pnl"] == -5000
         assert updated["total_pnl"] == 10000
+
+
+async def test_running_strategy_platform_helper_filters_by_platform(db, two_operators):
+    op_a, _ = two_operators
+    acc = await account_create(
+        db,
+        operator_id=op_a["id"],
+        account_name="platform-filter",
+        password="p",
+        platform_type="JND28WEB",
+    )
+    strat = await strategy_create(
+        db,
+        operator_id=op_a["id"],
+        account_id=acc["id"],
+        name="running-2",
+        type="flat",
+        play_code="DX1",
+        base_amount=100,
+        platform_type="JND282",
+    )
+    await strategy_update_status(
+        db,
+        strategy_id=strat["id"],
+        operator_id=op_a["id"],
+        status="running",
+    )
+
+    assert await strategy_running_exists_for_account_platform(
+        db,
+        operator_id=op_a["id"],
+        account_id=acc["id"],
+        platform_type="JND282",
+    )
+    assert not await strategy_running_exists_for_account_platform(
+        db,
+        operator_id=op_a["id"],
+        account_id=acc["id"],
+        platform_type="JND28WEB",
+    )
+
+
+async def test_sync_odds_updates_without_alert_when_platform_has_no_running_strategy(db, two_operators):
+    op_a, _ = two_operators
+    acc = await account_create(
+        db,
+        operator_id=op_a["id"],
+        account_name="odds-no-alert",
+        password="p",
+        platform_type="JND28WEB",
+    )
+    strat = await strategy_create(
+        db,
+        operator_id=op_a["id"],
+        account_id=acc["id"],
+        name="running-2",
+        type="flat",
+        play_code="DX1",
+        base_amount=100,
+        platform_type="JND282",
+    )
+    await strategy_update_status(
+        db,
+        strategy_id=strat["id"],
+        operator_id=op_a["id"],
+        status="running",
+    )
+
+    await _sync_odds(db, acc["id"], op_a["id"], "JND28WEB", {"DX1": 1950})
+    await _sync_odds(db, acc["id"], op_a["id"], "JND28WEB", {"DX1": 1960})
+
+    odds = await odds_list_by_account(
+        db,
+        account_id=acc["id"],
+        platform_type="JND28WEB",
+    )
+    alerts, total = await alert_list_by_operator(db, operator_id=op_a["id"])
+    assert {row["key_code"]: row["odds_value"] for row in odds} == {"DX1": 1960}
+    assert total == 0
+    assert alerts == []
+
+
+async def test_sync_odds_alerts_only_when_running_strategy_platform_matches(db, two_operators):
+    op_a, _ = two_operators
+    acc = await account_create(
+        db,
+        operator_id=op_a["id"],
+        account_name="odds-alert",
+        password="p",
+        platform_type="JND28WEB",
+    )
+    strat = await strategy_create(
+        db,
+        operator_id=op_a["id"],
+        account_id=acc["id"],
+        name="running-web",
+        type="flat",
+        play_code="DX1",
+        base_amount=100,
+        platform_type="JND28WEB",
+    )
+    await strategy_update_status(
+        db,
+        strategy_id=strat["id"],
+        operator_id=op_a["id"],
+        status="running",
+    )
+
+    await _sync_odds(db, acc["id"], op_a["id"], "JND28WEB", {"DX1": 1950})
+    await _sync_odds(db, acc["id"], op_a["id"], "JND28WEB", {"DX1": 1960})
+
+    alerts, total = await alert_list_by_operator(db, operator_id=op_a["id"])
+    assert total == 1
+    assert alerts[0]["type"] == "odds_changed"
+    assert alerts[0]["title"] == f"赔率变动：账号 {acc['id']}，平台 JND28WEB"
+    assert "DX1: 1950 -> 1960" in alerts[0]["detail"]
 
 
 # 
@@ -569,6 +805,69 @@ class TestDataIsolation:
             db, account_id=acc_a["id"], operator_id=op_b["id"],
         )
         assert total == 0
+
+
+class TestSharedMarketUncoveredUrls:
+    async def test_touch_accepts_platform_type_and_keeps_last_platform_type(self, db):
+        first = await shared_market_uncovered_url_touch(
+            db,
+            normalized_url="https://shared-market.test/route",
+            sample_raw_url="https://shared-market.test/route?a=1",
+            platform_type="JND28WEB",
+            seen_at="2026-04-30 10:00:00",
+        )
+        assert first["last_platform_type"] == "JND28WEB"
+        assert first["hit_count"] == 1
+
+        second = await shared_market_uncovered_url_touch(
+            db,
+            normalized_url="https://shared-market.test/route",
+            sample_raw_url="https://shared-market.test/route?a=2",
+            platform_type="JND282",
+            seen_at="2026-04-30 10:05:00",
+            last_account_id=22,
+        )
+        assert second["last_platform_type"] == "JND282"
+        assert second["last_account_id"] == 22
+        assert second["hit_count"] == 2
+
+    async def test_mark_matched_writes_group_url(self, db):
+        now = "2026-04-30 10:10:00"
+        cursor = await db.execute(
+            """INSERT INTO shared_market_groups
+               (group_key, enabled, collector_platform_type, collector_account_name,
+                collector_password_enc, freshness_threshold_sec, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("gm-test-group", 1, "JND28WEB", "collector", "xxx", 30, now, now),
+        )
+        group_id = int(cursor.lastrowid)
+        await db.commit()
+
+        row = await shared_market_uncovered_url_touch(
+            db,
+            normalized_url="https://shared-market.test/new",
+            sample_raw_url="https://shared-market.test/new?a=1",
+            platform_type="JND28WEB",
+            seen_at=now,
+        )
+
+        updated = await shared_market_uncovered_url_mark_matched(
+            db,
+            row_id=row["id"],
+            shared_group_id=group_id,
+            reviewed_at=now,
+        )
+        assert updated is not None
+        assert updated["detection_status"] == "matched"
+        assert updated["status"] == "matched"
+        assert updated["matched_shared_group_id"] == group_id
+
+        group_row = await shared_market_group_url_exists(
+            db,
+            normalized_url="https://shared-market.test/new",
+        )
+        assert group_row is not None
+        assert group_row["shared_group_id"] == group_id
 
 
 # 
