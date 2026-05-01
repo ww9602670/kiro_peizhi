@@ -178,6 +178,11 @@ def test_normalize_market_url_keeps_origin_and_path():
     assert normalized == "https://example.com:443/abc/def"
 
 
+def test_normalize_market_url_rejects_invalid_scheme():
+    assert normalize_market_url("hhtps://example.com") == ""
+    assert normalize_market_url("ftp://example.com") == ""
+
+
 def test_shared_collector_default_interval_and_freshness_are_aligned():
     assert DEFAULT_COLLECTOR_INTERVAL_SECONDS == 25.0
     assert DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS > DEFAULT_COLLECTOR_INTERVAL_SECONDS

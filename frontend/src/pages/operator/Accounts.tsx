@@ -53,6 +53,15 @@ const TOAST_MERGE_WINDOW_MS = 1500;
 const RELOGIN_HINTS = ['session', 'worker', 'login', 'relogin', 'auth', 'expired', '未登录', '重新登录', '登录失效', '验证'];
 const ODDS_HINTS = ['odds', '赔率', '未确认', 'unconfirmed', 'confirm'];
 
+function isValidPlatformUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value.trim());
+    return ['http:', 'https:'].includes(parsed.protocol) && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function normalizeOperatorMessage(rawMessage: string | null | undefined, fallback: string): string {
   const text = typeof rawMessage === 'string' ? rawMessage.trim() : '';
   if (!text) return fallback;
@@ -300,13 +309,19 @@ export default function Accounts({ onCreateStrategy }: AccountsProps) {
       return;
     }
 
+    const platformUrl = formPlatformUrl.trim();
+    if (!isValidPlatformUrl(platformUrl)) {
+      setFormError('平台地址格式错误，请使用 http:// 或 https:// 开头的完整网址');
+      return;
+    }
+
     setFormLoading(true);
     try {
       const data: AccountCreate = {
         account_name: formName.trim(),
         password: formPassword,
         game_type: formGameType,
-        platform_url: formPlatformUrl.trim(),
+        platform_url: platformUrl,
       };
       await createAccount(data);
       // Reset form & refresh list

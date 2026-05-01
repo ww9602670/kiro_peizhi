@@ -221,6 +221,27 @@ async def test_bind_jnd_account_requires_platform_url(client):
 
 
 @pytest.mark.asyncio
+async def test_bind_account_rejects_invalid_platform_url_scheme(client):
+    """账号绑定阶段拒绝错误协议，避免脏网址进入共享审核。"""
+    uid = _uid()
+    token, _ = await _create_operator(f"bad_url_{uid}", max_accounts=3)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"bad_url_{uid}",
+            "password": "testpass123",
+            "game_type": "JND28",
+            "platform_url": "hhtps://shared.example.com",
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_bind_account_duplicate(client):
     """ 409"""
     uid = _uid()

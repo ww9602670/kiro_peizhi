@@ -209,6 +209,49 @@ async def test_admin_join_shared_market_uncovered_to_group(client, admin_headers
     join_body = join_resp.json()
     assert join_body["code"] == 0
     assert join_body["data"]["shared_group_id"] == group_id
+    assert join_body["data"]["status"] == "matched"
+    assert join_body["data"]["detection_status"] == "matched"
+
+
+@pytest.mark.asyncio
+async def test_admin_join_shared_market_rejects_invalid_url(client, admin_headers):
+    """非法网址不能被手动加入共享组"""
+    db = await get_shared_db()
+    from app.models.db_ops import shared_market_uncovered_url_touch
+
+    row = await shared_market_uncovered_url_touch(
+        db,
+        normalized_url="hhtps://shared.example.com/join",
+        sample_raw_url="hhtps://shared.example.com/join",
+        platform_type="JND28WEB",
+        seen_at="2026-04-30 10:00:00",
+    )
+
+    cursor = await db.execute(
+        """INSERT INTO shared_market_groups
+           (group_key, enabled, collector_platform_type, collector_account_name,
+            collector_password_enc, freshness_threshold_sec, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "test-invalid-url-group",
+            1,
+            "JND28WEB",
+            "collector",
+            "abc",
+            30,
+            "2026-04-30 10:00:00",
+            "2026-04-30 10:00:00",
+        ),
+    )
+    group_id = int(cursor.lastrowid)
+    await db.commit()
+
+    join_resp = await client.post(
+        f"/api/v1/admin/shared-market-uncovered-urls/{row['id']}/join-shared-group",
+        headers=admin_headers,
+        json={"shared_group_id": group_id},
+    )
+    assert join_resp.status_code == 400
 
 
 @pytest.mark.asyncio

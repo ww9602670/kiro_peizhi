@@ -2109,8 +2109,10 @@ async def shared_market_uncovered_url_bind_group(
         """UPDATE shared_market_uncovered_urls
            SET shared_group_id=?,
                matched_shared_group_id=?,
-               status='pending',
-               detection_status='pending',
+               status='matched',
+               detection_status='matched',
+               review_status='matched',
+               detection_error=NULL,
                failure_reason=?,
                reviewed_at=?,
                last_checked_at=?

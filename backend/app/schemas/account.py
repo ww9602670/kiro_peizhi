@@ -4,6 +4,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.utils.platform_url import normalize_platform_url
+
 PlatformType = Literal["JND28WEB", "JND282", "LUCKYSB"]
 GameType = Literal["JND28", "LUCKYSB"]
 FrontendSignal = Literal["normal", "processing", "need_relogin", "need_confirm_odds"]
@@ -75,9 +77,9 @@ class AccountCreate(BaseModel):
     @model_validator(mode="after")
     def validate_platform_url(self):
         self.game_type = normalize_game_type(self.game_type, self.platform_type)
-        platform_url = (self.platform_url or "").strip()
+        platform_url = normalize_platform_url(self.platform_url)
         if not platform_url:
-            raise ValueError(f"{self.game_type} requires platform_url")
+            raise ValueError("平台地址格式错误，请使用 http:// 或 https:// 开头的完整网址")
         self.platform_url = platform_url
         self.platform_type = None
         return self

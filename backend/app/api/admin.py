@@ -50,6 +50,7 @@ from app.schemas.strategy import (
     SharedMarketUncoveredUrlInfo,
     StrategyPermissionUpdate,
 )
+from app.utils.platform_url import normalize_platform_url
 from app.utils.response import BizError
 
 router = APIRouter()
@@ -518,11 +519,15 @@ async def join_shared_market_uncovered_url(
     if group.get("enabled", 1) == 0:
         raise BizError(4002, "shared group is disabled", status_code=400)
 
+    normalized_url = normalize_platform_url(row.get("normalized_url"))
+    if not normalized_url or normalized_url != row.get("normalized_url"):
+        raise BizError(4002, "共享网址格式错误，不能加入共享组", status_code=400)
+
     review = await shared_market_uncovered_url_bind_group(
         db,
         row_id=record_id,
         shared_group_id=body.shared_group_id,
-        failure_reason="已加入共享组，待共享运行中自动重检",
+        failure_reason="管理员手动加入共享组",
     )
     if review is None:
         raise BizError(4001, "record not found", status_code=404)

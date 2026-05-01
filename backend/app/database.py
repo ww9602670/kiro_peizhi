@@ -555,6 +555,26 @@ async def _drop_obsolete_account_strategy_permissions(db: aiosqlite.Connection) 
     await db.commit()
 
 
+async def _cleanup_invalid_shared_market_urls(db: aiosqlite.Connection) -> None:
+    """Exclude malformed shared-market URLs from admin review queues."""
+    where = (
+        "lower(normalized_url) NOT LIKE 'http://%' "
+        "AND lower(normalized_url) NOT LIKE 'https://%'"
+    )
+    await db.execute(f"DELETE FROM shared_market_group_urls WHERE {where}")
+    await db.execute(
+        f"""UPDATE shared_market_uncovered_urls
+              SET status='ignored',
+                  detection_status='ignored',
+                  review_status='ignored',
+                  failure_reason='invalid_url_scheme_excluded',
+                  reviewed_at=datetime('now', '+8 hours'),
+                  last_checked_at=datetime('now', '+8 hours')
+            WHERE {where}"""
+    )
+    await db.commit()
+
+
 async def _auto_migrate(db: aiosqlite.Connection) -> None:
     """检测已有表的缺失列，自动执行 ALTER TABLE ADD COLUMN。
 
@@ -633,6 +653,7 @@ async def init_db(db_path: str | None = None) -> None:
         # 自动迁移：检测并添加缺失列
         await _auto_migrate(db)
         await _drop_obsolete_account_strategy_permissions(db)
+        await _cleanup_invalid_shared_market_urls(db)
         for stmt in dependent_ddl:
             await db.execute(stmt)
         # 

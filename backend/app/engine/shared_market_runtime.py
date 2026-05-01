@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlsplit, urlunsplit
 
 from app.config import (
     BOCAI_SHARED_DETECTOR_ACCOUNT,
@@ -19,6 +18,7 @@ from app.config import (
 from app.engine.adapters.base import InstallInfo, RemoteLoginRequired
 from app.models import db_ops
 from app.utils.captcha import get_shared_captcha_service
+from app.utils.platform_url import normalize_platform_url
 
 logger = logging.getLogger(__name__)
 
@@ -50,19 +50,7 @@ _SHARED_RELOGIN_ERROR_MARKERS = (
 
 def normalize_market_url(raw_url: str | None) -> str:
     """Normalize platform url into a stable pool key."""
-    url = (raw_url or "").strip()
-    if not url:
-        return ""
-    try:
-        parsed = urlsplit(url)
-    except Exception:
-        return ""
-    if not parsed.scheme or not parsed.netloc:
-        return ""
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
-    path = (parsed.path or "").rstrip("/")
-    return urlunsplit((scheme, netloc, path, "", ""))
+    return normalize_platform_url(raw_url)
 
 
 def _safe_int(value: object, default: int = 0) -> int:
