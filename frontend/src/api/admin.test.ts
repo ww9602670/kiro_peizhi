@@ -14,7 +14,7 @@ import {
   updateOperator,
   updateOperatorStatus,
   listOperatorStrategyPermissions,
-  updateAccountStrategyPermissions,
+  updateOperatorStrategyPermissions,
   fetchAdminDashboard,
   setGlobalKillSwitch,
   listSharedMarketGroups,
@@ -126,10 +126,10 @@ describe('account strategy permissions', () => {
   it('保存账号策略授权', async () => {
     mockRequest.mockResolvedValueOnce({ code: 0, message: 'success', data: null });
 
-    await updateAccountStrategyPermissions(7, 12, ['flat', 'martin']);
+    await updateOperatorStrategyPermissions(7, ['flat', 'martin']);
 
     expect(mockRequest).toHaveBeenCalledWith(
-      '/admin/operators/7/accounts/12/strategy-permissions',
+      '/admin/operators/7/strategy-permissions',
       {
         method: 'PUT',
         body: JSON.stringify({ strategy_types: ['flat', 'martin'] }),

@@ -14,7 +14,7 @@ import type { OperatorCreate, OperatorInfo, OperatorUpdate, StatusUpdate } from 
 import type { AdminDashboard } from '@/types/api/dashboard';
 import type { PagedData } from '@/types/api/common';
 import type {
-  AccountStrategyPermissionInfo,
+  OperatorStrategyPermissionInfo,
   SharedMarketGroupInfo,
   SharedMarketUncoveredUrlInfo,
   StrategyPermissionType,
@@ -57,16 +57,15 @@ export async function updateOperatorStatus(id: number, data: StatusUpdate) {
 }
 
 export async function listOperatorStrategyPermissions(operatorId: number) {
-  return request<AccountStrategyPermissionInfo[]>(`/admin/operators/${operatorId}/strategy-permissions`);
+  return request<OperatorStrategyPermissionInfo>(`/admin/operators/${operatorId}/strategy-permissions`);
 }
 
-export async function updateAccountStrategyPermissions(
+export async function updateOperatorStrategyPermissions(
   operatorId: number,
-  accountId: number,
   strategyTypes: StrategyPermissionType[]
 ) {
-  return request<AccountStrategyPermissionInfo>(
-    `/admin/operators/${operatorId}/accounts/${accountId}/strategy-permissions`,
+  return request<OperatorStrategyPermissionInfo>(
+    `/admin/operators/${operatorId}/strategy-permissions`,
     {
       method: 'PUT',
       body: JSON.stringify({ strategy_types: strategyTypes }),

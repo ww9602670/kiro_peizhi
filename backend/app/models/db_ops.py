@@ -243,70 +243,39 @@ async def account_update(
     return await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
 
 
-async def account_strategy_permission_list_by_account(
+async def operator_strategy_permission_list(
     db: aiosqlite.Connection,
     *,
     operator_id: int,
-    account_id: int,
 ) -> list[str]:
     rows = await (
         await db.execute(
-            """SELECT p.strategy_type
-               FROM account_strategy_permissions p
-               JOIN gambling_accounts a ON a.id = p.account_id
-              WHERE p.operator_id=?
-                AND p.account_id=?
-                AND a.operator_id=?
-                AND a.deleted_at IS NULL
-                AND a.status <> 'deleted'
-                AND p.enabled=1
-              ORDER BY p.strategy_type""",
-            (operator_id, account_id, operator_id),
+            """SELECT strategy_type
+               FROM operator_strategy_permissions
+              WHERE operator_id=? AND enabled=1
+              ORDER BY strategy_type""",
+            (operator_id,),
         )
     ).fetchall()
     return [str(row["strategy_type"]) for row in rows]
 
 
-async def account_strategy_permission_map_for_operator(
+async def operator_strategy_permission_set(
     db: aiosqlite.Connection,
     *,
     operator_id: int,
-) -> dict[int, list[str]]:
-    rows = await (
-        await db.execute(
-            """SELECT account_id, strategy_type
-               FROM account_strategy_permissions
-              WHERE operator_id=? AND enabled=1
-              ORDER BY account_id, strategy_type""",
-            (operator_id,),
-        )
-    ).fetchall()
-    result: dict[int, list[str]] = {}
-    for row in rows:
-        result.setdefault(int(row["account_id"]), []).append(str(row["strategy_type"]))
-    return result
-
-
-async def account_strategy_permission_set(
-    db: aiosqlite.Connection,
-    *,
-    operator_id: int,
-    account_id: int,
     strategy_types: list[str],
     created_by: int,
 ) -> list[str] | None:
     from app.schemas.strategy import normalize_strategy_permission_type
 
-    account = await (
+    operator = await (
         await db.execute(
-            """SELECT id FROM gambling_accounts
-               WHERE id=? AND operator_id=?
-                 AND deleted_at IS NULL
-                 AND status <> 'deleted'""",
-            (account_id, operator_id),
+            "SELECT id FROM operators WHERE id=? AND role='operator'",
+            (operator_id,),
         )
     ).fetchone()
-    if account is None:
+    if operator is None:
         return None
 
     normalized: list[str] = []
@@ -317,15 +286,15 @@ async def account_strategy_permission_set(
 
     now = _now()
     await db.execute(
-        "DELETE FROM account_strategy_permissions WHERE operator_id=? AND account_id=?",
-        (operator_id, account_id),
+        "DELETE FROM operator_strategy_permissions WHERE operator_id=?",
+        (operator_id,),
     )
     for strategy_type in normalized:
         await db.execute(
-            """INSERT INTO account_strategy_permissions
-               (operator_id, account_id, strategy_type, enabled, created_by, created_at, updated_at)
-               VALUES (?, ?, ?, 1, ?, ?, ?)""",
-            (operator_id, account_id, strategy_type, created_by, now, now),
+            """INSERT INTO operator_strategy_permissions
+               (operator_id, strategy_type, enabled, created_by, created_at, updated_at)
+               VALUES (?, ?, 1, ?, ?, ?)""",
+            (operator_id, strategy_type, created_by, now, now),
         )
     await db.commit()
     return normalized
@@ -369,10 +338,6 @@ async def account_delete(
             WHERE account_id=? AND operator_id=?
               AND deleted_at IS NULL""",
         (now, now, account_id, operator_id),
-    )
-    await db.execute(
-        "DELETE FROM account_strategy_permissions WHERE operator_id=? AND account_id=?",
-        (operator_id, account_id),
     )
     await db.execute(
         """UPDATE account_platform_sessions

@@ -79,11 +79,9 @@ export interface StrategyInfo {
   gate_window_issues?: number | null;
 }
 
-export interface AccountStrategyPermissionInfo {
+export interface OperatorStrategyPermissionInfo {
   operator_id: number;
-  account_id: number;
-  account_name: string;
-  game_type: string;
+  username: string;
   allowed_strategy_types: StrategyPermissionType[];
 }
 

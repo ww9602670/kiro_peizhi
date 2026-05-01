@@ -15,11 +15,9 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.dependencies import get_db_conn, require_admin
 from app.models.db_ops import (
-    account_get_by_id,
-    account_list_by_operator,
-    account_strategy_permission_map_for_operator,
-    account_strategy_permission_set,
     audit_log_create,
+    operator_strategy_permission_list,
+    operator_strategy_permission_set,
     operator_create,
     operator_get_by_id,
     operator_get_by_username,
@@ -46,7 +44,7 @@ from app.schemas.operator import (
     StatusUpdate,
 )
 from app.schemas.strategy import (
-    AccountStrategyPermissionInfo,
+    OperatorStrategyPermissionInfo,
     SharedMarketGroupInfo,
     SharedMarketUncoveredJoinGroupRequest,
     SharedMarketUncoveredUrlInfo,
@@ -207,17 +205,14 @@ async def update_operator_status(
     return ApiResponse[OperatorInfo](data=_to_operator_info(row))
 
 
-def _to_account_strategy_permission_info(
+def _to_operator_strategy_permission_info(
     *,
-    operator_id: int,
-    account: dict,
+    operator: dict,
     allowed_strategy_types: list[str],
-) -> AccountStrategyPermissionInfo:
-    return AccountStrategyPermissionInfo(
-        operator_id=operator_id,
-        account_id=account["id"],
-        account_name=account["account_name"],
-        game_type=account["game_type"],
+) -> OperatorStrategyPermissionInfo:
+    return OperatorStrategyPermissionInfo(
+        operator_id=operator["id"],
+        username=operator["username"],
         allowed_strategy_types=allowed_strategy_types,
     )
 
@@ -229,59 +224,48 @@ async def list_operator_strategy_permissions(
     db=Depends(get_db_conn),
 ):
     existing = await operator_get_by_id(db, operator_id=operator_id)
-    if not existing:
+    if not existing or existing["role"] != "operator":
         raise BizError(4001, "operator not found", status_code=404)
 
-    accounts = await account_list_by_operator(db, operator_id=operator_id)
-    permission_map = await account_strategy_permission_map_for_operator(
+    allowed_strategy_types = await operator_strategy_permission_list(
         db,
         operator_id=operator_id,
     )
-    return ApiResponse[list[AccountStrategyPermissionInfo]](
-        data=[
-            _to_account_strategy_permission_info(
-                operator_id=operator_id,
-                account=account,
-                allowed_strategy_types=permission_map.get(account["id"], []),
-            )
-            for account in accounts
-        ]
+    return ApiResponse[OperatorStrategyPermissionInfo](
+        data=_to_operator_strategy_permission_info(
+            operator=existing,
+            allowed_strategy_types=allowed_strategy_types,
+        )
     )
 
 
-@router.put("/admin/operators/{operator_id}/accounts/{account_id}/strategy-permissions")
-async def update_account_strategy_permissions(
+@router.put("/admin/operators/{operator_id}/strategy-permissions")
+async def update_operator_strategy_permissions(
     operator_id: int,
-    account_id: int,
     body: StrategyPermissionUpdate,
     request: Request,
     admin: dict = Depends(require_admin),
     db=Depends(get_db_conn),
 ):
     existing = await operator_get_by_id(db, operator_id=operator_id)
-    if not existing:
+    if not existing or existing["role"] != "operator":
         raise BizError(4001, "operator not found", status_code=404)
 
-    allowed_strategy_types = await account_strategy_permission_set(
+    allowed_strategy_types = await operator_strategy_permission_set(
         db,
         operator_id=operator_id,
-        account_id=account_id,
         strategy_types=list(body.strategy_types),
         created_by=admin["id"],
     )
     if allowed_strategy_types is None:
-        raise BizError(4001, "account not found", status_code=404)
-
-    account = await account_get_by_id(db, account_id=account_id, operator_id=operator_id)
-    if not account:
-        raise BizError(4001, "account not found", status_code=404)
+        raise BizError(4001, "operator not found", status_code=404)
 
     await audit_log_create(
         db,
         operator_id=admin["id"],
-        action="update_account_strategy_permissions",
-        target_type="account",
-        target_id=account_id,
+        action="update_operator_strategy_permissions",
+        target_type="operator",
+        target_id=operator_id,
         detail=json.dumps(
             {
                 "operator_id": operator_id,
@@ -290,10 +274,9 @@ async def update_account_strategy_permissions(
         ),
         ip_address=_get_client_ip(request),
     )
-    return ApiResponse[AccountStrategyPermissionInfo](
-        data=_to_account_strategy_permission_info(
-            operator_id=operator_id,
-            account=account,
+    return ApiResponse[OperatorStrategyPermissionInfo](
+        data=_to_operator_strategy_permission_info(
+            operator=existing,
             allowed_strategy_types=allowed_strategy_types,
         )
     )

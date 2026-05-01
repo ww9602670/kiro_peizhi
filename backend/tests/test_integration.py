@@ -16,7 +16,7 @@ import app.database as _db_module
 from app.database import close_shared_db, get_shared_db
 from app.engine.adapters.base import BalanceInfo, InstallInfo, LoginResult
 from app.main import app
-from app.models.db_ops import account_strategy_permission_set
+from app.models.db_ops import operator_strategy_permission_set
 from app.schemas.strategy import STRATEGY_PERMISSION_TYPES
 from app.utils.auth import decode_token
 
@@ -191,7 +191,7 @@ async def test_full_api_flow(client):
     assert verified_account["allowed_strategy_types"] == []
 
     resp = await client.put(
-        f"/api/v1/admin/operators/{op_id}/accounts/{account_id}/strategy-permissions",
+        f"/api/v1/admin/operators/{op_id}/strategy-permissions",
         headers=admin_headers,
         json={"strategy_types": ["flat", "martin"]},
     )
@@ -366,10 +366,9 @@ async def _create_account_for(client, headers, *, verify: bool = True) -> int:
     token = headers.get("Authorization", "").replace("Bearer ", "", 1)
     operator_id = int(decode_token(token)["sub"])
     db = await get_shared_db()
-    permissions = await account_strategy_permission_set(
+    permissions = await operator_strategy_permission_set(
         db,
         operator_id=operator_id,
-        account_id=account_id,
         strategy_types=list(STRATEGY_PERMISSION_TYPES),
         created_by=1,
     )

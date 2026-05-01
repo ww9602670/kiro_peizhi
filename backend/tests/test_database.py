@@ -28,7 +28,7 @@ EXPECTED_TABLES = {
     "account_odds",
     "account_platform_capabilities",
     "account_platform_sessions",
-    "account_strategy_permissions",
+    "operator_strategy_permissions",
     "account_verification_runs",
     "bet_order_platform_records",
     "backtest_tasks",
@@ -192,6 +192,47 @@ class TestLegacySchemaResetGuard:
             }
             assert "game_type" in cols
             assert "platform_type" not in cols
+            await verify_conn.close()
+        finally:
+            await database_module.close_shared_db()
+
+    async def test_init_db_drops_obsolete_account_strategy_permissions(self, tmp_path):
+        db_path = str(tmp_path / "obsolete_strategy_permissions.db")
+        conn = await aiosqlite.connect(db_path)
+        await conn.execute(
+            """
+            CREATE TABLE account_strategy_permissions (
+                id INTEGER PRIMARY KEY,
+                operator_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                strategy_type TEXT NOT NULL
+            )
+            """
+        )
+        await conn.commit()
+        await conn.close()
+
+        try:
+            await init_db(db_path)
+            verify_conn = await get_db(db_path)
+            old_table = await (
+                await verify_conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name='account_strategy_permissions'
+                    """
+                )
+            ).fetchone()
+            new_table = await (
+                await verify_conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name='operator_strategy_permissions'
+                    """
+                )
+            ).fetchone()
+            assert old_table is None
+            assert new_table is not None
             await verify_conn.close()
         finally:
             await database_module.close_shared_db()

@@ -8,9 +8,9 @@ from app.database import get_shared_db
 from app.main import app
 from app.models.db_ops import (
     account_create,
-    account_strategy_permission_set,
     bet_order_create,
     operator_create,
+    operator_strategy_permission_set,
     simulation_bet_order_create,
     simulation_strategy_stats_upsert,
     strategy_create,
@@ -46,10 +46,9 @@ async def _create_account_and_strategy(operator_id: int, *, simulation: int = 0)
         password="pwd",
         platform_type="JND282",
     )
-    await account_strategy_permission_set(
+    await operator_strategy_permission_set(
         db,
         operator_id=operator_id,
-        account_id=account["id"],
         strategy_types=list(STRATEGY_PERMISSION_TYPES),
         created_by=1,
     )

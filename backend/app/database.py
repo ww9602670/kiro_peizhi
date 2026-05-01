@@ -161,19 +161,18 @@ DDL_STATEMENTS = [
     """,
 
     """
-    CREATE TABLE IF NOT EXISTS account_strategy_permissions (
+    CREATE TABLE IF NOT EXISTS operator_strategy_permissions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        operator_id     INTEGER NOT NULL REFERENCES operators(id),
-        account_id      INTEGER NOT NULL REFERENCES gambling_accounts(id) ON DELETE CASCADE,
+        operator_id     INTEGER NOT NULL REFERENCES operators(id) ON DELETE CASCADE,
         strategy_type   TEXT NOT NULL,
         enabled         INTEGER NOT NULL DEFAULT 1,
         created_by      INTEGER REFERENCES operators(id),
         created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
-        UNIQUE(account_id, strategy_type)
+        UNIQUE(operator_id, strategy_type)
     );
     """,
-    "CREATE INDEX IF NOT EXISTS idx_account_strategy_permissions_operator ON account_strategy_permissions(operator_id, account_id);",
+    "CREATE INDEX IF NOT EXISTS idx_operator_strategy_permissions_operator ON operator_strategy_permissions(operator_id);",
 
     # 4. bet_orders
     """
@@ -550,6 +549,12 @@ async def _reset_legacy_platform_binding_schema(db: aiosqlite.Connection) -> Non
     await db.commit()
 
 
+async def _drop_obsolete_account_strategy_permissions(db: aiosqlite.Connection) -> None:
+    """Remove the abandoned per-platform-account authorization table."""
+    await db.execute("DROP TABLE IF EXISTS account_strategy_permissions")
+    await db.commit()
+
+
 async def _auto_migrate(db: aiosqlite.Connection) -> None:
     """检测已有表的缺失列，自动执行 ALTER TABLE ADD COLUMN。
 
@@ -627,6 +632,7 @@ async def init_db(db_path: str | None = None) -> None:
             await db.execute(stmt)
         # 自动迁移：检测并添加缺失列
         await _auto_migrate(db)
+        await _drop_obsolete_account_strategy_permissions(db)
         for stmt in dependent_ddl:
             await db.execute(stmt)
         # 

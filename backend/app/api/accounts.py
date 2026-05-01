@@ -25,7 +25,6 @@ from app.models.db_ops import (
     account_platform_session_delete,
     account_platform_session_list,
     account_platform_session_upsert,
-    account_strategy_permission_list_by_account,
     account_platform_capability_list_by_run,
     account_verification_run_complete,
     account_verification_run_create,
@@ -40,6 +39,7 @@ from app.models.db_ops import (
     alert_create,
     odds_batch_upsert,
     odds_list_by_account,
+    operator_strategy_permission_list,
     strategy_running_exists_for_account_platform,
 )
 from app.schemas.account import (
@@ -582,10 +582,9 @@ async def _build_account_info(
     odds_message: str | None = None,
 ) -> AccountInfo:
     verification_view = await _collect_account_verification_view(db, row)
-    allowed_strategy_types = await account_strategy_permission_list_by_account(
+    allowed_strategy_types = await operator_strategy_permission_list(
         db,
         operator_id=row["operator_id"],
-        account_id=row["id"],
     )
     has_unconfirmed_odds = await _has_unconfirmed_odds(db, account_id=row["id"])
     frontend_signal, frontend_signal_reason = _resolve_frontend_signal(

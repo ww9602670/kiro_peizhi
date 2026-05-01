@@ -90,6 +90,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   const actionLockRef = useRef<Record<number, string>>({});
   const deleteConfirmLockRef = useRef<Set<number>>(new Set());
   const recentToastRef = useRef<Map<string, number>>(new Map());
+  const consumedCreateIntentRef = useRef<string | null>(null);
 
   const showMergedNotice = useCallback(
     (rawMessage: string | null | undefined, fallback: string) => {
@@ -143,6 +144,11 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     if (strategyGateLoading) {
       return;
     }
+    const intentKey = `${createIntent.accountId}:${createIntent.nonce}`;
+    if (consumedCreateIntentRef.current === intentKey) {
+      return;
+    }
+    consumedCreateIntentRef.current = intentKey;
     if (!hasAuthorizedStrategyAccount) {
       showMergedNotice(STRATEGY_NOT_AUTHORIZED_MESSAGE, STRATEGY_NOT_AUTHORIZED_MESSAGE);
       onCreateIntentConsumed?.();

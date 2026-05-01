@@ -19,11 +19,10 @@ from app.api.dependencies import get_current_operator, get_db_conn
 from app.models.db_ops import (
     account_get_by_id,
     account_platform_capability_list_by_run,
-    account_strategy_permission_list_by_account,
-    account_strategy_permission_map_for_operator,
     account_verification_run_get_effective,
     account_verification_run_get_latest,
     account_verification_run_get_latest_completed,
+    operator_strategy_permission_list,
     strategy_create,
     strategy_delete,
     strategy_get_by_id,
@@ -301,7 +300,6 @@ async def _ensure_strategy_permission_or_raise(
     db,
     *,
     operator_id: int,
-    account_id: int,
     strategy_type: str,
     play_code: str,
 ) -> str:
@@ -310,15 +308,14 @@ async def _ensure_strategy_permission_or_raise(
     except ValueError as exc:
         raise BizError(1002, str(exc), status_code=400)
 
-    allowed = await account_strategy_permission_list_by_account(
+    allowed = await operator_strategy_permission_list(
         db,
         operator_id=operator_id,
-        account_id=account_id,
     )
     if permission_type not in allowed:
         raise BizError(
             4003,
-            "当前账号暂未开通该策略，请联系管理员",
+            "当前操作者账号暂未开通该策略，请联系管理员",
             status_code=403,
         )
     return permission_type
@@ -330,13 +327,12 @@ async def _filter_rows_by_strategy_permissions(
     operator_id: int,
     rows: list[dict],
 ) -> list[dict]:
-    permission_map = await account_strategy_permission_map_for_operator(
+    allowed = set(await operator_strategy_permission_list(
         db,
         operator_id=operator_id,
-    )
+    ))
     visible: list[dict] = []
     for row in rows:
-        account_id = int(row.get("account_id") or 0)
         try:
             permission_type = derive_strategy_permission_type(
                 str(row.get("type") or ""),
@@ -344,7 +340,7 @@ async def _filter_rows_by_strategy_permissions(
             )
         except ValueError:
             continue
-        if permission_type in permission_map.get(account_id, []):
+        if permission_type in allowed:
             visible.append(row)
     return visible
 
@@ -503,7 +499,6 @@ async def create_strategy(
     await _ensure_strategy_permission_or_raise(
         db,
         operator_id=operator["id"],
-        account_id=body.account_id,
         strategy_type=body.type,
         play_code=play_code,
     )
@@ -662,7 +657,6 @@ async def update_strategy(
     await _ensure_strategy_permission_or_raise(
         db,
         operator_id=operator["id"],
-        account_id=existing["account_id"],
         strategy_type=existing["type"],
         play_code=final_play_code,
     )
@@ -811,7 +805,6 @@ async def _transition_strategy(
         await _ensure_strategy_permission_or_raise(
             db,
             operator_id=operator["id"],
-            account_id=existing["account_id"],
             strategy_type=existing["type"],
             play_code=existing["play_code"],
         )

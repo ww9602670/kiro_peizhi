@@ -20,11 +20,11 @@ from app.main import app
 from app.database import get_shared_db
 from app.models.db_ops import (
     account_create,
-    account_strategy_permission_set,
     account_verification_run_complete,
     account_verification_run_create,
     bet_order_create,
     operator_create,
+    operator_strategy_permission_set,
 )
 from app.schemas.strategy import validate_state_transition
 from app.schemas.strategy import STRATEGY_PERMISSION_TYPES
@@ -93,10 +93,9 @@ async def _create_operator_with_account(
         "UPDATE gambling_accounts SET status='online' WHERE id=?", (acc["id"],)
     )
     if grant_strategy_permissions:
-        await account_strategy_permission_set(
+        await operator_strategy_permission_set(
             db,
             operator_id=op["id"],
-            account_id=acc["id"],
             strategy_types=list(STRATEGY_PERMISSION_TYPES),
             created_by=1,
         )
@@ -410,7 +409,7 @@ async def test_create_flat_strategy(client):
 
 
 @pytest.mark.asyncio
-async def test_create_strategy_rejected_without_account_strategy_permission(client):
+async def test_create_strategy_rejected_without_operator_strategy_permission(client):
     uid = _uid()
     token, _, acc_id = await _create_operator_with_account(
         f"noperm_{uid}",
@@ -887,10 +886,9 @@ async def test_list_strategies_hides_revoked_strategy_permissions(client):
     assert create_resp.status_code == 200
 
     db = await get_shared_db()
-    await account_strategy_permission_set(
+    await operator_strategy_permission_set(
         db,
         operator_id=op_id,
-        account_id=acc_id,
         strategy_types=[],
         created_by=1,
     )

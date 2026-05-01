@@ -18,7 +18,7 @@ vi.mock('@/api/admin', () => ({
   createOperator: vi.fn(),
   updateOperatorStatus: vi.fn(),
   listOperatorStrategyPermissions: vi.fn(),
-  updateAccountStrategyPermissions: vi.fn(),
+  updateOperatorStrategyPermissions: vi.fn(),
   listSharedMarketGroups: vi.fn(),
   listSharedMarketUncoveredUrls: vi.fn(),
   ignoreSharedMarketUncoveredUrl: vi.fn(),
@@ -33,7 +33,7 @@ vi.mock('@/api/request', () => ({
 import {
   listOperators,
   listOperatorStrategyPermissions,
-  updateAccountStrategyPermissions,
+  updateOperatorStrategyPermissions,
   listSharedMarketGroups,
   listSharedMarketUncoveredUrls,
   ignoreSharedMarketUncoveredUrl,
@@ -42,7 +42,7 @@ import {
 } from '@/api/admin';
 const mockList = vi.mocked(listOperators);
 const mockListPermissions = vi.mocked(listOperatorStrategyPermissions);
-const mockUpdatePermissions = vi.mocked(updateAccountStrategyPermissions);
+const mockUpdatePermissions = vi.mocked(updateOperatorStrategyPermissions);
 const mockListSharedGroups = vi.mocked(listSharedMarketGroups);
 const mockListUncovered = vi.mocked(listSharedMarketUncoveredUrls);
 const mockIgnoreSharedUncovered = vi.mocked(ignoreSharedMarketUncoveredUrl);
@@ -112,24 +112,18 @@ beforeEach(() => {
   mockListPermissions.mockResolvedValue({
     code: 0,
     message: 'success',
-    data: [
-      {
-        operator_id: 2,
-        account_id: 10,
-        account_name: 'acc1',
-        game_type: 'JND28',
-        allowed_strategy_types: ['flat'],
-      },
-    ],
+    data: {
+      operator_id: 2,
+      username: 'op1',
+      allowed_strategy_types: ['flat'],
+    },
   });
   mockUpdatePermissions.mockResolvedValue({
     code: 0,
     message: 'success',
     data: {
       operator_id: 2,
-      account_id: 10,
-      account_name: 'acc1',
-      game_type: 'JND28',
+      username: 'op1',
       allowed_strategy_types: ['flat', 'martin'],
     },
   });
@@ -199,7 +193,7 @@ describe('Operators', () => {
     expect(op1Row.querySelector('.toggle-btn')).not.toBeNull();
   });
 
-  it('可以打开账号策略授权并保存勾选', async () => {
+  it('可以打开操作者策略授权并保存勾选', async () => {
     const { container } = render(<Operators />);
     await waitFor(() => expect(getOperatorTableRow(container, 'op1')).toBeInTheDocument());
 
@@ -207,10 +201,10 @@ describe('Operators', () => {
     await userEvent.click(op1Row.querySelector('.permission-btn') as HTMLButtonElement);
 
     await waitFor(() => expect(screen.getByText('策略授权：op1')).toBeInTheDocument());
-    expect(screen.getByText('acc1')).toBeInTheDocument();
+    expect(screen.getByText('该操作者名下所有第三方账号共享此授权')).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText('马丁'));
-    expect(mockUpdatePermissions).toHaveBeenCalledWith(2, 10, ['flat', 'martin']);
+    expect(mockUpdatePermissions).toHaveBeenCalledWith(2, ['flat', 'martin']);
   });
 
   it('渲染共享网址审核区域', async () => {

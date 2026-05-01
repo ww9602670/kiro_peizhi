@@ -279,7 +279,7 @@ async def test_create_operator_defaults(client, admin_headers):
 
 
 @pytest.mark.asyncio
-async def test_admin_can_set_and_list_account_strategy_permissions(client, admin_headers):
+async def test_admin_can_set_and_list_operator_strategy_permissions(client, admin_headers):
     uid = _uid()
     token, op_id = await _create_operator_via_db(f"permop_{uid}")
     operator_headers = {"Authorization": f"Bearer {token}"}
@@ -300,21 +300,32 @@ async def test_admin_can_set_and_list_account_strategy_permissions(client, admin
         headers=admin_headers,
     )
     assert list_resp.json()["code"] == 0
-    first_row = next(row for row in list_resp.json()["data"] if row["account_id"] == account["id"])
-    assert first_row["allowed_strategy_types"] == []
+    assert list_resp.json()["data"]["operator_id"] == op_id
+    assert list_resp.json()["data"]["allowed_strategy_types"] == []
 
     update_resp = await client.put(
-        f"/api/v1/admin/operators/{op_id}/accounts/{account['id']}/strategy-permissions",
+        f"/api/v1/admin/operators/{op_id}/strategy-permissions",
         headers=admin_headers,
         json={"strategy_types": ["flat", "martin", "flat"]},
     )
     assert update_resp.json()["code"] == 0
     assert update_resp.json()["data"]["allowed_strategy_types"] == ["flat", "martin"]
 
+    second_account = await account_create(
+        db,
+        operator_id=op_id,
+        account_name=f"permacc2_{uid}",
+        password="pw1234",
+        game_type="JND28",
+        platform_url="https://jnd2.example.com",
+    )
+
     account_resp = await client.get("/api/v1/accounts", headers=operator_headers)
     assert account_resp.json()["code"] == 0
     account_row = next(row for row in account_resp.json()["data"] if row["id"] == account["id"])
     assert account_row["allowed_strategy_types"] == ["flat", "martin"]
+    second_row = next(row for row in account_resp.json()["data"] if row["id"] == second_account["id"])
+    assert second_row["allowed_strategy_types"] == ["flat", "martin"]
 
 
 @pytest.mark.asyncio

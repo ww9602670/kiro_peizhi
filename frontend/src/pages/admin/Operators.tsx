@@ -12,7 +12,7 @@ import {
   createOperator,
   updateOperatorStatus,
   listOperatorStrategyPermissions,
-  updateAccountStrategyPermissions,
+  updateOperatorStrategyPermissions,
   listSharedMarketUncoveredUrls,
   listSharedMarketGroups,
   ignoreSharedMarketUncoveredUrl,
@@ -22,7 +22,7 @@ import {
 import { isApiError } from '@/api/request';
 import type { OperatorInfo } from '@/types/api/operator';
 import type {
-  AccountStrategyPermissionInfo,
+  OperatorStrategyPermissionInfo,
   SharedMarketGroupInfo,
   SharedMarketUncoveredUrlInfo,
   StrategyPermissionType,
@@ -59,9 +59,9 @@ export default function Operators() {
   const [createError, setCreateError] = useState('');
   const { messages, showToast, removeToast } = useToast();
   const [permissionOperator, setPermissionOperator] = useState<OperatorInfo | null>(null);
-  const [permissionRows, setPermissionRows] = useState<AccountStrategyPermissionInfo[]>([]);
+  const [permissionInfo, setPermissionInfo] = useState<OperatorStrategyPermissionInfo | null>(null);
   const [permissionLoading, setPermissionLoading] = useState(false);
-  const [savingPermissionAccountId, setSavingPermissionAccountId] = useState<number | null>(null);
+  const [savingPermission, setSavingPermission] = useState(false);
 
   // 共享网址待审核
   const [sharedReviewLoading, setSharedReviewLoading] = useState(false);
@@ -169,11 +169,11 @@ export default function Operators() {
 
   const openPermissionPanel = async (op: OperatorInfo) => {
     setPermissionOperator(op);
-    setPermissionRows([]);
+    setPermissionInfo(null);
     setPermissionLoading(true);
     try {
       const res = await listOperatorStrategyPermissions(op.id);
-      setPermissionRows(res.data ?? []);
+      setPermissionInfo(res.data ?? null);
     } catch (err) {
       if (isApiError(err)) showToast(err.message);
       else showToast('加载策略授权失败');
@@ -182,35 +182,29 @@ export default function Operators() {
     }
   };
 
-  const handlePermissionToggle = async (
-    row: AccountStrategyPermissionInfo,
-    strategyType: StrategyPermissionType
-  ) => {
-    if (!permissionOperator) return;
-    const current = new Set(row.allowed_strategy_types);
+  const handlePermissionToggle = async (strategyType: StrategyPermissionType) => {
+    if (!permissionOperator || !permissionInfo) return;
+    const current = new Set(permissionInfo.allowed_strategy_types);
     if (current.has(strategyType)) current.delete(strategyType);
     else current.add(strategyType);
     const nextTypes = STRATEGY_PERMISSION_OPTIONS
       .map((item) => item.value)
       .filter((item) => current.has(item));
 
-    setSavingPermissionAccountId(row.account_id);
+    setSavingPermission(true);
     try {
-      const res = await updateAccountStrategyPermissions(
+      const res = await updateOperatorStrategyPermissions(
         permissionOperator.id,
-        row.account_id,
         nextTypes
       );
       if (res.data) {
-        setPermissionRows((previous) =>
-          previous.map((item) => item.account_id === row.account_id ? res.data! : item)
-        );
+        setPermissionInfo(res.data);
       }
     } catch (err) {
       if (isApiError(err)) showToast(err.message);
       else showToast('保存策略授权失败');
     } finally {
-      setSavingPermissionAccountId(null);
+      setSavingPermission(false);
     }
   };
 
@@ -488,31 +482,29 @@ export default function Operators() {
           </div>
           {permissionLoading ? (
             <p className="loading-text">加载中...</p>
-          ) : permissionRows.length === 0 ? (
-            <p className="empty-text">该操作者暂无绑定账号</p>
+          ) : !permissionInfo ? (
+            <p className="empty-text">策略授权信息不可用</p>
           ) : (
             <div className="permission-account-list">
-              {permissionRows.map((row) => (
-                <div key={row.account_id} className="permission-account">
-                  <div className="permission-account-title">
-                    <strong>{row.account_name}</strong>
-                    <span>{row.game_type}</span>
-                  </div>
-                  <div className="permission-options">
-                    {STRATEGY_PERMISSION_OPTIONS.map((option) => (
-                      <label key={option.value} className="permission-option">
-                        <input
-                          type="checkbox"
-                          checked={row.allowed_strategy_types.includes(option.value)}
-                          disabled={savingPermissionAccountId === row.account_id}
-                          onChange={() => handlePermissionToggle(row, option.value)}
-                        />
-                        <span>{option.label}</span>
-                      </label>
-                    ))}
-                  </div>
+              <div className="permission-account">
+                <div className="permission-account-title">
+                  <strong>{permissionInfo.username}</strong>
+                  <span>该操作者名下所有第三方账号共享此授权</span>
                 </div>
-              ))}
+                <div className="permission-options">
+                  {STRATEGY_PERMISSION_OPTIONS.map((option) => (
+                    <label key={option.value} className="permission-option">
+                      <input
+                        type="checkbox"
+                        checked={permissionInfo.allowed_strategy_types.includes(option.value)}
+                        disabled={savingPermission}
+                        onChange={() => handlePermissionToggle(option.value)}
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
         </div>

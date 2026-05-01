@@ -252,11 +252,9 @@ class StrategyPermissionUpdate(BaseModel):
         return self
 
 
-class AccountStrategyPermissionInfo(BaseModel):
+class OperatorStrategyPermissionInfo(BaseModel):
     operator_id: int
-    account_id: int
-    account_name: str
-    game_type: str
+    username: str
     allowed_strategy_types: list[StrategyPermissionType] = Field(default_factory=list)
 
 
