@@ -1,6 +1,7 @@
 import hashlib
 import uuid
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -317,4 +318,66 @@ async def test_refresh_odds_with_verified_platform(client, monkeypatch):
     assert body["data"]["odds_synced"] is True
     assert body["data"]["odds_count"] == 2
     assert "odds synced: 2 items" in body["data"]["odds_message"]
+    assert sync_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_odds_reuses_running_session_runtime(client, monkeypatch):
+    uid = _uid()
+    token, operator_id = await _create_operator_token(f"odds_runtime_{uid}")
+    account_id = await _create_account_with_verification(
+        operator_id=operator_id,
+        account_name=f"acc_runtime_{uid}",
+        supported_platforms=["JND28WEB"],
+    )
+
+    class RuntimeAdapter:
+        async def get_current_install(self):
+            return InstallInfo(
+                issue="3403606",
+                state=1,
+                close_countdown_sec=30,
+                pre_issue="3403605",
+                pre_result="1,2,3",
+                open_countdown_sec=40,
+            )
+
+        async def load_odds(self, issue):
+            _ = issue
+            return {"DX1": 20530, "DS3": 19840}
+
+    class RuntimeStub:
+        def __init__(self):
+            self.adapter = RuntimeAdapter()
+            self.ensure_logged_in = AsyncMock(return_value=True)
+
+        async def run_platform_call(self, _reason, func):
+            return await func()
+
+    runtime = RuntimeStub()
+    engine_stub = SimpleNamespace(
+        get_runtime_for_account=AsyncMock(return_value=runtime),
+    )
+    monkeypatch.setattr(app.state, "engine", engine_stub, raising=False)
+    monkeypatch.setattr(
+        odds_api,
+        "_login_platform_account",
+        AsyncMock(side_effect=AssertionError("runtime reuse should avoid relogin")),
+    )
+    monkeypatch.setattr(
+        odds_api,
+        "create_platform_adapter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("runtime reuse should avoid new adapter")),
+    )
+    sync_mock = AsyncMock()
+    monkeypatch.setattr(odds_api, "_sync_odds", sync_mock)
+
+    resp = await client.post(
+        f"/api/v1/accounts/{account_id}/odds/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"platform_type": "JND28WEB"},
+    )
+
+    assert resp.status_code == 200
+    assert runtime.ensure_logged_in.await_count == 1
     assert sync_mock.await_count == 1

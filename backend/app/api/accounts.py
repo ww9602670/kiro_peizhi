@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from app.api.dependencies import get_current_operator, get_db_conn
 from app.engine.adapters.base import LoginResult, PlatformAdapter
 from app.engine.adapters.factory import create_platform_adapter
+from app.engine.session_runtime import AccountSessionRuntime
 from app.models.db_ops import (
     account_create,
     account_delete,
@@ -40,7 +42,6 @@ from app.models.db_ops import (
     odds_batch_upsert,
     odds_list_by_account,
     operator_strategy_permission_list,
-    strategy_running_exists_for_account_platform,
 )
 from app.schemas.account import (
     AccountCreate,
@@ -51,6 +52,12 @@ from app.schemas.account import (
 )
 from app.schemas.common import ApiResponse
 from app.utils.captcha import CaptchaError, CaptchaService, get_shared_captcha_service
+from app.utils.omission_random import (
+    is_random_pick_type,
+    key_codes_for_category,
+    normalize_categories,
+    parse_omission_play_code,
+)
 from app.utils.response import BizError
 
 router = APIRouter()
@@ -222,6 +229,77 @@ def _normal_positive_odds(raw_odds: dict[str, Any]) -> dict[str, int]:
         if odds_value > 0:
             normal[str(key)] = odds_value
     return normal
+
+
+def _split_play_code_tokens(play_code: str | None) -> set[str]:
+    return {
+        token.strip().upper()
+        for token in str(play_code or "").split(",")
+        if token.strip()
+    }
+
+
+def _random_pick_categories_from_strategy(strategy: dict[str, Any]) -> list[str]:
+    raw_config = strategy.get("strategy_config")
+    if isinstance(raw_config, str) and raw_config.strip():
+        try:
+            parsed = json.loads(raw_config)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("categories") is not None:
+            try:
+                return normalize_categories(parsed.get("categories"))
+            except ValueError:
+                pass
+
+    try:
+        return parse_omission_play_code(str(strategy.get("play_code") or ""))
+    except ValueError:
+        return []
+
+
+def _strategy_odds_key_scope(strategy: dict[str, Any]) -> tuple[set[str], bool]:
+    if is_random_pick_type(strategy.get("type")):
+        watched: set[str] = set()
+        for category in _random_pick_categories_from_strategy(strategy):
+            watched.update(key_codes_for_category(category))
+        return watched, False
+
+    play_tokens = _split_play_code_tokens(strategy.get("play_code"))
+    if play_tokens:
+        return play_tokens, False
+    return set(), True
+
+
+async def _running_strategy_odds_scope(
+    db,
+    *,
+    operator_id: int,
+    account_id: int,
+    platform_type: str,
+) -> tuple[set[str], bool, bool]:
+    rows = await (
+        await db.execute(
+            """SELECT id, type, play_code, strategy_config
+                 FROM strategies
+                WHERE operator_id=?
+                  AND account_id=?
+                  AND UPPER(platform_type)=?
+                  AND status='running'
+                  AND deleted_at IS NULL""",
+            (operator_id, account_id, platform_type.strip().upper()),
+        )
+    ).fetchall()
+    if not rows:
+        return set(), False, False
+
+    watched: set[str] = set()
+    has_unbounded_strategy = False
+    for row in rows:
+        scoped_keys, unbounded = _strategy_odds_key_scope(dict(row))
+        watched.update(scoped_keys)
+        has_unbounded_strategy = has_unbounded_strategy or unbounded
+    return watched, has_unbounded_strategy, True
 
 
 async def _collect_account_verification_view(
@@ -435,13 +513,16 @@ async def _sync_odds(
     )
 
     changes: list[str] = []
+    changed_by_key: dict[str, str] = {}
     for key in sorted(set(old_map) | set(normal_odds)):
         old_val = old_map.get(key)
         new_val = normal_odds.get(key)
         if old_val != new_val:
-            changes.append(f"{key}: {old_val} -> {new_val}")
+            line = f"{key}: {old_val} -> {new_val}"
+            changes.append(line)
+            changed_by_key[str(key).upper()] = line
 
-    has_running_strategy = await strategy_running_exists_for_account_platform(
+    watched_keys, has_unbounded_strategy, has_running_strategy = await _running_strategy_odds_scope(
         db,
         operator_id=operator_id,
         account_id=account_id,
@@ -449,6 +530,16 @@ async def _sync_odds(
     )
     if not has_running_strategy:
         return
+
+    if not has_unbounded_strategy:
+        watched_upper = {key.upper() for key in watched_keys}
+        changes = [
+            line
+            for key, line in changed_by_key.items()
+            if key in watched_upper
+        ]
+        if not changes:
+            return
 
     await alert_create(
         db,
@@ -678,6 +769,7 @@ async def _run_account_verification_flow(
     db,
     operator_id: int,
     account: dict,
+    session_runtime: AccountSessionRuntime | None,
 ) -> tuple[dict, list[PlatformCapabilityProbe]]:
     candidate_platform_types = get_allowed_platform_types(account["game_type"])
     if not candidate_platform_types:
@@ -687,25 +779,41 @@ async def _run_account_verification_flow(
             status_code=400,
         )
 
-    adapter = create_platform_adapter(
+    adapter = session_runtime.adapter if session_runtime is not None else create_platform_adapter(
         candidate_platform_types[0],
         account.get("platform_url"),
     )
     try:
-        login_result = await _login_platform_account(
-            adapter,
-            account["account_name"],
-            account["password"],
-        )
-        if not login_result.success:
-            raise BizError(
-                4003,
-                f"account verification failed: {login_result.message}",
-                status_code=400,
+        if session_runtime is not None:
+            session_ok = await session_runtime.ensure_logged_in("account_verify")
+            if not session_ok:
+                raise BizError(
+                    4003,
+                    "account verification failed: session unavailable",
+                    status_code=400,
+                )
+            login_result = LoginResult(success=True, token=session_runtime.session.session_token)
+        else:
+            login_result = await _login_platform_account(
+                adapter,
+                account["account_name"],
+                account["password"],
             )
+            if not login_result.success:
+                raise BizError(
+                    4003,
+                    f"account verification failed: {login_result.message}",
+                    status_code=400,
+                )
 
         now = _now_bjt()
-        balance_info = await adapter.query_balance()
+        if session_runtime is not None:
+            balance_info = await session_runtime.run_platform_call(
+                "account_verify_query_balance",
+                adapter.query_balance,
+            )
+        else:
+            balance_info = await adapter.query_balance()
         balance_cents = int(balance_info.balance * 100)
         row = await account_update(
             db,
@@ -721,13 +829,25 @@ async def _run_account_verification_flow(
 
         capabilities: list[PlatformCapabilityProbe] = []
         for platform_type in candidate_platform_types:
-            capability = await _probe_platform_capability(
-                adapter=adapter,
-                db=db,
-                account=account,
-                operator_id=operator_id,
-                platform_type=platform_type,
-            )
+            if session_runtime is not None:
+                capability = await session_runtime.run_platform_call(
+                    f"account_verify_probe_{platform_type}",
+                    lambda _platform_type=platform_type: _probe_platform_capability(
+                        adapter=adapter,
+                        db=db,
+                        account=account,
+                        operator_id=operator_id,
+                        platform_type=_platform_type,
+                    ),
+                )
+            else:
+                capability = await _probe_platform_capability(
+                    adapter=adapter,
+                    db=db,
+                    account=account,
+                    operator_id=operator_id,
+                    platform_type=platform_type,
+                )
             capabilities.append(capability)
             if capability.verify_status == "supported":
                 await account_platform_session_upsert(
@@ -741,7 +861,8 @@ async def _run_account_verification_flow(
                 )
         return row, capabilities
     finally:
-        await adapter.close()
+        if session_runtime is None:
+            await adapter.close()
 
 
 async def _record_shared_market_url(
@@ -812,11 +933,19 @@ async def _verify_account(
         raise
 
     try:
+        engine = getattr(request.app.state, "engine", None)
+        runtime = None
+        if engine is not None and hasattr(engine, "get_runtime_for_account"):
+            runtime = await engine.get_runtime_for_account(
+                account_id=account["id"],
+            )
+
         row, capabilities = await asyncio.wait_for(
             _run_account_verification_flow(
                 db=db,
                 operator_id=operator["id"],
                 account=account,
+                session_runtime=runtime,
             ),
             timeout=VERIFICATION_TIMEOUT_SECONDS,
         )

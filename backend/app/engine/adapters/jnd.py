@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import json
 import time
 from typing import Any, Optional
 from urllib.parse import quote
@@ -177,6 +178,17 @@ class JNDAdapter(PlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
 
+    @classmethod
+    def _response_indicates_remote_login(cls, data: Any) -> bool:
+        if not isinstance(data, dict):
+            return False
+        return cls._safe_int(data.get("State"), 0) < 0
+
+    @staticmethod
+    def _looks_like_login_page(text: str) -> bool:
+        sample = (text or "").lstrip("\ufeff\r\n\t ").lower()
+        return sample.startswith("<!doctype") or sample.startswith("<html")
+
     async def _post(
         self,
         url: str,
@@ -202,7 +214,22 @@ class JNDAdapter(PlatformAdapter):
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 resp.raise_for_status()
-                return await resp.json(content_type=None)
+                text = await resp.text()
+                if self._looks_like_login_page(text):
+                    raise RemoteLoginRequired(
+                        raw_state=-2,
+                        message="platform returned login page",
+                    )
+                payload = text.lstrip("\ufeff\r\n\t ")
+                try:
+                    parsed = json.loads(payload)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"JSON parse failed: {text[:200]}") from exc
+                if self._response_indicates_remote_login(parsed):
+                    raw_state = self._safe_int(parsed.get("State"), -2)
+                    msg = self._safe_text(parsed.get("Msg")) or f"State={raw_state}"
+                    raise RemoteLoginRequired(raw_state=raw_state, message=msg)
+                return parsed
         except aiohttp.ContentTypeError:
             #  content-type
             async with session.post(
@@ -500,7 +527,32 @@ class JNDAdapter(PlatformAdapter):
             f"?lotteryType={self.lottery_type}"
         )
         resp = await self._post(url)
-        balance = float(resp.get("accountLimit", 0))
+        if not isinstance(resp, dict):
+            raise RemoteLoginRequired(
+                raw_state=-2,
+                message="QueryResult returned non-object response",
+            )
+        if "accountLimit" not in resp:
+            raw_state = self._safe_int(resp.get("State"), -2)
+            summary = self._safe_response_summary(resp)
+            raise RemoteLoginRequired(
+                raw_state=raw_state,
+                message=f"QueryResult missing accountLimit: {summary}",
+            )
+        try:
+            balance = float(resp["accountLimit"])
+        except (TypeError, ValueError) as exc:
+            raw_state = self._safe_int(resp.get("State"), -2)
+            raise RemoteLoginRequired(
+                raw_state=raw_state,
+                message=f"QueryResult invalid accountLimit: {resp.get('accountLimit')!r}",
+            ) from exc
+        if not math.isfinite(balance) or balance < 0:
+            raw_state = self._safe_int(resp.get("State"), -2)
+            raise RemoteLoginRequired(
+                raw_state=raw_state,
+                message=f"QueryResult invalid accountLimit: {resp.get('accountLimit')!r}",
+            )
         return BalanceInfo(
             balance=balance,
             raw_response=resp,

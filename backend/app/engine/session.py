@@ -21,7 +21,7 @@ MAX_LOGIN_ATTEMPTS = 5
 PAUSE_AFTER_FAILURES = 3
 PAUSE_DURATION = 600
 MAX_CAPTCHA_FAILURES = 5
-HEARTBEAT_INTERVAL = 75
+HEARTBEAT_INTERVAL = 10
 HEARTBEAT_MAX_FAILS = 3
 _BJT = timezone(timedelta(hours=8))
 
@@ -294,6 +294,29 @@ class SessionManager:
                 self.platform_type,
             )
         return success
+
+    async def reconnect(self) -> bool:
+        """Public reconnect hook for worker-owned recovery paths."""
+        return await self._reconnect()
+
+    async def recover_after_api_failure(self) -> bool:
+        """Check heartbeat before forcing a controlled relogin."""
+        try:
+            if await self.adapter.heartbeat():
+                logger.info(
+                    "API recovery heartbeat ok account_id=%d platform=%s",
+                    self.account_id,
+                    self.platform_type,
+                )
+                return True
+        except Exception as exc:
+            logger.warning(
+                "API recovery heartbeat failed account_id=%d platform=%s: %s",
+                self.account_id,
+                self.platform_type,
+                exc,
+            )
+        return await self._reconnect()
 
     @property
     def is_logged_in(self) -> bool:

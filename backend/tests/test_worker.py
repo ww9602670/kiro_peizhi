@@ -1828,13 +1828,13 @@ class TestFetchInstallWithRetry:
                 install,
             ]
         )
-        worker.session._reconnect = AsyncMock()
+        worker.session.reconnect = AsyncMock()
         worker.session.ensure_session = AsyncMock(return_value=True)
 
         result = await worker._fetch_install_with_retry()
 
         assert result == install
-        worker.session._reconnect.assert_awaited_once()
+        worker.session.reconnect.assert_awaited_once()
         worker.session.ensure_session.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1844,8 +1844,9 @@ class TestFetchInstallWithRetry:
         worker.poller.poll = AsyncMock(
             side_effect=RemoteLoginRequired(raw_state=-2, message="remote login detected")
         )
-        worker.session._reconnect = AsyncMock()
+        worker.session.reconnect = AsyncMock()
         worker.session.ensure_session = AsyncMock(return_value=False)
+        worker._persist_strategy_statuses = AsyncMock()
 
         result = await worker._fetch_install_with_retry()
 
@@ -1854,6 +1855,7 @@ class TestFetchInstallWithRetry:
         assert worker.status == "error"
         worker.alert_service.send.assert_awaited_once()
         assert worker.alert_service.send.await_args.kwargs["alert_type"] == "session_lost"
+        worker._persist_strategy_statuses.assert_awaited_once_with("error")
 
 
 

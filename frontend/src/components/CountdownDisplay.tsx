@@ -24,6 +24,7 @@ const SUM_GREEN = new Set([1, 4, 7, 10, 16, 19, 22, 25]);
 const SUM_BLUE = new Set([2, 5, 8, 11, 17, 20, 23, 26]);
 const SUM_SPECIAL = new Set([0, 13, 14, 27]);
 const COLLAPSED_RECENT_RESULT_COUNT = 3;
+const WAITING_DRAW_DISPLAY = { label: '等待开奖', color: 'yellow' };
 
 function parseBalls(result: string): number[] | null {
   if (!result || !result.trim()) return null;
@@ -104,9 +105,15 @@ export function CountdownDisplay({ platformType, recentResults }: CountdownDispl
     platformType,
   });
 
-  const stateDisplay =
+  const fallbackStateDisplay =
     STATE_DISPLAY_MAP[data?.state as LotteryStateEnum] ??
     STATE_DISPLAY_MAP[LotteryStateEnum.UNKNOWN];
+  const stateDisplay =
+    data && closeCountdown <= 0 && openCountdown <= 0
+      ? WAITING_DRAW_DISPLAY
+      : data && closeCountdown <= 0
+        ? STATE_DISPLAY_MAP[LotteryStateEnum.CLOSED]
+        : fallbackStateDisplay;
   const historyResults = recentResults ?? [];
   const visibleHistoryResults = historyExpanded
     ? historyResults

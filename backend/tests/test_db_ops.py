@@ -5,6 +5,8 @@
 -  A  B  CRUD 
 - operator_id 
 """
+import json
+
 import pytest
 import aiosqlite
 
@@ -446,6 +448,60 @@ async def test_sync_odds_alerts_only_when_running_strategy_platform_matches(db, 
     assert alerts[0]["type"] == "odds_changed"
     assert alerts[0]["title"] == f"赔率变动：账号 {acc['id']}，平台 JND28WEB"
     assert "DX1: 1950 -> 1960" in alerts[0]["detail"]
+
+
+async def test_sync_odds_alert_filters_irrelevant_random_pick_keys(db, two_operators):
+    op_a, _ = two_operators
+    acc = await account_create(
+        db,
+        operator_id=op_a["id"],
+        account_name="odds-random-filter",
+        password="p",
+        platform_type="JND282",
+    )
+    strat = await strategy_create(
+        db,
+        operator_id=op_a["id"],
+        account_id=acc["id"],
+        name="ai-ball1",
+        type="ai_random_flat",
+        play_code="OMR_BALL1",
+        base_amount=100,
+        platform_type="JND282",
+        strategy_config=json.dumps(
+            {
+                "pick_count": 6,
+                "categories": ["ball1"],
+                "weight_mode": "pure_random",
+            }
+        ),
+    )
+    await strategy_update_status(
+        db,
+        strategy_id=strat["id"],
+        operator_id=op_a["id"],
+        status="running",
+    )
+
+    await _sync_odds(
+        db,
+        acc["id"],
+        op_a["id"],
+        "JND282",
+        {"B1QH0": 99170, "DW3_157": 9917000},
+    )
+    await _sync_odds(
+        db,
+        acc["id"],
+        op_a["id"],
+        "JND282",
+        {"B1QH0": 94170, "DW3_157": 9417000},
+    )
+
+    alerts, total = await alert_list_by_operator(db, operator_id=op_a["id"])
+    assert total == 1
+    assert "B1QH0: 99170 -> 94170" in alerts[0]["detail"]
+    assert "DW3_157" not in alerts[0]["detail"]
 
 
 # 

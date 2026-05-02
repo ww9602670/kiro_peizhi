@@ -177,6 +177,52 @@ class TestStopWorker:
         result = await manager.stop_worker(999)
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_stop_worker_removes_session_runtime(self):
+        manager = _make_manager()
+        runtime_key = make_runtime_key(100, "JND282")
+        worker = _make_mock_worker(account_id=100)
+        worker._platform_type = "JND282"
+        worker._has_unsettled_orders = AsyncMock(return_value=False)
+        await manager.registry.register(runtime_key, worker)
+
+        with patch.object(
+            manager.session_runtime_registry,
+            "remove",
+            AsyncMock(),
+        ) as mock_remove:
+            result = await manager.stop_worker(100, "JND282")
+
+        assert result is True
+        worker.stop.assert_called_once()
+        mock_remove.assert_awaited_once_with(100, "JND282")
+        assert await manager.registry.get(runtime_key) is None
+
+    @pytest.mark.asyncio
+    async def test_settling_complete_callback_removes_session_runtime(self):
+        manager = _make_manager()
+        runtime_key = make_runtime_key(100, "JND282")
+        worker = _make_mock_worker(account_id=100)
+        worker._platform_type = "JND282"
+        worker._has_unsettled_orders = AsyncMock(return_value=True)
+        worker.enter_settling_mode = AsyncMock()
+        await manager.registry.register(runtime_key, worker)
+
+        with patch.object(
+            manager.session_runtime_registry,
+            "remove",
+            AsyncMock(),
+        ) as mock_remove:
+            result = await manager.stop_worker(100, "JND282")
+            assert result is True
+            worker.stop.assert_not_called()
+            mock_remove.assert_not_awaited()
+
+            await worker._on_settle_complete(100, "JND282")
+
+        mock_remove.assert_awaited_once_with(100, "JND282")
+        assert await manager.registry.get(runtime_key) is None
+
 
 # 
 # 
@@ -465,16 +511,22 @@ class TestStartWorker:
     async def test_start_worker_builds_settler_without_platform_type_kwarg(self):
         manager = _make_manager()
         worker = _make_mock_worker(account_id=321, operator_id=9, running=False)
+        runtime = MagicMock()
+        runtime.adapter = MagicMock()
+        runtime.session = MagicMock()
 
         with (
-            patch("app.engine.manager.create_platform_adapter", return_value=MagicMock()) as mock_adapter_factory,
-            patch("app.engine.manager.SessionManager", return_value=MagicMock()) as mock_session,
             patch("app.engine.manager.IssuePoller", return_value=MagicMock()) as mock_poller,
             patch("app.engine.manager.RiskController", return_value=MagicMock()) as mock_risk,
             patch("app.engine.manager.BetExecutor", return_value=MagicMock()) as mock_executor,
             patch("app.engine.manager.SettlementProcessor", return_value=MagicMock()) as mock_settler,
             patch("app.engine.manager.Reconciler", return_value=MagicMock()) as mock_reconciler,
             patch("app.engine.manager.AccountWorker", return_value=worker) as mock_worker_cls,
+            patch.object(
+                manager,
+                "get_or_create_session_runtime",
+                AsyncMock(return_value=runtime),
+            ) as mock_get_runtime,
         ):
             result = await manager.start_worker(
                 operator_id=9,
@@ -488,20 +540,15 @@ class TestStartWorker:
 
         assert result is worker
         assert await manager.registry.get(make_runtime_key(321, "JND282")) is worker
-        mock_adapter_factory.assert_called_once_with("JND282", "https://example.test")
-        mock_session.assert_called_once()
+        mock_get_runtime.assert_awaited_once()
         mock_poller.assert_called_once()
         mock_risk.assert_called_once()
         mock_executor.assert_called_once()
         mock_reconciler.assert_called_once()
-        mock_settler.assert_called_once_with(
-            db=manager.db,
-            operator_id=9,
-            account_id=321,
-        )
+        mock_settler.assert_called_once()
         mock_reconciler.assert_called_once_with(
             db=manager.db,
-            adapter=mock_adapter_factory.return_value,
+            adapter=runtime.adapter,
             alert_service=manager.alert_service,
             operator_id=9,
         )
@@ -528,16 +575,22 @@ class TestStartWorker:
         manager = _make_manager()
         worker = _make_mock_worker(account_id=321, operator_id=9, running=False)
         worker.start = AsyncMock(side_effect=WorkerStartupError("startup failed"))
+        runtime = MagicMock()
+        runtime.adapter = MagicMock()
+        runtime.session = MagicMock()
 
         with (
-            patch("app.engine.manager.create_platform_adapter", return_value=MagicMock()),
-            patch("app.engine.manager.SessionManager", return_value=MagicMock()),
             patch("app.engine.manager.IssuePoller", return_value=MagicMock()),
             patch("app.engine.manager.RiskController", return_value=MagicMock()),
             patch("app.engine.manager.BetExecutor", return_value=MagicMock()),
             patch("app.engine.manager.SettlementProcessor", return_value=MagicMock()),
             patch("app.engine.manager.Reconciler", return_value=MagicMock()),
             patch("app.engine.manager.AccountWorker", return_value=worker),
+            patch.object(
+                manager,
+                "get_or_create_session_runtime",
+                AsyncMock(return_value=runtime),
+            ),
         ):
             with pytest.raises(WorkerStartupError):
                 await manager.start_worker(

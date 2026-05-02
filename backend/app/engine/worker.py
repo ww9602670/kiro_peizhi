@@ -37,6 +37,7 @@ from app.engine.poller import IssuePoller
 from app.engine.reconciler import Reconciler
 from app.engine.risk import RiskController
 from app.engine.session import SessionManager
+from app.engine.session_runtime import AccountSessionRuntime
 from app.engine.settlement import SettlementProcessor
 from app.engine.strategies.base import StrategyStopRequest
 from app.engine.strategy_runner import BetSignal, StrategyRunner
@@ -162,6 +163,7 @@ class AccountWorker:
         bet_timing: int = DEFAULT_BET_TIMING,
         platform_type: str = "JND28WEB",
         settlement_wait_seconds: int = SETTLEMENT_WAIT_SECONDS_DEFAULT,
+        session_runtime: AccountSessionRuntime | None = None,
     ) -> None:
         self.operator_id = operator_id
         self.account_id = account_id
@@ -197,6 +199,7 @@ class AccountWorker:
             min(settlement_wait_seconds, SETTLEMENT_WAIT_SECONDS_MAX),
         )
         self._last_signal_collection_reasons: dict[int, str] = {}
+        self.session_runtime = session_runtime
 
         # 
         self.running: bool = False
@@ -477,7 +480,13 @@ class AccountWorker:
     ) -> tuple[InstallInfo, str | None]:
         """Refresh the current issue snapshot before submitting one timing group."""
         try:
-            refreshed = await self.adapter.get_current_install()
+            if self.session_runtime is not None:
+                refreshed = await self.session_runtime.run_platform_call(
+                    "worker_group_revalidate_install",
+                    self.adapter.get_current_install,
+                )
+            else:
+                refreshed = await self.adapter.get_current_install()
         except Exception:
             logger.exception(
                 "group revalidation failed issue=%s account_id=%d bet_timing=%ds",
@@ -753,7 +762,10 @@ class AccountWorker:
             self.operator_id,
             self.account_id,
         )
-        login_ok = await self.session.login()
+        if self.session_runtime is not None:
+            login_ok = await self.session_runtime.ensure_logged_in("worker_startup")
+        else:
+            login_ok = await self.session.login()
         if not login_ok:
             raise WorkerStartupError(
                 f"session login failed account_id={self.account_id} platform={self._platform_type}"
@@ -999,6 +1011,11 @@ class AccountWorker:
         """
         for attempt in range(API_RETRY_MAX):
             try:
+                if self.session_runtime is not None:
+                    return await self.session_runtime.run_platform_call(
+                        "worker_poll_install",
+                        self.poller.poll,
+                    )
                 return await self.poller.poll()
             except RemoteLoginRequired as exc:
                 recovered = await self._recover_remote_login(exc)
@@ -1033,10 +1050,12 @@ class AccountWorker:
             exc.raw_state,
             str(exc),
         )
-        await self.session._reconnect()
-
         try:
-            session_ready = await self.session.ensure_session()
+            if self.session_runtime is not None:
+                session_ready = await self.session_runtime.recover("worker_remote_login")
+            else:
+                await self.session.reconnect()
+                session_ready = await self.session.ensure_session()
         except Exception:
             logger.exception(
                 "remote login recovery check failed account_id=%d state=%s",
@@ -1060,6 +1079,7 @@ class AccountWorker:
             ),
             account_id=self.account_id,
         )
+        await self._persist_strategy_statuses("error")
         return False
 
     # ------------------------------------------------------------------
@@ -1225,7 +1245,13 @@ class AccountWorker:
 
         # 鑾峰彇鍘嗗彶寮€濂栫粨鏋?
         try:
-            results = await self.adapter.get_lottery_results(count=50)
+            if self.session_runtime is not None:
+                results = await self.session_runtime.run_platform_call(
+                    "worker_recover_lottery_results",
+                    lambda: self.adapter.get_lottery_results(count=50),
+                )
+            else:
+                results = await self.adapter.get_lottery_results(count=50)
         except Exception:
             logger.exception(
                 "琛ョ粨绠楋細鑾峰彇鍘嗗彶寮€濂栫粨鏋滃け璐?account_id=%d", self.account_id,
@@ -1407,7 +1433,13 @@ class AccountWorker:
 
         # 鑾峰彇鍘嗗彶寮€濂栫粨鏋?
         try:
-            results = await self.adapter.get_lottery_results(count=50)
+            if self.session_runtime is not None:
+                results = await self.session_runtime.run_platform_call(
+                    "worker_stop_lottery_results",
+                    lambda: self.adapter.get_lottery_results(count=50),
+                )
+            else:
+                results = await self.adapter.get_lottery_results(count=50)
         except Exception:
             logger.exception(
                 "鍋滄鍓嶈ˉ缁撶畻锛氳幏鍙栧巻鍙插紑濂栫粨鏋滃け璐?account_id=%d",
@@ -1422,7 +1454,13 @@ class AccountWorker:
 
         # 涔熷皾璇曚粠 GetCurrentInstall 鑾峰彇涓婃湡缁撴灉
         try:
-            install = await self.poller.poll()
+            if self.session_runtime is not None:
+                install = await self.session_runtime.run_platform_call(
+                    "worker_stop_poll_install",
+                    self.poller.poll,
+                )
+            else:
+                install = await self.poller.poll()
             if install and install.pre_issue and install.pre_result:
                 result_map[str(install.pre_issue)] = install.pre_result
         except Exception:

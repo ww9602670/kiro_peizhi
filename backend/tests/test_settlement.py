@@ -2211,7 +2211,7 @@ class TestPersistPlatformRecords:
 # ──────────────────────────────────────────────
 
 from unittest.mock import AsyncMock, MagicMock
-from app.engine.adapters.base import BalanceInfo
+from app.engine.adapters.base import BalanceInfo, RemoteLoginRequired
 
 
 class _FakeAdapter:
@@ -2297,6 +2297,11 @@ class TestSettleReal:
             db, setup_data, key_code="DX1", amount=1000, odds=19800,
             idempotent_id="t4-real-qf-1",
         )
+        await db.execute(
+            "UPDATE gambling_accounts SET balance=? WHERE id=?",
+            (515700, setup_data["account"]["id"]),
+        )
+        await db.commit()
 
         adapter = _FakeAdapter(
             query_balance_error=True,
@@ -2314,6 +2319,13 @@ class TestSettleReal:
         assert settled["status"] == "settled"
         assert settled["match_source"] == "platform"
         assert settled["is_win"] == 0
+        row = await (
+            await db.execute(
+                "SELECT balance FROM gambling_accounts WHERE id=?",
+                (setup_data["account"]["id"],),
+            )
+        ).fetchone()
+        assert row["balance"] == 515700
 
 
 # ──────────────────────────────────────────────
@@ -2369,6 +2381,63 @@ class TestRetryApi:
         with pytest.raises(ConnectionError, match="fail-3"):
             await processor._retry_api(always_fail, max_retries=3, interval=0)
         assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_retry_remote_login_recovers_and_retries(self, db, setup_data):
+        """会话失效时先重登，再重试原 API。"""
+        recover = AsyncMock(return_value=True)
+        processor = SettlementProcessor(
+            db,
+            setup_data["operator"]["id"],
+            session_recover=recover,
+        )
+        call_count = 0
+
+        async def remote_login_then_success():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RemoteLoginRequired(raw_state=-2, message="remote login")
+            return "ok"
+
+        result = await processor._retry_api(
+            remote_login_then_success,
+            max_retries=3,
+            interval=0,
+            recover_session=True,
+        )
+
+        assert result == "ok"
+        assert call_count == 2
+        recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_retry_remote_login_recovery_failure_raises_without_retry(
+        self, db, setup_data,
+    ):
+        recover = AsyncMock(return_value=False)
+        processor = SettlementProcessor(
+            db,
+            setup_data["operator"]["id"],
+            session_recover=recover,
+        )
+        call_count = 0
+
+        async def always_remote_login():
+            nonlocal call_count
+            call_count += 1
+            raise RemoteLoginRequired(raw_state=-2, message="remote login")
+
+        with pytest.raises(RemoteLoginRequired, match="remote login"):
+            await processor._retry_api(
+                always_remote_login,
+                max_retries=3,
+                interval=0,
+                recover_session=True,
+            )
+
+        assert call_count == 1
+        recover.assert_awaited_once()
 
 
 # ──────────────────────────────────────────────

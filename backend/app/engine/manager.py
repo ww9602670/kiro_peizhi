@@ -23,7 +23,7 @@ from app.engine.poller import IssuePoller
 from app.engine.rate_limiter import RateLimiter
 from app.engine.reconciler import Reconciler
 from app.engine.risk import RiskController
-from app.engine.session import SessionManager
+from app.engine.session_runtime import AccountSessionRuntime, SessionRuntimeRegistry
 from app.engine.settlement import SettlementProcessor
 from app.engine.shared_market_runtime import SharedMarketRuntime
 from app.engine.strategy_runner import StrategyRunner
@@ -241,6 +241,7 @@ class EngineManager:
         self._account_consecutive_bet_fails: dict[int, int] = {}
         self._health_check_task: Optional[asyncio.Task] = None
         self._shutting_down = False
+        self.session_runtime_registry = SessionRuntimeRegistry()
 
     def _create_adapter(self, platform_type: str, platform_url: Optional[str] = None) -> PlatformAdapter:
         return create_platform_adapter(platform_type, platform_url)
@@ -284,18 +285,17 @@ class EngineManager:
                 existing.exit_settling_mode()
             return await self._hot_update_worker(existing, strategies)
 
-        adapter = self._create_adapter(runtime_key[1], platform_url)
-        rate_limiter = RateLimiter()
-        session = SessionManager(
-            adapter=adapter,
-            alert_service=self.alert_service,
+        runtime = await self.get_or_create_session_runtime(
             operator_id=operator_id,
             account_id=account_id,
             account_name=account_name,
             password=password,
             platform_type=runtime_key[1],
-            db=self.db,
+            platform_url=platform_url,
         )
+        adapter = runtime.adapter
+        session = runtime.session
+        rate_limiter = RateLimiter()
         shared_owner_key = make_shared_market_owner_key(account_id, runtime_key[1])
         poller = IssuePoller(
             adapter=adapter,
@@ -320,11 +320,15 @@ class EngineManager:
             operator_id=operator_id,
             account_id=account_id,
             platform_type=runtime_key[1],
+            session_runtime=runtime,
         )
         settler = SettlementProcessor(
             db=self.db,
             operator_id=operator_id,
+            alert_service=self.alert_service,
             account_id=account_id,
+            session_recover=lambda: runtime.recover("settlement"),
+            session_runtime=runtime,
         )
         reconciler = Reconciler(
             db=self.db,
@@ -349,6 +353,7 @@ class EngineManager:
             strategies=strategy_runners,
             strategy_profiles=strategy_profiles,
             platform_type=runtime_key[1],
+            session_runtime=runtime,
         )
 
         await self.registry.register(runtime_key, worker)
@@ -410,14 +415,16 @@ class EngineManager:
                 await self._release_shared_market_owner(worker)
                 await self.registry.unregister(registry_key)
                 await self.session_store.delete(registry_key)
+                await self._remove_session_runtime(account_id, platform_type)
 
             worker._on_settle_complete = _on_complete
             await worker.enter_settling_mode()
         else:
-            await self.registry.unregister(registry_key)
             await worker.stop()
             await self._release_shared_market_owner(worker)
+            await self.registry.unregister(registry_key)
             await self.session_store.delete(registry_key)
+            await self._remove_session_runtime(account_id, platform_type)
         return True
 
     async def global_kill_switch(self) -> None:
@@ -547,17 +554,30 @@ class EngineManager:
             await asyncio.gather(
                 *(self._stop_worker_safe(runtime_key, worker) for runtime_key, worker in workers.items())
             )
+        await self.session_runtime_registry.shutdown()
         await self.shared_market_runtime.shutdown()
         logger.info("EngineManager stopped_workers=%d", len(workers))
 
     async def _stop_worker_safe(self, runtime_key: RuntimeKey, worker: AccountWorker) -> None:
+        account_id, platform_type = _runtime_key_parts(runtime_key, worker)
         try:
             await worker.stop()
             await self._release_shared_market_owner(worker)
             await self.registry.unregister(runtime_key)
             await self.session_store.delete(runtime_key)
+            await self._remove_session_runtime(account_id, platform_type)
         except Exception:
             logger.exception("failed to stop worker key=%s", runtime_key)
+
+    async def _remove_session_runtime(self, account_id: int, platform_type: str) -> None:
+        try:
+            await self.session_runtime_registry.remove(account_id, platform_type)
+        except Exception:
+            logger.exception(
+                "failed to remove session runtime account_id=%d platform=%s",
+                account_id,
+                platform_type,
+            )
 
     async def _release_shared_market_owner(self, worker: AccountWorker | None) -> None:
         poller = getattr(worker, "poller", None)
@@ -568,6 +588,61 @@ class EngineManager:
             await self.shared_market_runtime.release_owner(owner_key)
         except Exception:
             logger.exception("shared collector release failed owner=%s", owner_key)
+
+    async def get_or_create_session_runtime(
+        self,
+        *,
+        operator_id: int,
+        account_id: int,
+        account_name: str,
+        password: str,
+        platform_type: str,
+        platform_url: str | None = None,
+    ) -> AccountSessionRuntime:
+        return await self.session_runtime_registry.get_or_create(
+            db=self.db,
+            alert_service=self.alert_service,
+            operator_id=operator_id,
+            account_id=account_id,
+            account_name=account_name,
+            password=password,
+            platform_type=platform_type,
+            platform_url=platform_url,
+        )
+
+    async def get_runtime_for_account(
+        self,
+        *,
+        account_id: int,
+        platform_type: str | None = None,
+    ) -> AccountSessionRuntime | None:
+        if platform_type:
+            runtime = self.session_runtime_registry.get(account_id, platform_type)
+            if runtime is not None:
+                return runtime
+        workers = await self.registry.all_workers()
+        for runtime_key in workers:
+            rid, rplatform = _runtime_key_parts(runtime_key)
+            if rid != account_id:
+                continue
+            runtime = self.session_runtime_registry.get(rid, rplatform)
+            if runtime is not None:
+                return runtime
+        return self.session_runtime_registry.find_by_account(account_id)
+
+    async def get_worker(
+        self,
+        *,
+        account_id: int,
+        platform_type: str | None = None,
+    ) -> AccountWorker | None:
+        if platform_type:
+            return await self.registry.get(make_runtime_key(account_id, platform_type))
+        workers = await self.registry.all_workers()
+        for key, worker in workers.items():
+            if _runtime_key_matches_account(key, account_id):
+                return worker
+        return None
 
     def _build_runtime_profile(
         self,

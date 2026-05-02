@@ -65,6 +65,56 @@ describe('CountdownDisplay', () => {
     expect(mockUseLotteryCountdown).toHaveBeenCalledWith({ platformType: 'JND282' });
   });
 
+  it('shows closed state after close countdown reaches zero while draw countdown continues', () => {
+    mockUseLotteryCountdown.mockReturnValue({
+      data: {
+        installments: '20260419019',
+        state: LotteryStateEnum.OPEN,
+        close_countdown_sec: 0,
+        open_countdown_sec: 35,
+        pre_lottery_result: '1,2,3',
+        pre_installments: '20260419018',
+        template_code: 'JND282',
+        market_data_state: 'shared_hit',
+      },
+      closeCountdown: 0,
+      openCountdown: 35,
+      closeTimestamp: 0,
+      openTimestamp: 35,
+      error: null,
+      lastUpdateTime: null,
+    });
+
+    render(<CountdownDisplay />);
+
+    expect(screen.getByText('封盘中')).toBeInTheDocument();
+  });
+
+  it('shows waiting for draw when both countdowns are zero', () => {
+    mockUseLotteryCountdown.mockReturnValue({
+      data: {
+        installments: '20260419020',
+        state: LotteryStateEnum.CLOSED,
+        close_countdown_sec: 0,
+        open_countdown_sec: 0,
+        pre_lottery_result: '1,2,3',
+        pre_installments: '20260419019',
+        template_code: 'JND282',
+        market_data_state: 'shared_hit',
+      },
+      closeCountdown: 0,
+      openCountdown: 0,
+      closeTimestamp: 0,
+      openTimestamp: 0,
+      error: null,
+      lastUpdateTime: null,
+    });
+
+    render(<CountdownDisplay />);
+
+    expect(screen.getByText('等待开奖')).toBeInTheDocument();
+  });
+
   it('renders recent results as compact rows with full issue numbers', () => {
     mockUseLotteryCountdown.mockReturnValue({
       data: {

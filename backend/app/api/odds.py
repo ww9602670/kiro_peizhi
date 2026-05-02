@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.accounts import _login_platform_account, _normal_positive_odds, _sync_odds
 from app.api.dependencies import get_current_operator, get_db_conn
@@ -194,34 +194,63 @@ async def confirm_account_odds(
 @router.post("/accounts/{account_id}/odds/refresh")
 async def refresh_account_odds(
     account_id: int,
+    request: Request,
     platform_type: str | None = Query(default=None),
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
     account = await _get_verified_account(account_id, operator, db)
     resolved_platform_type = _resolve_platform_type(account, platform_type)
-    adapter = create_platform_adapter(
-        resolved_platform_type,
-        account.get("platform_url"),
+    engine = getattr(request.app.state, "engine", None)
+    session_runtime = None
+    if engine is not None and hasattr(engine, "get_runtime_for_account"):
+        session_runtime = await engine.get_runtime_for_account(
+            account_id=account["id"],
+            platform_type=resolved_platform_type,
+        )
+    adapter = (
+        session_runtime.adapter
+        if session_runtime is not None
+        else create_platform_adapter(
+            resolved_platform_type,
+            account.get("platform_url"),
+        )
     )
 
     try:
-        login_result = await _login_platform_account(
-            adapter,
-            account["account_name"],
-            account["password"],
-        )
-        if not login_result.success:
-            return ApiResponse[OddsRefreshResponse](
-                data=_build_refresh_response(
-                    account_id=account_id,
-                    platform_type=resolved_platform_type,
-                    odds_message=f"login failed: {login_result.message}",
+        if session_runtime is not None:
+            session_ok = await session_runtime.ensure_logged_in("odds_refresh")
+            if not session_ok:
+                return ApiResponse[OddsRefreshResponse](
+                    data=_build_refresh_response(
+                        account_id=account_id,
+                        platform_type=resolved_platform_type,
+                        odds_message="login failed: session unavailable",
+                    )
                 )
+        else:
+            login_result = await _login_platform_account(
+                adapter,
+                account["account_name"],
+                account["password"],
             )
+            if not login_result.success:
+                return ApiResponse[OddsRefreshResponse](
+                    data=_build_refresh_response(
+                        account_id=account_id,
+                        platform_type=resolved_platform_type,
+                        odds_message=f"login failed: {login_result.message}",
+                    )
+                )
 
         try:
-            install = await adapter.get_current_install()
+            if session_runtime is not None:
+                install = await session_runtime.run_platform_call(
+                    "odds_refresh_get_install",
+                    adapter.get_current_install,
+                )
+            else:
+                install = await adapter.get_current_install()
         except Exception as exc:
             logger.warning("get_current_install failed account_id=%d: %s", account_id, exc)
             return ApiResponse[OddsRefreshResponse](
@@ -253,7 +282,13 @@ async def refresh_account_odds(
             )
 
         try:
-            raw_odds = await adapter.load_odds(install.issue)
+            if session_runtime is not None:
+                raw_odds = await session_runtime.run_platform_call(
+                    "odds_refresh_load_odds",
+                    lambda: adapter.load_odds(install.issue),
+                )
+            else:
+                raw_odds = await adapter.load_odds(install.issue)
         except Exception as exc:
             logger.warning("load_odds failed account_id=%d: %s", account_id, exc)
             return ApiResponse[OddsRefreshResponse](
@@ -302,4 +337,5 @@ async def refresh_account_odds(
             )
         )
     finally:
-        await adapter.close()
+        if session_runtime is None:
+            await adapter.close()

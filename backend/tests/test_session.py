@@ -7,7 +7,7 @@
 4.  0
 5. 
 6.  5 
-7.  75  heartbeat
+7.  10  heartbeat
 8.  3  reconnect
 9. reconnect token 
 10. AlertService.send login_fail/captcha_fail/session_lost
@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 import pytest
 
 from app.engine.adapters.base import LoginResult
+from app.engine.session_runtime import AccountSessionRuntime, SESSION_BLOCKED
 from app.engine.session import (
     SessionManager,
     RETRY_DELAYS,
@@ -363,7 +364,7 @@ async def test_success_after_failures_resets_all(session, mock_adapter):
 
 @pytest.mark.asyncio
 async def test_heartbeat_calls_adapter(session, mock_adapter):
-    """ 75  adapter.heartbeat()"""
+    """10s interval calls adapter.heartbeat()."""
     sleep_calls = []
     heartbeat_count = 0
 
@@ -467,6 +468,28 @@ async def test_heartbeat_exception_counts_as_failure(session, mock_adapter):
         await session._heartbeat_loop()
 
     assert reconnect_called is True
+
+
+@pytest.mark.asyncio
+async def test_api_recovery_uses_heartbeat_before_reconnect(session, mock_adapter):
+    mock_adapter.heartbeat.return_value = True
+    session._reconnect = AsyncMock(return_value=True)
+
+    assert await session.recover_after_api_failure() is True
+
+    mock_adapter.heartbeat.assert_awaited_once()
+    session._reconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_api_recovery_reconnects_when_heartbeat_fails(session, mock_adapter):
+    mock_adapter.heartbeat.return_value = False
+    session._reconnect = AsyncMock(return_value=True)
+
+    assert await session.recover_after_api_failure() is True
+
+    mock_adapter.heartbeat.assert_awaited_once()
+    session._reconnect.assert_awaited_once()
 
 
 # 
@@ -596,6 +619,73 @@ async def test_alert_session_lost_type(session, mock_adapter, mock_alert_service
 
     with patch("app.engine.session.asyncio.sleep", new_callable=AsyncMock):
         await session._heartbeat_loop()
+
+    send_calls = mock_alert_service.send.call_args_list
+    alert_types = [c.kwargs.get("alert_type") for c in send_calls]
+    assert "session_lost" in alert_types
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_ensure_logged_in_single_flight(db, mock_alert_service):
+    adapter = AsyncMock()
+    adapter.close = AsyncMock(return_value=None)
+    runtime = AccountSessionRuntime(
+        db=db,
+        alert_service=mock_alert_service,
+        operator_id=1,
+        account_id=99,
+        account_name="acc",
+        password="pw",
+        platform_type="JND28WEB",
+        adapter=adapter,
+    )
+    call_count = 0
+
+    async def ensure_session():
+        nonlocal call_count
+        call_count += 1
+        runtime.session.session_token = "tok"
+        await asyncio.sleep(0)
+        return True
+
+    runtime.session.ensure_session = AsyncMock(side_effect=ensure_session)
+
+    results = await asyncio.gather(
+        runtime.ensure_logged_in("t1"),
+        runtime.ensure_logged_in("t2"),
+        runtime.ensure_logged_in("t3"),
+    )
+
+    assert results == [True, True, True]
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_blocked_on_risk_markers(db, mock_alert_service):
+    adapter = AsyncMock()
+    adapter.close = AsyncMock(return_value=None)
+    runtime = AccountSessionRuntime(
+        db=db,
+        alert_service=mock_alert_service,
+        operator_id=1,
+        account_id=100,
+        account_name="acc",
+        password="pw",
+        platform_type="JND28WEB",
+        adapter=adapter,
+    )
+    runtime.session.ensure_session = AsyncMock(return_value=True)
+    runtime.session.session_token = "tok"
+
+    async def boom():
+        raise RuntimeError("HTTP 403 Cloudflare challenge")
+
+    with pytest.raises(RuntimeError):
+        await runtime.run_platform_call("probe", boom)
+
+    assert runtime.snapshot().state == SESSION_BLOCKED
+    assert await runtime.ensure_logged_in("retry") is False
+    return
 
     send_calls = mock_alert_service.send.call_args_list
     alert_types = [c.kwargs.get("alert_type") for c in send_calls]

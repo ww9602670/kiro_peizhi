@@ -78,6 +78,12 @@ class TestBaseClasses:
         assert result.message == ""
         assert result.captcha_required is False
 
+    def test_login_page_detection_handles_bom(self, adapter):
+        assert adapter._looks_like_login_page("\ufeff\n<html><body>login</body></html>")
+
+    def test_negative_state_indicates_remote_login(self, adapter):
+        assert adapter._response_indicates_remote_login({"State": -2, "Msg": "timeout"})
+
 
 # ------------------------------------------------------------------
 # 2. PLATFORM_CONFIGS 
@@ -534,6 +540,20 @@ class TestQueryBalance:
         info = await adapter.query_balance()
 
         assert info.balance == 0.0
+
+    @pytest.mark.asyncio
+    async def test_missing_account_limit_requires_recovery(self, adapter):
+        _patch_post(adapter, {"State": 1, "Msg": "ok"})
+
+        with pytest.raises(RemoteLoginRequired, match="missing accountLimit"):
+            await adapter.query_balance()
+
+    @pytest.mark.asyncio
+    async def test_invalid_account_limit_requires_recovery(self, adapter):
+        _patch_post(adapter, {"State": 1, "accountLimit": "not-a-number"})
+
+        with pytest.raises(RemoteLoginRequired, match="invalid accountLimit"):
+            await adapter.query_balance()
 
 
 # ------------------------------------------------------------------

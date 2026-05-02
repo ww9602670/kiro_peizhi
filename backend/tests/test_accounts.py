@@ -456,6 +456,66 @@ async def test_account_verify(client):
 
 
 @pytest.mark.asyncio
+async def test_account_verify_reuses_running_session_runtime(client, monkeypatch):
+    uid = _uid()
+    token, _ = await _create_operator(f"verify_runtime_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+    create_resp = await client.post(
+        "/api/v1/accounts",
+        headers=headers,
+        json={
+            "account_name": f"verify_runtime_{uid}",
+            "password": "pass123",
+            "game_type": "JND28",
+            "platform_url": _platform_url("JND282"),
+        },
+    )
+    account_id = create_resp.json()["data"]["id"]
+
+    class RuntimeAdapter:
+        async def query_balance(self):
+            return BalanceInfo(balance=66.88)
+
+        async def get_current_install(self):
+            return InstallInfo(
+                issue="3403606",
+                state=1,
+                close_countdown_sec=30,
+                pre_issue="3403605",
+                pre_result="1,2,3",
+                open_countdown_sec=40,
+            )
+
+        async def load_odds(self, issue):
+            _ = issue
+            return {"DX1": 20530}
+
+    class RuntimeStub:
+        def __init__(self):
+            self.adapter = RuntimeAdapter()
+            self.session = SimpleNamespace(session_token="runtime-token")
+            self.ensure_logged_in = AsyncMock(return_value=True)
+
+        async def run_platform_call(self, _reason, func):
+            return await func()
+
+    runtime = RuntimeStub()
+    engine_stub = SimpleNamespace(
+        get_runtime_for_account=AsyncMock(return_value=runtime),
+    )
+    monkeypatch.setattr(app.state, "engine", engine_stub, raising=False)
+    monkeypatch.setattr(
+        accounts_api,
+        "_login_platform_account",
+        AsyncMock(side_effect=AssertionError("should not relogin when runtime is reused")),
+    )
+
+    resp = await client.post(f"/api/v1/accounts/{account_id}/verify", headers=headers)
+    assert resp.status_code == 200
+    assert runtime.ensure_logged_in.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_account_logout_invalidates_effective_verification(client):
     uid = _uid()
     token, _ = await _create_operator(f"logoutop_{uid}")

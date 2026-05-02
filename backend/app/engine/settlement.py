@@ -30,11 +30,13 @@ def _now_bj() -> str:
 def _today_bj() -> str:
     """返回北京时间日期字符串"""
     return datetime.now(_BJT).strftime("%Y-%m-%d")
-from typing import TYPE_CHECKING
+from typing import Awaitable, Callable, TYPE_CHECKING
 
 import aiosqlite
 
+from app.engine.adapters.base import RemoteLoginRequired
 from app.engine.adapters.config import PLATFORM_CONFIGS
+from app.engine.session_runtime import AccountSessionRuntime
 from app.models.db_ops import (
     account_update,
     bet_order_update_status,
@@ -127,13 +129,26 @@ class SettleResult:
 # SettlementProcessor
 # 
 
+SessionRecover = Callable[[], Awaitable[bool]]
+
+
 class SettlementProcessor:
     """"""
 
-    def __init__(self, db: aiosqlite.Connection, operator_id: int, alert_service=None, account_id: int | None = None) -> None:
+    def __init__(
+        self,
+        db: aiosqlite.Connection,
+        operator_id: int,
+        alert_service=None,
+        account_id: int | None = None,
+        session_recover: SessionRecover | None = None,
+        session_runtime: AccountSessionRuntime | None = None,
+    ) -> None:
         self.db = db
         self.operator_id = operator_id
         self.alert_service = alert_service
+        self.session_recover = session_recover
+        self.session_runtime = session_runtime
         self.account_id = account_id  # 按账户隔离结算，避免跨账户误匹配
 
     # ==================================================================
@@ -599,7 +614,13 @@ class SettlementProcessor:
     # Task 4: 真实投注结算路径
     # ==================================================================
 
-    async def _retry_api(self, func, max_retries: int = 3, interval: int = 5):
+    async def _retry_api(
+        self,
+        func,
+        max_retries: int = 3,
+        interval: int = 5,
+        recover_session: bool = False,
+    ):
         """通用 API 重试，固定间隔，最多 max_retries 次
 
         全部失败后抛出最后一次异常。
@@ -607,7 +628,31 @@ class SettlementProcessor:
         last_error: Exception | None = None
         for attempt in range(max_retries):
             try:
+                if self.session_runtime is not None:
+                    return await self.session_runtime.run_platform_call(
+                        "settlement_api_call",
+                        func,
+                    )
                 return await func()
+            except RemoteLoginRequired as e:
+                last_error = e
+                logger.warning(
+                    "结算 API 检测到会话失效 attempt=%d/%d: %s",
+                    attempt + 1,
+                    max_retries,
+                    e,
+                )
+                recovered = False
+                if recover_session and self.session_recover is not None:
+                    try:
+                        recovered = await self.session_recover()
+                    except Exception:
+                        logger.exception("结算 API 自动重登异常")
+                        recovered = False
+                if not recovered:
+                    raise
+                if attempt < max_retries - 1:
+                    continue
             except Exception as e:
                 last_error = e
                 logger.warning(
@@ -698,7 +743,10 @@ class SettlementProcessor:
         """
         # 1. 更新余额（QueryResult）
         try:
-            balance_info = await self._retry_api(adapter.query_balance)
+            balance_info = await self._retry_api(
+                adapter.query_balance,
+                recover_session=True,
+            )
             account_limit = balance_info.balance
             # accountLimit 为负值或非数值时不更新
             if not isinstance(account_limit, (int, float)):
@@ -716,7 +764,8 @@ class SettlementProcessor:
         fetch_count = max(len(orders) * 2, 100)
         try:
             platform_bets = await self._retry_api(
-                lambda: adapter.get_bet_history(count=fetch_count)
+                lambda: adapter.get_bet_history(count=fetch_count),
+                recover_session=True,
             )
         except Exception:
             # 3 次重试全部失败 → settle_failed + 告警

@@ -18,6 +18,7 @@ import aiosqlite
 from app.engine.adapters.base import BetResult, InstallInfo, PlatformAdapter
 from app.engine.alert import AlertService
 from app.engine.risk import RiskCheckResult, RiskController
+from app.engine.session_runtime import AccountSessionRuntime
 from app.engine.strategy_runner import BetSignal
 from app.models.db_ops import (
     account_update,
@@ -58,6 +59,7 @@ class BetExecutor:
         operator_id: int,
         account_id: int,
         platform_type: str,
+        session_runtime: AccountSessionRuntime | None = None,
     ) -> None:
         self.db = db
         self.adapter = adapter
@@ -66,6 +68,7 @@ class BetExecutor:
         self.operator_id = operator_id
         self.account_id = account_id
         self.platform_type = platform_type
+        self.session_runtime = session_runtime
 
     def _log_confirmbet_terminal(
         self,
@@ -288,7 +291,13 @@ class BetExecutor:
             return None
 
         try:
-            live_odds = await self.adapter.load_odds(install.issue)
+            if self.session_runtime is not None:
+                live_odds = await self.session_runtime.run_platform_call(
+                    "executor_runtime_load_odds",
+                    lambda: self.adapter.load_odds(install.issue),
+                )
+            else:
+                live_odds = await self.adapter.load_odds(install.issue)
         except Exception:
             logger.exception(
                 "runtime odds refresh failed issue=%s account_id=%d",
@@ -524,9 +533,13 @@ class BetExecutor:
         effective_betdata = betdata
 
         try:
-            result: BetResult = await self.adapter.place_bet(
-                install.issue, betdata
-            )
+            if self.session_runtime is not None:
+                result = await self.session_runtime.run_platform_call(
+                    "executor_place_bet",
+                    lambda: self.adapter.place_bet(install.issue, betdata),
+                )
+            else:
+                result = await self.adapter.place_bet(install.issue, betdata)
         except (TimeoutError, asyncio.TimeoutError):
             self._log_confirmbet_terminal(
                 issue=install.issue,
@@ -669,7 +682,13 @@ class BetExecutor:
             return None
 
         try:
-            live_odds = await self.adapter.load_odds(install.issue)
+            if self.session_runtime is not None:
+                live_odds = await self.session_runtime.run_platform_call(
+                    "executor_retry_load_odds",
+                    lambda: self.adapter.load_odds(install.issue),
+                )
+            else:
+                live_odds = await self.adapter.load_odds(install.issue)
         except Exception:
             logger.exception(
                 "获取实时赔率失败 issue=%s account_id=%d",
@@ -709,7 +728,13 @@ class BetExecutor:
         )
 
         try:
-            result = await self.adapter.place_bet(install.issue, new_betdata)
+            if self.session_runtime is not None:
+                result = await self.session_runtime.run_platform_call(
+                    "executor_retry_place_bet",
+                    lambda: self.adapter.place_bet(install.issue, new_betdata),
+                )
+            else:
+                result = await self.adapter.place_bet(install.issue, new_betdata)
             if not isinstance(result.raw_response, dict):
                 result.raw_response = {}
             result.raw_response["_retry_attempt"] = True
@@ -728,7 +753,13 @@ class BetExecutor:
             install.state == 1 and install.close_countdown_sec > SAFE_CLOSE_THRESHOLD
         )
         try:
-            detail = await self.adapter.get_current_install_detail()
+            if self.session_runtime is not None:
+                detail = await self.session_runtime.run_platform_call(
+                    "executor_retry_revalidate_install",
+                    self.adapter.get_current_install_detail,
+                )
+            else:
+                detail = await self.adapter.get_current_install_detail()
         except Exception:
             logger.exception(
                 "retry revalidation failed issue=%s account_id=%d",
