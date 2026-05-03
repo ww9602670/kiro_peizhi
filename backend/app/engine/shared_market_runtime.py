@@ -973,7 +973,9 @@ class SharedMarketRuntime:
 
     def _is_market_closed_install(self, install: InstallInfo) -> bool:
         state = _safe_int(getattr(install, "state", 0), 0)
-        if state in (1, 2, 3):
+        if state == 3:
+            return True
+        if state in (1, 2):
             return False
         return (
             state == 0

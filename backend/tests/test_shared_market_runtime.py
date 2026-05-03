@@ -967,7 +967,7 @@ async def test_collector_market_closed_stops_draw_pending(monkeypatch):
         stop_event.set()
         return _make_install(
             issue="20260431001",
-            state=0,
+            state=3,
             close_countdown_sec=0,
             open_countdown_sec=0,
             pre_issue="20260431000",
