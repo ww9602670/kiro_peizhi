@@ -17,11 +17,17 @@ from app.api.dependencies import get_current_operator, get_db_conn
 from app.engine.adapters.base import InstallInfo, RemoteLoginRequired
 from app.engine.adapters.factory import create_platform_adapter
 from app.engine.shared_market_runtime import (
+    DEFAULT_LOCAL_FALLBACK_INTERVAL_SECONDS,
     DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS,
+    DRAW_STATE_PENDING,
+    DRAW_STATE_WAIT_RETRY,
+    MARKET_STATE_MARKET_CLOSED,
+    MARKET_STATE_SHARED_ERROR,
+    MARKET_STATE_SHARED_OK,
+    MARKET_STATE_SHARED_STALE,
     PUBLIC_STATE_LOCAL_FALLBACK,
-    PUBLIC_STATE_PROCESSING,
-    PUBLIC_STATE_SHARED_HIT,
     normalize_market_url,
+    normalize_draw_state,
     normalize_shared_market_state,
 )
 from app.models.db_ops import account_list_by_operator, account_platform_session_list
@@ -32,6 +38,8 @@ from app.schemas.lottery import CurrentInstallResponse
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_API_LAST_LOCAL_FALLBACK_AT: dict[str, datetime] = {}
+_API_LAST_LOCAL_FALLBACK_INSTALL: dict[str, InstallInfo] = {}
 
 
 def _default_current_install_response() -> CurrentInstallResponse:
@@ -84,10 +92,45 @@ def _normalize_market_data_state(
     return normalize_shared_market_state(value, default=default)
 
 
+def _normalize_draw_state_value(value: object) -> str:
+    return normalize_draw_state(value, default="normal")
+
+
 def _resolve_worker_market_data_state(worker: object) -> str:
     poller = getattr(worker, "poller", None)
     state = getattr(poller, "shared_market_state", None)
     return _normalize_market_data_state(state, default=PUBLIC_STATE_LOCAL_FALLBACK)
+
+
+def _build_local_fallback_key(*, account_id: int, requested_platform_type: str) -> str:
+    return f"account:{account_id}:{requested_platform_type}"
+
+
+def _snapshot_market_data_state(snapshot: object, *, freshness_seconds: int) -> str:
+    state = _normalize_market_data_state(
+        getattr(snapshot, "market_data_state", None),
+        default=MARKET_STATE_SHARED_OK,
+    )
+    source_status = _safe_text(getattr(snapshot, "source_status", "")).strip().lower()
+    if state == MARKET_STATE_SHARED_OK and source_status in {"error", "failed", "offline"}:
+        return MARKET_STATE_SHARED_ERROR
+    if state == MARKET_STATE_SHARED_OK and source_status in {"stale", "expired"}:
+        return MARKET_STATE_SHARED_STALE
+    if state == MARKET_STATE_SHARED_OK and source_status in {"closed", "market_closed"}:
+        return MARKET_STATE_MARKET_CLOSED
+    if state == MARKET_STATE_SHARED_OK and not _snapshot_is_fresh(snapshot, freshness_seconds=freshness_seconds):
+        return MARKET_STATE_SHARED_STALE
+    return state
+
+
+def _can_use_local_fallback_for_snapshot(
+    *,
+    market_data_state: str,
+    draw_state: str,
+) -> bool:
+    if draw_state in {DRAW_STATE_PENDING, DRAW_STATE_WAIT_RETRY}:
+        return False
+    return market_data_state in {MARKET_STATE_SHARED_ERROR, MARKET_STATE_SHARED_STALE}
 
 
 def _resolve_worker_snapshot(worker: object) -> dict[str, Any] | None:
@@ -104,6 +147,13 @@ def _resolve_worker_snapshot(worker: object) -> dict[str, Any] | None:
         "pre_lottery_result": getattr(install, "pre_result", ""),
         "pre_installments": getattr(install, "pre_issue", ""),
         "template_code": getattr(install, "template_code", ""),
+        "market_data_state": getattr(install, "market_data_state", None),
+        "draw_state": getattr(install, "draw_state", None),
+        "next_normal_refresh_at": getattr(install, "next_normal_refresh_at", None),
+        "next_draw_retry_at": getattr(install, "next_draw_retry_at", None),
+        "snapshot_version": getattr(install, "snapshot_version", 0),
+        "message_code": getattr(install, "message_code", None),
+        "message_text": getattr(install, "message_text", None),
     }
 
 
@@ -116,6 +166,13 @@ def _install_to_detail(install: InstallInfo) -> dict[str, Any]:
         "pre_lottery_result": getattr(install, "pre_result", ""),
         "pre_installments": getattr(install, "pre_issue", ""),
         "template_code": getattr(install, "template_code", ""),
+        "market_data_state": getattr(install, "market_data_state", None),
+        "draw_state": getattr(install, "draw_state", None),
+        "next_normal_refresh_at": getattr(install, "next_normal_refresh_at", None),
+        "next_draw_retry_at": getattr(install, "next_draw_retry_at", None),
+        "snapshot_version": getattr(install, "snapshot_version", 0),
+        "message_code": getattr(install, "message_code", None),
+        "message_text": getattr(install, "message_text", None),
     }
 
 
@@ -324,10 +381,24 @@ async def _resolve_account_current_install(
         return None
 
     platform_url = _safe_text(account.get("platform_url")).strip()
-    market_data_state = PUBLIC_STATE_LOCAL_FALLBACK
+    account_id = int(account["id"])
+    fallback_key = _build_local_fallback_key(
+        account_id=account_id,
+        requested_platform_type=requested_platform_type,
+    )
+    market_data_state = MARKET_STATE_SHARED_STALE
+    draw_state = "normal"
     shared_runtime = getattr(engine, "shared_market_runtime", None)
     contracts = getattr(shared_runtime, "_contracts", None)
+    freshness_seconds = int(
+        getattr(
+            shared_runtime,
+            "_freshness_seconds",
+            DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS,
+        )
+    )
     shared_group_id: int | None = None
+    snapshot: object | None = None
 
     if contracts is not None and platform_url:
         normalized_url = normalize_market_url(platform_url)
@@ -341,38 +412,102 @@ async def _resolve_account_current_install(
                     platform_type=requested_platform_type,
                     normalized_url=normalized_url,
                 )
+                market_data_state = MARKET_STATE_SHARED_STALE
             else:
-                freshness_seconds = int(
-                    getattr(
-                        shared_runtime,
-                        "_freshness_seconds",
-                        DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS,
-                    )
-                )
                 snapshot = await contracts.snapshot_get_latest(
                     shared_group_id=shared_group_id,
                 )
-                if snapshot is not None and _snapshot_is_fresh(
-                    snapshot,
-                    freshness_seconds=freshness_seconds,
-                ):
-                    return _build_current_install_response(
-                        _install_to_detail(snapshot.to_install()),
-                        default_market_data_state=PUBLIC_STATE_SHARED_HIT,
+                if snapshot is not None:
+                    market_data_state = _snapshot_market_data_state(
+                        snapshot,
+                        freshness_seconds=freshness_seconds,
                     )
-                market_data_state = PUBLIC_STATE_PROCESSING
+                    draw_state = _normalize_draw_state_value(
+                        getattr(snapshot, "draw_state", None)
+                    )
+                    if draw_state in {DRAW_STATE_PENDING, DRAW_STATE_WAIT_RETRY}:
+                        return _build_current_install_response(
+                            _install_to_detail(snapshot.to_install()),
+                            default_market_data_state=market_data_state,
+                        )
+                    if market_data_state in {MARKET_STATE_SHARED_OK, MARKET_STATE_MARKET_CLOSED}:
+                        return _build_current_install_response(
+                            _install_to_detail(snapshot.to_install()),
+                            default_market_data_state=market_data_state,
+                        )
+                else:
+                    market_data_state = MARKET_STATE_SHARED_STALE
+    elif contracts is None:
+        market_data_state = PUBLIC_STATE_LOCAL_FALLBACK
 
-    sessions = await account_platform_session_list(db, account_id=int(account["id"]))
+    sessions = await account_platform_session_list(db, account_id=account_id)
     session_token = _select_session_token(
         sessions,
         requested_platform_type=requested_platform_type,
     )
+
+    if not _can_use_local_fallback_for_snapshot(
+        market_data_state=_normalize_market_data_state(market_data_state, default=MARKET_STATE_SHARED_OK),
+        draw_state=draw_state,
+    ):
+        if snapshot is not None:
+            return _build_current_install_response(
+                _install_to_detail(snapshot.to_install()),
+                default_market_data_state=market_data_state,
+            )
+        if not session_token:
+            response = _default_current_install_response()
+            response.market_data_state = _normalize_market_data_state(
+                market_data_state,
+                default=PUBLIC_STATE_LOCAL_FALLBACK,
+            )
+            response.draw_state = _normalize_draw_state_value(draw_state)
+            return response
+        install = await _fetch_local_account_install(
+            platform_type=requested_platform_type,
+            platform_url=platform_url,
+            session_token=session_token,
+        )
+        if install is None:
+            response = _default_current_install_response()
+            response.market_data_state = _normalize_market_data_state(
+                market_data_state,
+                default=PUBLIC_STATE_LOCAL_FALLBACK,
+            )
+            response.draw_state = _normalize_draw_state_value(draw_state)
+            return response
+        return _build_current_install_response(
+            _install_to_detail(install),
+            default_market_data_state=market_data_state,
+        )
+
+    last_fallback_at = _API_LAST_LOCAL_FALLBACK_AT.get(fallback_key)
+    now = datetime.now()
+    if last_fallback_at is not None:
+        elapsed_seconds = (now - last_fallback_at).total_seconds()
+        if elapsed_seconds < DEFAULT_LOCAL_FALLBACK_INTERVAL_SECONDS:
+            cached_install = _API_LAST_LOCAL_FALLBACK_INSTALL.get(fallback_key)
+            if cached_install is not None:
+                detail = _install_to_detail(cached_install)
+                detail["draw_state"] = draw_state
+                detail["market_data_state"] = market_data_state
+                return _build_current_install_response(
+                    detail,
+                    default_market_data_state=market_data_state,
+                )
+            if snapshot is not None:
+                return _build_current_install_response(
+                    _install_to_detail(snapshot.to_install()),
+                    default_market_data_state=market_data_state,
+                )
+
     if not session_token:
         response = _default_current_install_response()
         response.market_data_state = _normalize_market_data_state(
             market_data_state,
             default=PUBLIC_STATE_LOCAL_FALLBACK,
         )
+        response.draw_state = _normalize_draw_state_value(draw_state)
         return response
 
     install = await _fetch_local_account_install(
@@ -386,25 +521,16 @@ async def _resolve_account_current_install(
             market_data_state,
             default=PUBLIC_STATE_LOCAL_FALLBACK,
         )
+        response.draw_state = _normalize_draw_state_value(draw_state)
         return response
 
-    if contracts is not None and shared_group_id is not None:
-        try:
-            await contracts.snapshot_upsert(
-                shared_group_id=shared_group_id,
-                install=install,
-                source_status="ok",
-            )
-        except Exception:
-            logger.warning(
-                "countdown_snapshot_upsert_failed group_id=%s platform=%s",
-                shared_group_id,
-                requested_platform_type,
-                exc_info=True,
-            )
-
+    _API_LAST_LOCAL_FALLBACK_AT[fallback_key] = now
+    _API_LAST_LOCAL_FALLBACK_INSTALL[fallback_key] = install
+    detail = _install_to_detail(install)
+    detail["draw_state"] = draw_state
+    detail["market_data_state"] = market_data_state
     return _build_current_install_response(
-        _install_to_detail(install),
+        detail,
         default_market_data_state=market_data_state,
     )
 
@@ -438,6 +564,24 @@ def _build_current_install_response(
             _coalesce(detail, "market_data_state", "shared_market_state", "data_source_state"),
             default=default_market_data_state,
         ),
+        draw_state=_normalize_draw_state_value(
+            _coalesce(detail, "draw_state")
+        ),
+        next_normal_refresh_at=_safe_text(
+            _coalesce(detail, "next_normal_refresh_at")
+        ) or None,
+        next_draw_retry_at=_safe_text(
+            _coalesce(detail, "next_draw_retry_at")
+        ) or None,
+        snapshot_version=_safe_non_negative_int(
+            _coalesce(detail, "snapshot_version")
+        ),
+        message_code=_safe_text(
+            _coalesce(detail, "message_code")
+        ) or None,
+        message_text=_safe_text(
+            _coalesce(detail, "message_text")
+        ) or None,
     )
 
 

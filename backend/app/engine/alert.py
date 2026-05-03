@@ -26,12 +26,15 @@ Phase 9.1:  12  +
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
 import aiosqlite
 
 from app.models.db_ops import alert_create
+
+logger = logging.getLogger(__name__)
 
 # 
 #   12 
@@ -64,6 +67,30 @@ ALERT_LEVEL_MAP: dict[str, str] = {
     "match_ambiguity": "warning",
     "worker_lock_conflict": "critical",
     "worker_lock_lost": "critical",
+    "session_reconnecting": "warning",
+    "session_reconnect_failed": "critical",
+    "shared_market_error": "critical",
+}
+
+ALERT_OPERATOR_COPY: dict[str, tuple[str, str]] = {
+    "login_fail": ("SESSION-003", "账号登录失败，请联系管理员处理。"),
+    "captcha_fail": ("SESSION-004", "账号验证失败，请联系管理员处理。"),
+    "session_lost": ("SESSION-002", "账号重连失败，请联系管理员处理。"),
+    "session_reconnecting": ("SESSION-001", "账号会话异常，系统正在重连。"),
+    "session_reconnect_failed": ("SESSION-002", "账号重连失败，请联系管理员处理。"),
+    "bet_fail": ("BET-003", "本期下注失败，请检查账号和平台状态。"),
+    "platform_limit": ("BET-002", "当前策略过多，可能引发风控导致下注失败。"),
+    "shared_market_error": ("SHARED-002", "数据更新变慢，可能影响投注，请联系管理员处理。"),
+    "system_api_fail": ("SYSTEM-001", "系统接口异常率升高，请联系管理员处理。"),
+    "consecutive_fail": ("SYSTEM-002", "账号连续下注失败，请联系管理员处理。"),
+    "settlement_data_missing": ("SETTLE-002", "结算数据暂未返回，系统将继续补偿。"),
+    "settle_timeout": ("SETTLE-002", "结算数据暂未返回，系统将继续补偿。"),
+    "unsettled_orders": ("SETTLE-001", "订单结算中，请稍后查看。"),
+    "settle_api_failed": ("SETTLE-003", "结算失败，请联系管理员处理。"),
+    "api_call_failed": ("SETTLE-003", "结算失败，请联系管理员处理。"),
+    "settle_data_expired": ("SETTLE-003", "结算失败，请联系管理员处理。"),
+    "worker_lock_conflict": ("WORKER-001", "任务执行冲突，系统已自动保护。"),
+    "worker_lock_lost": ("WORKER-002", "任务执行锁异常，请联系管理员处理。"),
 }
 
 # 
@@ -91,6 +118,14 @@ class AlertService:
         # (operator_id, alert_type, account_id)  last_sent_at timestamp
         self._dedup_cache: dict[tuple[int, str, int | None], float] = {}
 
+    @staticmethod
+    def format_operator_title(alert_type: str, fallback_title: str) -> str:
+        template = ALERT_OPERATOR_COPY.get(alert_type)
+        if template is None:
+            return fallback_title
+        code, message = template
+        return f"{message}日志编号：{code}。"
+
     async def send(
         self,
         operator_id: int,
@@ -112,6 +147,17 @@ class AlertService:
         if last_sent is not None and (now - last_sent) < _DEDUP_WINDOW:
             return False
 
+        operator_title = self.format_operator_title(alert_type, title)
+
+        if detail:
+            logger.info(
+                "operator_alert_detail type=%s operator_id=%d account_id=%s detail=%s",
+                alert_type,
+                operator_id,
+                account_id,
+                detail[:1000],
+            )
+
         #  warning
         level = ALERT_LEVEL_MAP.get(alert_type, "warning")
 
@@ -121,7 +167,7 @@ class AlertService:
             operator_id=operator_id,
             type=alert_type,
             level=level,
-            title=title,
+            title=operator_title,
             detail=detail,
         )
 

@@ -17,6 +17,7 @@ from typing import Callable, Optional
 from app.engine.adapters.base import InstallInfo, PlatformAdapter
 from app.engine.rate_limiter import RateLimiter
 from app.engine.shared_market_runtime import (
+    MARKET_STATE_SHARED_ERROR,
     PUBLIC_STATE_LOCAL_FALLBACK,
     PUBLIC_STATE_PROCESSING,
     SharedMarketRuntime,
@@ -158,7 +159,10 @@ class IssuePoller:
                 self.shared_market_platform_type,
             )
             install = await self._fetch_install_local()
-            self.shared_market_state = PUBLIC_STATE_LOCAL_FALLBACK
+            self.shared_market_state = normalize_shared_market_state(
+                MARKET_STATE_SHARED_ERROR,
+                default=MARKET_STATE_SHARED_ERROR,
+            )
             return install
 
     def _enter_slow_mode(self, reason: str) -> None:

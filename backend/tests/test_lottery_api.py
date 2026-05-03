@@ -15,6 +15,7 @@ from app.api.lottery import (
 )
 from app.engine.adapters.base import InstallInfo
 from app.engine.shared_market_runtime import SharedMarketSnapshot
+from app.schemas.lottery import CurrentInstallResponse
 
 
 def test_current_install_response_clamps_negative_countdowns():
@@ -34,7 +35,9 @@ def test_current_install_response_clamps_negative_countdowns():
     assert response.state == 1
     assert response.close_countdown_sec == 0
     assert response.open_countdown_sec == 0
-    assert response.market_data_state == "local_fallback"
+    assert response.market_data_state == "shared_error"
+    assert response.draw_state == "normal"
+    assert response.snapshot_version == 0
 
 
 def test_default_current_install_response_is_frontend_safe():
@@ -47,7 +50,7 @@ def test_default_current_install_response_is_frontend_safe():
     assert response.pre_lottery_result == ""
     assert response.pre_installments == ""
     assert response.template_code == ""
-    assert response.market_data_state == "local_fallback"
+    assert response.market_data_state == "shared_error"
 
 
 def test_current_install_response_supports_legacy_field_mapping():
@@ -70,7 +73,7 @@ def test_current_install_response_supports_legacy_field_mapping():
     assert response.pre_installments == "3397192"
     assert response.pre_lottery_result == ""
     assert response.template_code == "PCDD"
-    assert response.market_data_state == "local_fallback"
+    assert response.market_data_state == "shared_error"
 
 
 def test_current_install_response_supports_market_data_state_mapping():
@@ -83,7 +86,7 @@ def test_current_install_response_supports_market_data_state_mapping():
         default_market_data_state="processing",
     )
 
-    assert response.market_data_state == "shared_hit"
+    assert response.market_data_state == "shared_ok"
 
 
 def test_current_install_response_uses_fallback_market_data_state_on_invalid_value():
@@ -96,7 +99,24 @@ def test_current_install_response_uses_fallback_market_data_state_on_invalid_val
         default_market_data_state="processing",
     )
 
-    assert response.market_data_state == "processing"
+    assert response.market_data_state == "shared_ok"
+
+
+def test_current_install_response_schema_normalizes_legacy_states():
+    response = CurrentInstallResponse(
+        installments="3397193",
+        state=1,
+        close_countdown_sec=10,
+        open_countdown_sec=20,
+        pre_lottery_result="1,2,3",
+        pre_installments="3397192",
+        template_code="JND282",
+        market_data_state="shared_hit",
+        draw_state="processing",
+    )
+
+    assert response.market_data_state == "shared_ok"
+    assert response.draw_state == "draw_pending"
 
 
 def test_select_running_adapter_prefers_requested_platform_for_operator():
@@ -181,6 +201,13 @@ def test_resolve_worker_snapshot_uses_poller_last_install():
         "pre_lottery_result": "1,2,3",
         "pre_installments": "3424000",
         "template_code": "",
+        "market_data_state": None,
+        "draw_state": None,
+        "next_normal_refresh_at": None,
+        "next_draw_retry_at": None,
+        "snapshot_version": 0,
+        "message_code": None,
+        "message_text": None,
     }
 
 
@@ -231,7 +258,7 @@ async def test_get_current_install_reads_cached_snapshot_without_live_adapter_ca
     assert response.data.open_countdown_sec == 45
     assert response.data.pre_installments == "3424001"
     assert response.data.pre_lottery_result == "4,5,6"
-    assert response.data.market_data_state == "shared_hit"
+    assert response.data.market_data_state == "shared_ok"
 
 
 @pytest.mark.asyncio
@@ -314,7 +341,7 @@ async def test_get_current_install_uses_shared_snapshot_without_running_worker(m
     assert response.data.close_countdown_sec == 10
     assert response.data.pre_installments == "3425000"
     assert response.data.pre_lottery_result == "2,2,2"
-    assert response.data.market_data_state == "shared_hit"
+    assert response.data.market_data_state == "shared_ok"
 
 
 @pytest.mark.asyncio
@@ -410,5 +437,197 @@ async def test_get_current_install_uses_operator_session_when_no_worker_exists(m
     assert response.data.open_countdown_sec == 35
     assert response.data.pre_installments == "3426001"
     assert response.data.pre_lottery_result == "3,4,5"
-    assert response.data.market_data_state == "local_fallback"
+    assert response.data.market_data_state == "shared_stale"
     fake_adapter.cookie_jar.update_cookies.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_get_current_install_draw_pending_snapshot_does_not_fallback_local(monkeypatch):
+    async def _fake_accounts(_db, *, operator_id: int):
+        assert operator_id == 7
+        return [
+            {
+                "id": 303,
+                "game_type": "JND28",
+                "platform_url": "https://pool.example.com",
+                "allowed_strategy_platform_types": ["JND282"],
+                "verification_stale": False,
+            }
+        ]
+
+    async def _fake_sessions(_db, *, account_id: int):
+        assert account_id == 303
+        return [
+            {
+                "id": 3,
+                "platform_type": "JND282",
+                "status": "online",
+                "session_token": "session-token-303",
+            }
+        ]
+
+    monkeypatch.setattr(lottery_api, "account_list_by_operator", _fake_accounts)
+    monkeypatch.setattr(lottery_api, "account_platform_session_list", _fake_sessions)
+    monkeypatch.setattr(
+        lottery_api,
+        "create_platform_adapter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("draw_pending should not call local adapter fallback")
+        ),
+    )
+
+    fake_contracts = SimpleNamespace(
+        group_resolve_by_url=AsyncMock(return_value=303),
+        snapshot_get_latest=AsyncMock(
+            return_value=SharedMarketSnapshot(
+                shared_group_id=303,
+                issue="3500001",
+                state=2,
+                close_countdown_sec=0,
+                open_countdown_sec=0,
+                pre_issue="3500000",
+                pre_result="1,1,1",
+                fetched_at=datetime.now(),
+                source_status="ok",
+                market_data_state="shared_ok",
+                draw_state="draw_pending",
+                next_draw_retry_at="2026-05-03 10:00:10",
+            )
+        ),
+        uncovered_url_touch=AsyncMock(),
+    )
+
+    class _Registry:
+        async def all_workers(self):
+            return {}
+
+    app = FastAPI()
+    app.state.engine = SimpleNamespace(
+        registry=_Registry(),
+        shared_market_runtime=SimpleNamespace(
+            _contracts=fake_contracts,
+            _freshness_seconds=15,
+        ),
+    )
+    request = Request({"type": "http", "app": app})
+
+    response = await get_current_install(
+        request=request,
+        platform_type="JND282",
+        operator={"id": 7, "role": "operator"},
+        db=object(),
+    )
+
+    assert response.data.installments == "3500001"
+    assert response.data.draw_state == "draw_pending"
+    assert response.data.market_data_state == "shared_ok"
+
+
+@pytest.mark.asyncio
+async def test_get_current_install_shared_error_local_fallback_is_throttled(monkeypatch):
+    async def _fake_accounts(_db, *, operator_id: int):
+        assert operator_id == 7
+        return [
+            {
+                "id": 404,
+                "game_type": "JND28",
+                "platform_url": "https://pool.example.com",
+                "allowed_strategy_platform_types": ["JND282"],
+                "verification_stale": False,
+            }
+        ]
+
+    async def _fake_sessions(_db, *, account_id: int):
+        assert account_id == 404
+        return [
+            {
+                "id": 4,
+                "platform_type": "JND282",
+                "status": "online",
+                "session_token": "session-token-404",
+            }
+        ]
+
+    adapter_calls = 0
+
+    class _FakeAdapter:
+        def __init__(self) -> None:
+            self.base_url = "https://pool.example.com"
+
+        async def _ensure_session(self):
+            return SimpleNamespace(cookie_jar=SimpleNamespace(update_cookies=Mock()))
+
+        async def get_current_install(self):
+            nonlocal adapter_calls
+            adapter_calls += 1
+            return InstallInfo(
+                issue="fallback-issue",
+                state=1,
+                close_countdown_sec=11,
+                open_countdown_sec=22,
+                pre_issue="fallback-prev",
+                pre_result="3,3,3",
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(lottery_api, "account_list_by_operator", _fake_accounts)
+    monkeypatch.setattr(lottery_api, "account_platform_session_list", _fake_sessions)
+    monkeypatch.setattr(
+        lottery_api,
+        "create_platform_adapter",
+        lambda *_args, **_kwargs: _FakeAdapter(),
+    )
+
+    fake_contracts = SimpleNamespace(
+        group_resolve_by_url=AsyncMock(return_value=404),
+        snapshot_get_latest=AsyncMock(
+            return_value=SharedMarketSnapshot(
+                shared_group_id=404,
+                issue="3501001",
+                state=1,
+                close_countdown_sec=0,
+                open_countdown_sec=0,
+                pre_issue="3501000",
+                pre_result="2,2,2",
+                fetched_at=datetime.now(),
+                source_status="error",
+                market_data_state="shared_error",
+            )
+        ),
+        uncovered_url_touch=AsyncMock(),
+    )
+
+    class _Registry:
+        async def all_workers(self):
+            return {}
+
+    app = FastAPI()
+    app.state.engine = SimpleNamespace(
+        registry=_Registry(),
+        shared_market_runtime=SimpleNamespace(
+            _contracts=fake_contracts,
+            _freshness_seconds=15,
+        ),
+    )
+    request = Request({"type": "http", "app": app})
+
+    first = await get_current_install(
+        request=request,
+        platform_type="JND282",
+        operator={"id": 7, "role": "operator"},
+        db=object(),
+    )
+    second = await get_current_install(
+        request=request,
+        platform_type="JND282",
+        operator={"id": 7, "role": "operator"},
+        db=object(),
+    )
+
+    assert first.data.installments == "fallback-issue"
+    assert second.data.installments == "fallback-issue"
+    assert first.data.market_data_state == "shared_error"
+    assert second.data.market_data_state == "shared_error"
+    assert adapter_calls == 1

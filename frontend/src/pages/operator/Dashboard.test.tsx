@@ -108,6 +108,33 @@ describe('Dashboard', () => {
     expect(screen.getByText('测试告警')).toBeInTheDocument();
   });
 
+  it('hides detail for coded alerts', () => {
+    setupHook({ data: baseDashboard });
+    mockUseAlertsContext.mockReturnValue({
+      alerts: [
+        {
+          ...baseDashboard.recent_alerts[0],
+          title: '数据更新变慢，可能影响投注，请联系管理员处理。日志编号：SHARED-002。',
+          detail: 'raw backend detail',
+        },
+      ],
+      unreadCount: 1,
+      total: 1,
+      loading: false,
+      initialized: true,
+      error: '',
+      fetchAlerts: vi.fn().mockResolvedValue(undefined),
+      fetchUnreadCount: vi.fn().mockResolvedValue(undefined),
+      markRead: vi.fn().mockResolvedValue(undefined),
+      markAllRead: vi.fn().mockResolvedValue(undefined),
+      startPolling: vi.fn(),
+      stopPolling: vi.fn(),
+    });
+    render(<Dashboard />);
+    expect(screen.getByText('数据更新变慢，可能影响投注，请联系管理员处理。日志编号：SHARED-002。')).toBeInTheDocument();
+    expect(screen.queryByText('raw backend detail')).not.toBeInTheDocument();
+  });
+
   it('renders localized running strategy cards', () => {
     setupHook({
       data: {

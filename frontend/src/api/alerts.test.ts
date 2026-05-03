@@ -50,6 +50,8 @@ describe('listAlerts', () => {
     const res = await listAlerts({ is_read: 0, page: 1, page_size: 20 });
     expect(mockRequest).toHaveBeenCalledWith('/alerts?is_read=0&page=1&page_size=20');
     expect(res.data!.items).toHaveLength(1);
+    expect(res.data!.items[0].title).toBe('账号登录失败，请联系管理员处理。日志编号：SESSION-003。');
+    expect(res.data!.items[0].detail).toBeNull();
   });
 
   it('仅传 page 参数', async () => {

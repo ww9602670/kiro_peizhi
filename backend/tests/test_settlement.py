@@ -2504,7 +2504,7 @@ class TestTopbetlistAllFail:
     """Topbetlist 3 次重试全部失败时的处理"""
 
     @pytest.mark.asyncio
-    async def test_all_orders_marked_settle_failed(self, db, setup_data):
+    async def test_all_orders_kept_settlement_pending(self, db, setup_data):
         """所有 simulation=0 订单标记为 settle_failed"""
         oid = setup_data["operator"]["id"]
         alert_svc = AlertService(db)
@@ -2529,8 +2529,8 @@ class TestTopbetlistAllFail:
         # 验证订单状态
         s1 = await bet_order_get_by_id(db, order_id=o1["id"], operator_id=oid)
         s2 = await bet_order_get_by_id(db, order_id=o2["id"], operator_id=oid)
-        assert s1["status"] == "settle_failed"
-        assert s2["status"] == "settle_failed"
+        assert s1["status"] == "settlement_pending"
+        assert s2["status"] == "settlement_pending"
 
     @pytest.mark.asyncio
     async def test_simulation_orders_marked_settle_failed(self, db, setup_data):
@@ -2603,7 +2603,7 @@ class TestTopbetlistAllFail:
             )
         ).fetchall()
         assert len(alerts) == 1
-        assert "getBetChecked" in alerts[0]["title"]
+        assert "日志编号：SETTLE-003" in alerts[0]["title"]
 
 
 # ──────────────────────────────────────────────

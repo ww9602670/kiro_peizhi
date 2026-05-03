@@ -338,6 +338,33 @@ class TestRestoreWorkersOnStartup:
         manager.start_worker.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_restore_running_strategy_when_verification_stale(self):
+        manager = _make_manager()
+
+        with patch("app.engine.manager.db_ops") as mock_ops:
+            mock_ops.operator_list_all = AsyncMock(return_value=[
+                {"id": 1, "status": "active", "username": "op1"},
+            ])
+            mock_ops.account_list_by_operator = AsyncMock(return_value=[
+                {"id": 100, "account_name": "acc1", "password": "pw1",
+                 "status": "online", "platform_type": "JND28WEB", "operator_id": 1,
+                 "effective_verification_run_id": None,
+                 "verification_stale": True,
+                 "allowed_strategy_platform_types": []},
+            ])
+            mock_ops.strategy_list_by_operator = AsyncMock(return_value=[
+                {"id": 10, "account_id": 100, "status": "running",
+                 "type": "flat", "play_code": "DX1", "base_amount": 100,
+                 "bet_timing": 30, "simulation": 0},
+            ])
+            manager.start_worker = AsyncMock(return_value=_make_mock_worker())
+
+            restored = await manager.restore_workers_on_startup()
+
+        assert restored == 1
+        manager.start_worker.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_skip_inactive_operators(self):
         """ active """
         manager = _make_manager()

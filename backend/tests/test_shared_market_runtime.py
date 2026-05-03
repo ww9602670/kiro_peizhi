@@ -10,9 +10,14 @@ from app.engine.adapters.base import InstallInfo, LoginResult, RemoteLoginRequir
 from app.engine.shared_market_runtime import (
     DEFAULT_COLLECTOR_INTERVAL_SECONDS,
     DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS,
+    DRAW_STATE_PENDING,
+    DRAW_STATE_WAIT_RETRY,
+    MARKET_STATE_MARKET_CLOSED,
+    MARKET_STATE_SHARED_ERROR,
+    MARKET_STATE_SHARED_OK,
+    MARKET_STATE_SHARED_STALE,
+    SHARED_ERROR_MESSAGE_TEXT,
     PUBLIC_STATE_LOCAL_FALLBACK,
-    PUBLIC_STATE_PROCESSING,
-    PUBLIC_STATE_SHARED_HIT,
     SharedMarketRuntime,
     SharedMarketContracts,
     SharedMarketSnapshot,
@@ -50,7 +55,7 @@ class _FakeContracts:
         self.shared_group_id = shared_group_id
         self.snapshot = snapshot
         self.shared_groups = shared_groups or []
-        self.upserts: list[tuple[int, str, str, str | None]] = []
+        self.upserts: list[dict] = []
         self.snapshot_errors: list[dict] = []
         self.admin_ids = [1]
         self.admin_alerts: list[dict] = []
@@ -76,8 +81,29 @@ class _FakeContracts:
         install: InstallInfo,
         source_status: str,
         last_error: str | None = None,
+        market_data_state: str | None = None,
+        draw_state: str | None = None,
+        next_normal_refresh_at: str | None = None,
+        next_draw_retry_at: str | None = None,
+        snapshot_version: int | None = None,
+        message_code: str | None = None,
+        message_text: str | None = None,
     ) -> None:
-        self.upserts.append((shared_group_id, install.issue, source_status, last_error))
+        self.upserts.append(
+            {
+                "shared_group_id": shared_group_id,
+                "issue": install.issue,
+                "source_status": source_status,
+                "last_error": last_error,
+                "market_data_state": market_data_state,
+                "draw_state": draw_state,
+                "next_normal_refresh_at": next_normal_refresh_at,
+                "next_draw_retry_at": next_draw_retry_at,
+                "snapshot_version": snapshot_version,
+                "message_code": message_code,
+                "message_text": message_text,
+            }
+        )
 
     async def snapshot_mark_error(
         self,
@@ -270,7 +296,34 @@ async def test_collector_marks_error_and_alerts_admin_without_last_install():
     assert contracts.snapshot_errors[-1]["issue"] is None
     assert "session expired" in contracts.snapshot_errors[-1]["last_error"]
     assert contracts.admin_alerts
-    assert contracts.admin_alerts[-1]["title"] == "共享数据源异常"
+    assert contracts.admin_alerts[-1]["title"] == SHARED_ERROR_MESSAGE_TEXT
+    assert contracts.admin_alerts[-1]["detail"] == ""
+
+
+@pytest.mark.asyncio
+async def test_shared_error_alert_only_once_until_recovered():
+    contracts = _FakeContracts(shared_group_id=None)
+    runtime = SharedMarketRuntime(db=AsyncMock(), contracts=contracts)
+
+    await runtime._notify_admin_shared_error(
+        shared_group_id=3,
+        owner_key="shared-group-3",
+        error_text="first",
+    )
+    await runtime._notify_admin_shared_error(
+        shared_group_id=3,
+        owner_key="shared-group-3",
+        error_text="second",
+    )
+    assert len(contracts.admin_alerts) == 1
+
+    runtime._shared_error_alerted_group_ids.discard(3)
+    await runtime._notify_admin_shared_error(
+        shared_group_id=3,
+        owner_key="shared-group-3",
+        error_text="third",
+    )
+    assert len(contracts.admin_alerts) == 2
 
 
 @pytest.mark.asyncio
@@ -348,7 +401,7 @@ async def test_resolve_install_uses_fresh_snapshot_without_local_poll():
     )
 
     assert install.issue == "20260421009"
-    assert getattr(install, "market_data_state", None) == PUBLIC_STATE_SHARED_HIT
+    assert getattr(install, "market_data_state", None) == MARKET_STATE_SHARED_OK
     fetch_local_install.assert_not_called()
 
 
@@ -366,7 +419,7 @@ async def test_resolve_install_miss_touches_uncovered_and_fallback():
     )
 
     assert install.issue == "fallback"
-    assert getattr(install, "market_data_state", None) == PUBLIC_STATE_LOCAL_FALLBACK
+    assert getattr(install, "market_data_state", None) == MARKET_STATE_SHARED_ERROR
     fetch_local_install.assert_awaited_once()
     assert len(contracts.uncovered_touches) == 1
     touch = contracts.uncovered_touches[0]
@@ -399,7 +452,7 @@ async def test_resolve_install_miss_success_joins_shared_group():
     )
 
     assert install.issue == "shared-hit"
-    assert getattr(install, "market_data_state", None) == PUBLIC_STATE_SHARED_HIT
+    assert getattr(install, "market_data_state", None) == MARKET_STATE_SHARED_OK
     runtime._probe_with_shared_account.assert_awaited_once()
     assert contracts.uncovered_matched == [(1, 2)]
     assert contracts.group_url_adds == [(2, "https://example.com/path")]
@@ -692,10 +745,9 @@ async def test_resolve_install_stale_snapshot_fallback_and_refresh():
     )
 
     assert install.issue == "fresh_local"
-    assert getattr(install, "market_data_state", None) == PUBLIC_STATE_PROCESSING
+    assert getattr(install, "market_data_state", None) == MARKET_STATE_SHARED_STALE
     fetch_local_install.assert_awaited_once()
-    assert contracts.upserts
-    assert contracts.upserts[-1][2] == "ok"
+    assert contracts.upserts == []
 
 
 @pytest.mark.asyncio
@@ -723,8 +775,81 @@ async def test_resolve_install_error_snapshot_fallback():
     )
 
     assert install.issue == "local_after_error"
-    assert getattr(install, "market_data_state", None) == PUBLIC_STATE_PROCESSING
+    assert getattr(install, "market_data_state", None) == MARKET_STATE_SHARED_ERROR
     fetch_local_install.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_install_draw_pending_does_not_trigger_local_fallback():
+    pending_snapshot = SharedMarketSnapshot(
+        shared_group_id=18,
+        issue="20260421088",
+        state=2,
+        close_countdown_sec=0,
+        open_countdown_sec=0,
+        pre_issue="20260421087",
+        pre_result="7,7,7",
+        fetched_at=datetime.now(),
+        source_status="ok",
+        market_data_state=MARKET_STATE_SHARED_OK,
+        draw_state=DRAW_STATE_PENDING,
+    )
+    contracts = _FakeContracts(shared_group_id=18, snapshot=pending_snapshot)
+    runtime = SharedMarketRuntime(db=AsyncMock(), contracts=contracts)
+    fetch_local_install = AsyncMock(return_value=_make_install(issue="should-not-use-local"))
+
+    install = await runtime.resolve_install(
+        platform_type="JND28WEB",
+        platform_url="https://example.com/path",
+        owner_key="100:JND28WEB",
+        fetch_local_install=fetch_local_install,
+    )
+
+    assert install.issue == "20260421088"
+    assert getattr(install, "draw_state", None) == DRAW_STATE_PENDING
+    fetch_local_install.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_install_local_fallback_is_throttled_for_80_seconds():
+    error_snapshot = SharedMarketSnapshot(
+        shared_group_id=19,
+        issue="20260421999",
+        state=1,
+        close_countdown_sec=10,
+        open_countdown_sec=20,
+        pre_issue="20260421998",
+        pre_result="9,9,9",
+        fetched_at=datetime.now(),
+        source_status="error",
+        market_data_state=MARKET_STATE_SHARED_ERROR,
+    )
+    contracts = _FakeContracts(shared_group_id=19, snapshot=error_snapshot)
+    runtime = SharedMarketRuntime(db=AsyncMock(), contracts=contracts)
+    fetch_local_install = AsyncMock(
+        side_effect=[
+            _make_install(issue="local-1"),
+            _make_install(issue="local-2"),
+        ]
+    )
+
+    first = await runtime.resolve_install(
+        platform_type="JND28WEB",
+        platform_url="https://example.com/path",
+        owner_key="500:JND28WEB",
+        fetch_local_install=fetch_local_install,
+    )
+    second = await runtime.resolve_install(
+        platform_type="JND28WEB",
+        platform_url="https://example.com/path",
+        owner_key="500:JND28WEB",
+        fetch_local_install=fetch_local_install,
+    )
+
+    assert first.issue == "local-1"
+    assert second.issue == "local-1"
+    assert fetch_local_install.await_count == 1
+    assert contracts.upserts == []
 
 
 @pytest.mark.asyncio
@@ -741,8 +866,151 @@ async def test_resolve_install_invalid_url_local_fallback_state():
     )
 
     assert install.issue == "invalid-url-local"
-    assert getattr(install, "market_data_state", None) == PUBLIC_STATE_LOCAL_FALLBACK
+    assert getattr(install, "market_data_state", None) == MARKET_STATE_SHARED_ERROR
     fetch_local_install.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_collector_draw_pending_transitions_to_wait_retry(monkeypatch):
+    monkeypatch.setattr(
+        "app.engine.shared_market_runtime.DRAW_PENDING_RETRY_INTERVALS_SECONDS",
+        (0.01, 0.01, 0.01, 0.01, 0.01, 0.01),
+    )
+    monkeypatch.setattr(
+        "app.engine.shared_market_runtime.DRAW_WAIT_RETRY_INTERVAL_SECONDS",
+        0.01,
+    )
+
+    contracts = _FakeContracts(shared_group_id=30)
+    runtime = SharedMarketRuntime(
+        db=AsyncMock(),
+        contracts=contracts,
+        collector_interval_seconds=0.01,
+        collector_error_backoff_seconds=0.01,
+    )
+    stop_event = asyncio.Event()
+    call_count = 0
+
+    async def fetch_local_install() -> InstallInfo:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 7:
+            stop_event.set()
+        return _make_install(
+            issue="20260430001",
+            state=1,
+            close_countdown_sec=0,
+            open_countdown_sec=0,
+            pre_issue="20260430000",
+            pre_result="1,2,3",
+        )
+
+    await runtime._collector_loop(
+        shared_group_id=30,
+        owner_key="shared-group-30",
+        stop_event=stop_event,
+        fetch_local_install=fetch_local_install,
+    )
+
+    draw_states = [row["draw_state"] for row in contracts.upserts]
+    assert draw_states[:6] == [DRAW_STATE_PENDING] * 6
+    assert draw_states[6] == DRAW_STATE_WAIT_RETRY
+    assert all(row["market_data_state"] == MARKET_STATE_SHARED_OK for row in contracts.upserts)
+
+
+@pytest.mark.asyncio
+async def test_collector_market_closed_stops_draw_pending(monkeypatch):
+    monkeypatch.setattr(
+        "app.engine.shared_market_runtime.DRAW_PENDING_RETRY_INTERVALS_SECONDS",
+        (0.01, 0.01, 0.01, 0.01, 0.01, 0.01),
+    )
+
+    contracts = _FakeContracts(shared_group_id=31)
+    runtime = SharedMarketRuntime(
+        db=AsyncMock(),
+        contracts=contracts,
+        collector_interval_seconds=0.01,
+        collector_error_backoff_seconds=0.01,
+    )
+    stop_event = asyncio.Event()
+    call_count = 0
+
+    async def fetch_local_install() -> InstallInfo:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _make_install(
+                issue="20260431001",
+                state=1,
+                close_countdown_sec=0,
+                open_countdown_sec=0,
+                pre_issue="20260431000",
+                pre_result="2,2,2",
+            )
+        stop_event.set()
+        return _make_install(
+            issue="20260431001",
+            state=0,
+            close_countdown_sec=0,
+            open_countdown_sec=0,
+            pre_issue="20260431000",
+            pre_result="2,2,2",
+        )
+
+    await runtime._collector_loop(
+        shared_group_id=31,
+        owner_key="shared-group-31",
+        stop_event=stop_event,
+        fetch_local_install=fetch_local_install,
+    )
+
+    assert contracts.upserts
+    assert contracts.upserts[0]["draw_state"] == DRAW_STATE_PENDING
+    assert contracts.upserts[1]["market_data_state"] == MARKET_STATE_MARKET_CLOSED
+    assert contracts.upserts[1]["draw_state"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_collector_closed_countdown_waits_for_draw_instead_of_market_closed(monkeypatch):
+    monkeypatch.setattr(
+        "app.engine.shared_market_runtime.DRAW_PENDING_RETRY_INTERVALS_SECONDS",
+        (0.01, 0.01),
+    )
+
+    contracts = _FakeContracts(shared_group_id=32)
+    runtime = SharedMarketRuntime(
+        db=AsyncMock(),
+        contracts=contracts,
+        collector_interval_seconds=0.01,
+        collector_error_backoff_seconds=0.01,
+    )
+    stop_event = asyncio.Event()
+    call_count = 0
+
+    async def fetch_local_install() -> InstallInfo:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            stop_event.set()
+        return _make_install(
+            issue="20260431001",
+            state=2,
+            close_countdown_sec=0,
+            open_countdown_sec=0,
+            pre_issue="20260431000",
+            pre_result="2,2,2",
+        )
+
+    await runtime._collector_loop(
+        shared_group_id=32,
+        owner_key="shared-group-32",
+        stop_event=stop_event,
+        fetch_local_install=fetch_local_install,
+    )
+
+    assert contracts.upserts
+    assert all(row["market_data_state"] == MARKET_STATE_SHARED_OK for row in contracts.upserts)
+    assert all(row["draw_state"] == DRAW_STATE_PENDING for row in contracts.upserts)
 
 
 @pytest.mark.asyncio

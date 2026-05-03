@@ -12,6 +12,11 @@ interface DashboardProps {
   onCreateStrategy?: () => void;
 }
 
+function shouldShowAlertDetail(title: string, detail: string | null): boolean {
+  if (!detail) return false;
+  return !title.includes('日志编号：');
+}
+
 function readDismissed(key: string): string[] {
   try {
     const raw = localStorage.getItem(key);
@@ -230,7 +235,9 @@ export default function Dashboard({ onCreateStrategy }: DashboardProps) {
                       {closingId === alert.id ? '关闭中…' : '关闭'}
                     </button>
                   </div>
-                  {alert.detail && <p className="alert-card-compact-detail">{alert.detail}</p>}
+                  {shouldShowAlertDetail(alert.title, alert.detail) && (
+                    <p className="alert-card-compact-detail">{alert.detail}</p>
+                  )}
                   <p className="alert-card-compact-time">{alert.created_at}</p>
                 </article>
               ))}

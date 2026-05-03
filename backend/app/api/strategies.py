@@ -196,13 +196,14 @@ async def _load_account_with_strategy_gate_context(
         db, account_id=account_id
     )
     effective_run = await account_verification_run_get_effective(db, account_id=account_id)
+    capability_run = effective_run or latest_completed_run
 
     capabilities: list[dict] = []
     allowed_strategy_platform_types: list[str] = []
-    if effective_run:
+    if capability_run:
         raw_capabilities = await account_platform_capability_list_by_run(
             db,
-            verification_run_id=effective_run["id"],
+            verification_run_id=capability_run["id"],
         )
         for item in raw_capabilities:
             normalized_platform_type = _normalize_strategy_platform_type(
@@ -231,7 +232,7 @@ async def _load_account_with_strategy_gate_context(
 
     enriched = dict(account)
     enriched["latest_verification_run_id"] = latest_run["id"] if latest_run else None
-    enriched["effective_verification_run_id"] = effective_run["id"] if effective_run else None
+    enriched["effective_verification_run_id"] = capability_run["id"] if capability_run else None
     enriched["verification_stale"] = verification_stale
     enriched["allowed_strategy_platform_types"] = allowed_strategy_platform_types
     enriched["platform_capabilities"] = capabilities
@@ -260,12 +261,6 @@ def _validate_account_platform_gate_or_raise(
 ) -> str:
     normalized = _normalize_strategy_platform_type(strategy_platform_type)
     effective_run_id = _get_effective_verification_run_id(account)
-    if _is_truthy_flag(account.get("verification_stale")):
-        raise BizError(
-            error_code,
-            "verification_stale=true; refresh verification before strategy operations",
-            status_code=400,
-        )
     if effective_run_id is None:
         raise BizError(
             error_code,

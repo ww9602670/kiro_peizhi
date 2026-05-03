@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 
 from app.config import (
@@ -25,15 +24,40 @@ logger = logging.getLogger(__name__)
 DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS = 35
 DEFAULT_COLLECTOR_INTERVAL_SECONDS = 25.0
 DEFAULT_COLLECTOR_ERROR_BACKOFF_SECONDS = 5.0
+DEFAULT_LOCAL_FALLBACK_INTERVAL_SECONDS = 80
 DEFAULT_SHARED_CAPTCHA_LOGIN_ATTEMPTS = 3
-ADMIN_ALERT_DEDUP_SECONDS = 300.0
+DRAW_PENDING_RETRY_INTERVALS_SECONDS = (10.0, 10.0, 10.0, 5.0, 3.0, 1.0)
+DRAW_WAIT_RETRY_INTERVAL_SECONDS = 10.0
+SHARED_ERROR_MESSAGE_CODE = "SHARED-002"
+SHARED_ERROR_MESSAGE_TEXT = "数据更新变慢，可能影响投注，请联系管理员处理。日志编号：SHARED-002。"
+
+MARKET_STATE_SHARED_OK = "shared_ok"
+MARKET_STATE_SHARED_ERROR = "shared_error"
+MARKET_STATE_SHARED_STALE = "shared_stale"
+MARKET_STATE_MARKET_CLOSED = "market_closed"
+
+DRAW_STATE_NORMAL = "normal"
+DRAW_STATE_PENDING = "draw_pending"
+DRAW_STATE_WAIT_RETRY = "draw_wait_retry"
+
+# Legacy aliases kept for compatibility during rollout.
 PUBLIC_STATE_SHARED_HIT = "shared_hit"
 PUBLIC_STATE_LOCAL_FALLBACK = "local_fallback"
 PUBLIC_STATE_PROCESSING = "processing"
-_PUBLIC_MARKET_STATES = {
-    PUBLIC_STATE_SHARED_HIT,
-    PUBLIC_STATE_LOCAL_FALLBACK,
-    PUBLIC_STATE_PROCESSING,
+_MARKET_STATE_ALIASES = {
+    MARKET_STATE_SHARED_OK: MARKET_STATE_SHARED_OK,
+    MARKET_STATE_SHARED_ERROR: MARKET_STATE_SHARED_ERROR,
+    MARKET_STATE_SHARED_STALE: MARKET_STATE_SHARED_STALE,
+    MARKET_STATE_MARKET_CLOSED: MARKET_STATE_MARKET_CLOSED,
+    PUBLIC_STATE_SHARED_HIT: MARKET_STATE_SHARED_OK,
+    PUBLIC_STATE_LOCAL_FALLBACK: MARKET_STATE_SHARED_ERROR,
+    PUBLIC_STATE_PROCESSING: MARKET_STATE_SHARED_OK,
+}
+_DRAW_STATE_ALIASES = {
+    DRAW_STATE_NORMAL: DRAW_STATE_NORMAL,
+    DRAW_STATE_PENDING: DRAW_STATE_PENDING,
+    DRAW_STATE_WAIT_RETRY: DRAW_STATE_WAIT_RETRY,
+    PUBLIC_STATE_PROCESSING: DRAW_STATE_PENDING,
 }
 _SHARED_RELOGIN_ERROR_MARKERS = (
     "login",
@@ -152,19 +176,57 @@ def _is_shared_detector_account(account_name: object, account_password: object) 
 def normalize_shared_market_state(
     value: object,
     *,
-    default: str = PUBLIC_STATE_PROCESSING,
+    default: str = MARKET_STATE_SHARED_OK,
 ) -> str:
     text = _safe_text(value).strip().lower()
-    if text in _PUBLIC_MARKET_STATES:
-        return text
-    return default if default in _PUBLIC_MARKET_STATES else PUBLIC_STATE_PROCESSING
+    normalized = _MARKET_STATE_ALIASES.get(text)
+    if normalized:
+        return normalized
+    fallback = _MARKET_STATE_ALIASES.get(_safe_text(default).strip().lower())
+    return fallback or MARKET_STATE_SHARED_OK
 
 
-def _attach_market_data_state(install: InstallInfo, state: str) -> InstallInfo:
+def normalize_draw_state(
+    value: object,
+    *,
+    default: str = DRAW_STATE_NORMAL,
+) -> str:
+    text = _safe_text(value).strip().lower()
+    normalized = _DRAW_STATE_ALIASES.get(text)
+    if normalized:
+        return normalized
+    fallback = _DRAW_STATE_ALIASES.get(_safe_text(default).strip().lower())
+    return fallback or DRAW_STATE_NORMAL
+
+
+def _format_refresh_at(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _attach_market_data_state(
+    install: InstallInfo,
+    state: str,
+    *,
+    draw_state: str = DRAW_STATE_NORMAL,
+    next_normal_refresh_at: str | None = None,
+    next_draw_retry_at: str | None = None,
+    snapshot_version: int = 0,
+    message_code: str | None = None,
+    message_text: str | None = None,
+) -> InstallInfo:
     normalized = normalize_shared_market_state(state)
+    normalized_draw_state = normalize_draw_state(draw_state)
     # Keep both names for compatibility during rollout.
     setattr(install, "market_data_state", normalized)
     setattr(install, "shared_market_state", normalized)
+    setattr(install, "draw_state", normalized_draw_state)
+    setattr(install, "next_normal_refresh_at", next_normal_refresh_at)
+    setattr(install, "next_draw_retry_at", next_draw_retry_at)
+    setattr(install, "snapshot_version", max(0, _safe_int(snapshot_version, 0)))
+    setattr(install, "message_code", _safe_text(message_code) or None)
+    setattr(install, "message_text", _safe_text(message_text) or None)
     return install
 
 
@@ -217,10 +279,17 @@ class SharedMarketSnapshot:
     pre_result: str
     fetched_at: Optional[datetime]
     source_status: str = "ok"
+    market_data_state: str = MARKET_STATE_SHARED_OK
+    draw_state: str = DRAW_STATE_NORMAL
+    next_normal_refresh_at: str | None = None
+    next_draw_retry_at: str | None = None
+    snapshot_version: int = 0
+    message_code: str | None = None
+    message_text: str | None = None
 
     def to_install(self, *, now: Optional[datetime] = None) -> InstallInfo:
         age_seconds = _snapshot_age_seconds(self.fetched_at, now=now)
-        return InstallInfo(
+        install = InstallInfo(
             issue=self.issue,
             state=self.state,
             close_countdown_sec=max(0, int(self.close_countdown_sec) - age_seconds),
@@ -228,6 +297,16 @@ class SharedMarketSnapshot:
             pre_issue=self.pre_issue,
             pre_result=self.pre_result,
             is_new_issue=False,
+        )
+        return _attach_market_data_state(
+            install,
+            self.market_data_state,
+            draw_state=self.draw_state,
+            next_normal_refresh_at=self.next_normal_refresh_at,
+            next_draw_retry_at=self.next_draw_retry_at,
+            snapshot_version=self.snapshot_version,
+            message_code=self.message_code,
+            message_text=self.message_text,
         )
 
 
@@ -274,6 +353,13 @@ class SharedMarketContracts:
         install: InstallInfo,
         source_status: str,
         last_error: str | None = None,
+        market_data_state: str | None = None,
+        draw_state: str | None = None,
+        next_normal_refresh_at: str | None = None,
+        next_draw_retry_at: str | None = None,
+        snapshot_version: int | None = None,
+        message_code: str | None = None,
+        message_text: str | None = None,
     ) -> None:
         fetched_at_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         await self._invoke_with_variants(
@@ -290,6 +376,13 @@ class SharedMarketContracts:
                     "source_status": source_status,
                     "last_error": last_error,
                     "fetched_at": fetched_at_text,
+                    "market_data_state": normalize_shared_market_state(market_data_state),
+                    "draw_state": normalize_draw_state(draw_state),
+                    "next_normal_refresh_at": next_normal_refresh_at,
+                    "next_draw_retry_at": next_draw_retry_at,
+                    "snapshot_version": snapshot_version,
+                    "message_code": message_code,
+                    "message_text": message_text,
                 },
                 {
                     "shared_group_id": shared_group_id,
@@ -320,6 +413,9 @@ class SharedMarketContracts:
                 install=install,
                 source_status="error",
                 last_error=last_error,
+                market_data_state=MARKET_STATE_SHARED_ERROR,
+                message_code=SHARED_ERROR_MESSAGE_CODE,
+                message_text=SHARED_ERROR_MESSAGE_TEXT,
             )
             return
 
@@ -338,6 +434,9 @@ class SharedMarketContracts:
                     "source_status": "error",
                     "last_error": last_error,
                     "fetched_at": fetched_at_text,
+                    "market_data_state": MARKET_STATE_SHARED_ERROR,
+                    "message_code": SHARED_ERROR_MESSAGE_CODE,
+                    "message_text": SHARED_ERROR_MESSAGE_TEXT,
                 },
                 {
                     "shared_group_id": shared_group_id,
@@ -395,6 +494,16 @@ class SharedMarketContracts:
                 or row.get("snapshot_fetched_at")
             ),
             source_status=_safe_text(row.get("source_status") or row.get("status") or "ok").lower(),
+            market_data_state=normalize_shared_market_state(
+                row.get("market_data_state")
+                or row.get("shared_market_state"),
+            ),
+            draw_state=normalize_draw_state(row.get("draw_state")),
+            next_normal_refresh_at=_safe_text(row.get("next_normal_refresh_at")) or None,
+            next_draw_retry_at=_safe_text(row.get("next_draw_retry_at")) or None,
+            snapshot_version=_safe_int(row.get("snapshot_version"), 0),
+            message_code=_safe_text(row.get("message_code")) or None,
+            message_text=_safe_text(row.get("message_text")) or None,
         )
 
     async def uncovered_url_touch(
@@ -612,6 +721,39 @@ class _CollectorState:
     cleanup: Callable[[], Awaitable[None]] | None = None
 
 
+@dataclass(slots=True)
+class _DrawRefreshState:
+    active: bool = False
+    retry_index: int = 0
+    trigger_issue: str = ""
+    trigger_pre_issue: str = ""
+    trigger_pre_result: str = ""
+
+    def start(self, install: InstallInfo) -> None:
+        self.active = True
+        self.retry_index = 0
+        self.trigger_issue = _safe_text(install.issue)
+        self.trigger_pre_issue = _safe_text(install.pre_issue)
+        self.trigger_pre_result = _safe_text(install.pre_result)
+
+    def reset(self) -> None:
+        self.active = False
+        self.retry_index = 0
+        self.trigger_issue = ""
+        self.trigger_pre_issue = ""
+        self.trigger_pre_result = ""
+
+    def has_new_draw_data(self, install: InstallInfo) -> bool:
+        current_issue = _safe_text(install.issue)
+        current_pre_issue = _safe_text(install.pre_issue)
+        current_pre_result = _safe_text(install.pre_result)
+        return (
+            (self.trigger_issue and current_issue and current_issue != self.trigger_issue)
+            or (self.trigger_pre_issue and current_pre_issue and current_pre_issue != self.trigger_pre_issue)
+            or (self.trigger_pre_result != current_pre_result)
+        )
+
+
 class SharedMarketRuntime:
     """Shared current-install pool with collector lifecycle and fallback."""
 
@@ -628,8 +770,11 @@ class SharedMarketRuntime:
         self._freshness_seconds = max(1, int(freshness_seconds))
         self._collector_interval_seconds = max(0.5, float(collector_interval_seconds))
         self._collector_error_backoff_seconds = max(0.5, float(collector_error_backoff_seconds))
+        self._local_fallback_interval_seconds = DEFAULT_LOCAL_FALLBACK_INTERVAL_SECONDS
         self._collectors: dict[int, _CollectorState] = {}
-        self._last_admin_alert_at_by_group: dict[int, float] = {}
+        self._shared_error_alerted_group_ids: set[int] = set()
+        self._last_local_fallback_at: dict[str, datetime] = {}
+        self._last_local_fallback_install: dict[str, InstallInfo] = {}
         self._lock = asyncio.Lock()
 
     async def ensure_enabled_collectors(self) -> int:
@@ -754,6 +899,72 @@ class SharedMarketRuntime:
             )
             return None, None
 
+    def _is_snapshot_stale(self, snapshot: SharedMarketSnapshot) -> bool:
+        if snapshot.fetched_at is None:
+            return True
+        now = datetime.now(snapshot.fetched_at.tzinfo) if snapshot.fetched_at.tzinfo else datetime.now()
+        age_seconds = (now - snapshot.fetched_at).total_seconds()
+        return age_seconds > self._freshness_seconds
+
+    def _effective_snapshot_market_data_state(self, snapshot: SharedMarketSnapshot) -> str:
+        state = normalize_shared_market_state(snapshot.market_data_state)
+        source_status = _safe_text(snapshot.source_status).strip().lower()
+        if state == MARKET_STATE_SHARED_OK and source_status in {"error", "failed", "offline"}:
+            return MARKET_STATE_SHARED_ERROR
+        if state == MARKET_STATE_SHARED_OK and source_status in {"stale", "expired"}:
+            return MARKET_STATE_SHARED_STALE
+        if state == MARKET_STATE_SHARED_OK and source_status in {"closed", "market_closed"}:
+            return MARKET_STATE_MARKET_CLOSED
+        if state == MARKET_STATE_SHARED_OK and self._is_snapshot_stale(snapshot):
+            return MARKET_STATE_SHARED_STALE
+        return state
+
+    def _snapshot_install_with_state(
+        self,
+        snapshot: SharedMarketSnapshot,
+        *,
+        market_data_state: str | None = None,
+        draw_state: str | None = None,
+    ) -> InstallInfo:
+        install = snapshot.to_install()
+        return _attach_market_data_state(
+            install,
+            market_data_state or snapshot.market_data_state,
+            draw_state=draw_state or snapshot.draw_state,
+            next_normal_refresh_at=snapshot.next_normal_refresh_at,
+            next_draw_retry_at=snapshot.next_draw_retry_at,
+            snapshot_version=snapshot.snapshot_version,
+            message_code=snapshot.message_code,
+            message_text=snapshot.message_text,
+        )
+
+    def _local_fallback_key(self, *, owner_key: str, shared_group_id: int) -> str:
+        account_id = self._extract_account_id(owner_key)
+        if account_id and account_id > 0:
+            return f"account:{account_id}"
+        return f"group:{shared_group_id}"
+
+    def _can_use_local_fallback(
+        self,
+        *,
+        market_data_state: str,
+        draw_state: str,
+    ) -> bool:
+        if normalize_draw_state(draw_state) in {DRAW_STATE_PENDING, DRAW_STATE_WAIT_RETRY}:
+            return False
+        normalized_market_state = normalize_shared_market_state(market_data_state)
+        return normalized_market_state in {MARKET_STATE_SHARED_ERROR, MARKET_STATE_SHARED_STALE}
+
+    def _is_market_closed_install(self, install: InstallInfo) -> bool:
+        state = _safe_int(getattr(install, "state", 0), 0)
+        if state in (1, 2, 3):
+            return False
+        return (
+            state == 0
+            and _safe_int(getattr(install, "close_countdown_sec", 0), 0) <= 0
+            and _safe_int(getattr(install, "open_countdown_sec", 0), 0) <= 0
+        )
+
     async def resolve_install(
         self,
         *,
@@ -790,30 +1001,44 @@ class SharedMarketRuntime:
                     fetch_local_install=fetch_local_install,
                 )
                 if discovered_install is not None:
-                    return _attach_market_data_state(discovered_install, PUBLIC_STATE_SHARED_HIT)
+                    return _attach_market_data_state(discovered_install, MARKET_STATE_SHARED_OK)
                 snapshot = await self._contracts.snapshot_get_latest(
                     shared_group_id=discovered_group_id,
                 )
-                if snapshot is not None and snapshot.source_status in {"ok", ""}:
-                    if snapshot.fetched_at is None:
-                        return await self._fallback_local(
-                            shared_group_id=discovered_group_id,
-                            reason="discovered_no_fetched_at",
-                            fetch_local_install=fetch_local_install,
-                        )
-                    now = datetime.now(snapshot.fetched_at.tzinfo) if snapshot.fetched_at else datetime.now()
-                    age_seconds = (now - snapshot.fetched_at).total_seconds()
-                    if age_seconds <= self._freshness_seconds:
-                        return _attach_market_data_state(snapshot.to_install(), PUBLIC_STATE_SHARED_HIT)
+                if snapshot is None:
                     return await self._fallback_local(
                         shared_group_id=discovered_group_id,
-                        reason="discovered_snapshot_stale",
+                        owner_key=owner_key,
+                        reason="discovered_no_snapshot",
                         fetch_local_install=fetch_local_install,
+                        market_data_state=MARKET_STATE_SHARED_STALE,
                     )
-                return await self._fallback_local(
-                    shared_group_id=discovered_group_id,
-                    reason="discovered_no_snapshot",
-                    fetch_local_install=fetch_local_install,
+
+                draw_state = normalize_draw_state(snapshot.draw_state)
+                market_data_state = self._effective_snapshot_market_data_state(snapshot)
+                if draw_state in {DRAW_STATE_PENDING, DRAW_STATE_WAIT_RETRY}:
+                    return self._snapshot_install_with_state(
+                        snapshot,
+                        market_data_state=market_data_state,
+                        draw_state=draw_state,
+                    )
+                if self._can_use_local_fallback(
+                    market_data_state=market_data_state,
+                    draw_state=draw_state,
+                ):
+                    return await self._fallback_local(
+                        shared_group_id=discovered_group_id,
+                        owner_key=owner_key,
+                        reason=f"discovered_{market_data_state}",
+                        fetch_local_install=fetch_local_install,
+                        market_data_state=market_data_state,
+                        draw_state=draw_state,
+                        snapshot_fallback=snapshot,
+                    )
+                return self._snapshot_install_with_state(
+                    snapshot,
+                    market_data_state=market_data_state,
+                    draw_state=draw_state,
                 )
 
             install = await fetch_local_install()
@@ -834,39 +1059,38 @@ class SharedMarketRuntime:
         if snapshot is None:
             return await self._fallback_local(
                 shared_group_id=shared_group_id,
+                owner_key=owner_key,
                 reason="missing",
                 fetch_local_install=fetch_local_install,
+                market_data_state=MARKET_STATE_SHARED_STALE,
             )
 
-        if snapshot.source_status not in {"ok", ""}:
+        draw_state = normalize_draw_state(snapshot.draw_state)
+        market_data_state = self._effective_snapshot_market_data_state(snapshot)
+        if draw_state in {DRAW_STATE_PENDING, DRAW_STATE_WAIT_RETRY}:
+            return self._snapshot_install_with_state(
+                snapshot,
+                market_data_state=market_data_state,
+                draw_state=draw_state,
+            )
+        if self._can_use_local_fallback(
+            market_data_state=market_data_state,
+            draw_state=draw_state,
+        ):
             return await self._fallback_local(
                 shared_group_id=shared_group_id,
-                reason=f"source_{snapshot.source_status}",
+                owner_key=owner_key,
+                reason=f"source_{market_data_state}",
                 fetch_local_install=fetch_local_install,
+                market_data_state=market_data_state,
+                draw_state=draw_state,
+                snapshot_fallback=snapshot,
             )
-
-        now = datetime.now(snapshot.fetched_at.tzinfo) if snapshot.fetched_at else datetime.now()
-        if snapshot.fetched_at is None:
-            return await self._fallback_local(
-                shared_group_id=shared_group_id,
-                reason="no_fetched_at",
-                fetch_local_install=fetch_local_install,
-            )
-        age_seconds = (now - snapshot.fetched_at).total_seconds()
-        if age_seconds > self._freshness_seconds:
-            logger.info(
-                "shared_snapshot_stale group_id=%d age_seconds=%.2f freshness=%d",
-                shared_group_id,
-                age_seconds,
-                self._freshness_seconds,
-            )
-            return await self._fallback_local(
-                shared_group_id=shared_group_id,
-                reason="stale",
-                fetch_local_install=fetch_local_install,
-            )
-
-        return _attach_market_data_state(snapshot.to_install(), PUBLIC_STATE_SHARED_HIT)
+        return self._snapshot_install_with_state(
+            snapshot,
+            market_data_state=market_data_state,
+            draw_state=draw_state,
+        )
 
     async def release_owner(self, owner_key: str) -> None:
         if not owner_key:
@@ -880,22 +1104,50 @@ class SharedMarketRuntime:
         self,
         *,
         shared_group_id: int,
+        owner_key: str,
         reason: str,
         fetch_local_install: Callable[[], Awaitable[InstallInfo]],
-        market_data_state: str = PUBLIC_STATE_PROCESSING,
+        market_data_state: str = MARKET_STATE_SHARED_ERROR,
+        draw_state: str = DRAW_STATE_NORMAL,
+        snapshot_fallback: SharedMarketSnapshot | None = None,
     ) -> InstallInfo:
+        fallback_key = self._local_fallback_key(
+            owner_key=owner_key,
+            shared_group_id=shared_group_id,
+        )
+        now = datetime.now()
+        last_fallback_at = self._last_local_fallback_at.get(fallback_key)
+        if last_fallback_at is not None:
+            elapsed_seconds = (now - last_fallback_at).total_seconds()
+            if elapsed_seconds < self._local_fallback_interval_seconds:
+                cached_install = self._last_local_fallback_install.get(fallback_key)
+                if cached_install is not None:
+                    return _attach_market_data_state(
+                        cached_install,
+                        market_data_state,
+                        draw_state=draw_state,
+                    )
+                if snapshot_fallback is not None:
+                    return self._snapshot_install_with_state(
+                        snapshot_fallback,
+                        market_data_state=market_data_state,
+                        draw_state=draw_state,
+                    )
+
         logger.info(
-            "shared_snapshot_fallback group_id=%d reason=%s",
+            "shared_snapshot_fallback group_id=%d reason=%s key=%s",
             shared_group_id,
             reason,
+            fallback_key,
         )
         install = await fetch_local_install()
-        await self._contracts.snapshot_upsert(
-            shared_group_id=shared_group_id,
-            install=install,
-            source_status="ok",
+        self._last_local_fallback_at[fallback_key] = now
+        self._last_local_fallback_install[fallback_key] = install
+        return _attach_market_data_state(
+            install,
+            market_data_state,
+            draw_state=draw_state,
         )
-        return _attach_market_data_state(install, market_data_state)
 
     async def _discover_url_group_match(
         self,
@@ -1124,16 +1376,58 @@ class SharedMarketRuntime:
         fetch_local_install: Callable[[], Awaitable[InstallInfo]],
     ) -> None:
         last_install: Optional[InstallInfo] = None
+        draw_refresh = _DrawRefreshState()
         while not stop_event.is_set():
             sleep_seconds = self._collector_interval_seconds
             try:
                 install = await fetch_local_install()
                 last_install = install
+                now = datetime.now()
+                market_data_state = MARKET_STATE_SHARED_OK
+                draw_state = DRAW_STATE_NORMAL
+                next_normal_refresh_at: datetime | None = None
+                next_draw_retry_at: datetime | None = None
+
+                if self._is_market_closed_install(install):
+                    draw_refresh.reset()
+                    market_data_state = MARKET_STATE_MARKET_CLOSED
+                    sleep_seconds = self._collector_interval_seconds
+                    next_normal_refresh_at = now + timedelta(seconds=sleep_seconds)
+                else:
+                    open_countdown_sec = _safe_int(getattr(install, "open_countdown_sec", 0), 0)
+                    if not draw_refresh.active and open_countdown_sec <= 0:
+                        draw_refresh.start(install)
+
+                    if draw_refresh.active:
+                        if draw_refresh.has_new_draw_data(install):
+                            draw_refresh.reset()
+                            sleep_seconds = self._collector_interval_seconds
+                            next_normal_refresh_at = now + timedelta(seconds=sleep_seconds)
+                        elif draw_refresh.retry_index >= len(DRAW_PENDING_RETRY_INTERVALS_SECONDS):
+                            draw_state = DRAW_STATE_WAIT_RETRY
+                            sleep_seconds = DRAW_WAIT_RETRY_INTERVAL_SECONDS
+                            next_draw_retry_at = now + timedelta(seconds=sleep_seconds)
+                        else:
+                            draw_state = DRAW_STATE_PENDING
+                            sleep_seconds = float(
+                                DRAW_PENDING_RETRY_INTERVALS_SECONDS[draw_refresh.retry_index]
+                            )
+                            draw_refresh.retry_index += 1
+                            next_draw_retry_at = now + timedelta(seconds=sleep_seconds)
+                    else:
+                        sleep_seconds = self._collector_interval_seconds
+                        next_normal_refresh_at = now + timedelta(seconds=sleep_seconds)
+
                 await self._contracts.snapshot_upsert(
                     shared_group_id=shared_group_id,
                     install=install,
                     source_status="ok",
+                    market_data_state=market_data_state,
+                    draw_state=draw_state,
+                    next_normal_refresh_at=_format_refresh_at(next_normal_refresh_at),
+                    next_draw_retry_at=_format_refresh_at(next_draw_retry_at),
                 )
+                self._shared_error_alerted_group_ids.discard(shared_group_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1143,6 +1437,7 @@ class SharedMarketRuntime:
                     shared_group_id,
                     owner_key,
                 )
+                draw_refresh.reset()
                 await self._contracts.snapshot_mark_error(
                     shared_group_id=shared_group_id,
                     install=last_install,
@@ -1167,25 +1462,23 @@ class SharedMarketRuntime:
         owner_key: str,
         error_text: str,
     ) -> None:
-        now = time.monotonic()
-        last_alert_at = self._last_admin_alert_at_by_group.get(shared_group_id, 0.0)
-        if now - last_alert_at < ADMIN_ALERT_DEDUP_SECONDS:
+        if shared_group_id in self._shared_error_alerted_group_ids:
             return
-        self._last_admin_alert_at_by_group[shared_group_id] = now
+        self._shared_error_alerted_group_ids.add(shared_group_id)
 
-        detail = (
-            f"共享组ID：{shared_group_id}\n"
-            f"来源：{owner_key}\n"
-            f"异常：{error_text}\n"
-            "系统已将共享数据源标记为异常，前端会尝试改用操作者账号自行获取开奖数据。"
+        logger.warning(
+            "shared_collector_admin_alert_triggered group_id=%d owner=%s error=%s",
+            shared_group_id,
+            owner_key,
+            error_text,
         )
         try:
             admin_ids = await self._contracts.active_admin_operator_ids()
             for operator_id in admin_ids:
                 await self._contracts.admin_alert_create(
                     operator_id=operator_id,
-                    title="共享数据源异常",
-                    detail=detail,
+                    title=SHARED_ERROR_MESSAGE_TEXT,
+                    detail="",
                 )
         except Exception:
             logger.exception(

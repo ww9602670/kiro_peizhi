@@ -4,7 +4,9 @@ import { isApiError } from '@/api/request';
 import { DEFAULT_CURRENT_INSTALL, type CurrentInstall } from '@/types/api/lottery';
 
 const RETRY_INTERVAL_MS = 5000;
-const POST_DRAW_REFRESH_DELAY_MS = 30000;
+const DRAW_PENDING_POLL_INTERVAL_MS = 5000;
+const POST_DRAW_REFRESH_DELAY_MS = 10000;
+const DRAW_WAIT_RETRY_DEFAULT_DELAY_MS = 10000;
 const TICK_INTERVAL_MS = 1000;
 
 export interface UseLotteryCountdownOptions {
@@ -102,6 +104,51 @@ class CountdownStore {
     return data.close_countdown_sec > 0 || data.open_countdown_sec > 0;
   }
 
+  private resolveDrawWaitRetryDelayMs(data: CurrentInstall): number {
+    const retryAt = data.next_draw_retry_at?.trim();
+    if (!retryAt) {
+      return DRAW_WAIT_RETRY_DEFAULT_DELAY_MS;
+    }
+    const parsed = new Date(retryAt).getTime();
+    if (!Number.isFinite(parsed)) {
+      return DRAW_WAIT_RETRY_DEFAULT_DELAY_MS;
+    }
+    const deltaMs = parsed - Date.now();
+    if (deltaMs <= 0) {
+      return DRAW_WAIT_RETRY_DEFAULT_DELAY_MS;
+    }
+    return deltaMs;
+  }
+
+  private scheduleNextFetch(nextInstall: CurrentInstall) {
+    if (nextInstall.market_data_state === 'market_closed') {
+      return;
+    }
+
+    if (nextInstall.draw_state === 'draw_pending') {
+      this.scheduleFetch(DRAW_PENDING_POLL_INTERVAL_MS);
+      return;
+    }
+
+    if (nextInstall.draw_state === 'draw_wait_retry') {
+      this.scheduleFetch(this.resolveDrawWaitRetryDelayMs(nextInstall));
+      return;
+    }
+
+    if (!this.hasUsableSnapshot(nextInstall)) {
+      this.scheduleFetch(RETRY_INTERVAL_MS);
+      return;
+    }
+
+    if (nextInstall.open_countdown_sec <= 0) {
+      // Usable snapshot already at zero-countdown: draw has already finished.
+      // Schedule the post-draw refresh so the UI can advance to the next issue
+      // instead of freezing on a stale zero-countdown snapshot.
+      this.scheduleFetch(POST_DRAW_REFRESH_DELAY_MS);
+      this.drawRefreshScheduled = true;
+    }
+  }
+
   private start() {
     this.started = true;
     this.tickHandle = setInterval(() => {
@@ -157,15 +204,7 @@ class CountdownStore {
         error: null,
         lastUpdateTime: new Date(),
       });
-      if (!this.hasUsableSnapshot(nextInstall)) {
-        this.scheduleFetch(RETRY_INTERVAL_MS);
-      } else if (nextInstall.open_countdown_sec <= 0) {
-        // Usable snapshot already at zero-countdown: draw has already finished.
-        // Schedule the post-draw refresh so the UI can advance to the next issue
-        // instead of freezing on a stale zero-countdown snapshot.
-        this.scheduleFetch(POST_DRAW_REFRESH_DELAY_MS);
-        this.drawRefreshScheduled = true;
-      }
+      this.scheduleNextFetch(nextInstall);
     } catch (err) {
       const message = isApiError(err) ? err.message || '数据延迟' : '数据延迟';
       this.setSnapshot({

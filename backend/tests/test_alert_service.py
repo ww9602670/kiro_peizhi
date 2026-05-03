@@ -17,7 +17,7 @@ import aiosqlite
 
 from app.database import DDL_STATEMENTS, INSERT_DEFAULT_ADMIN
 from app.models.db_ops import operator_create
-from app.engine.alert import AlertService, ALERT_LEVEL_MAP, _DEDUP_WINDOW
+from app.engine.alert import AlertService, ALERT_LEVEL_MAP, ALERT_OPERATOR_COPY, _DEDUP_WINDOW
 
 
 @pytest.fixture
@@ -66,7 +66,7 @@ async def test_send_writes_to_db(db, operator, alert_service):
     assert row["operator_id"] == operator["id"]
     assert row["type"] == "login_fail"
     assert row["level"] == "critical"  # login_fail  critical
-    assert row["title"] == ""
+    assert row["title"] == "账号登录失败，请联系管理员处理。日志编号：SESSION-003。"
     assert row["detail"] == ""
     assert row["is_read"] == 0
 
@@ -106,7 +106,7 @@ async def test_dedup_within_5_minutes(db, operator, alert_service):
         "SELECT * FROM alerts WHERE operator_id=?", (operator["id"],)
     )).fetchall()
     assert len(rows) == 1
-    assert rows[0]["title"] == " #1"
+    assert rows[0]["title"] == "账号登录失败，请联系管理员处理。日志编号：SESSION-003。"
 
 
 @pytest.mark.asyncio
@@ -274,7 +274,7 @@ async def test_unknown_alert_type_defaults_to_warning(db, operator, alert_servic
     result = await alert_service.send(
         operator_id=operator["id"],
         alert_type="unknown_type_xyz",
-        title="",
+        title="unknown raw title",
     )
     assert result is True
 
@@ -283,3 +283,24 @@ async def test_unknown_alert_type_defaults_to_warning(db, operator, alert_servic
     )).fetchone()
     assert row is not None
     assert row["level"] == "warning"
+    assert row["title"] == "unknown raw title"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alert_type", ["session_lost", "bet_fail", "platform_limit", "shared_market_error"])
+async def test_operator_copy_applied_for_known_types(db, operator, alert_service, alert_type):
+    code, message = ALERT_OPERATOR_COPY[alert_type]
+    await alert_service.send(
+        operator_id=operator["id"],
+        alert_type=alert_type,
+        title="raw-title-should-not-show",
+        detail='{"raw":"detail"}',
+    )
+
+    row = await (await db.execute(
+        "SELECT * FROM alerts WHERE operator_id=? AND type=? ORDER BY id DESC",
+        (operator["id"], alert_type),
+    )).fetchone()
+    assert row is not None
+    assert row["title"] == f"{message}日志编号：{code}。"
+    assert row["detail"] == '{"raw":"detail"}'

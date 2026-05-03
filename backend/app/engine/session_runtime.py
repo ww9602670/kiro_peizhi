@@ -28,14 +28,17 @@ SESSION_ONLINE = "session_online"
 SESSION_RECONNECTING = "session_reconnecting"
 SESSION_BLOCKED = "session_blocked"
 PLATFORM_RATE_LIMITED = "platform_rate_limited"
+SESSION_ALERT_RECONNECTING = "账号会话异常，系统正在重连。日志编号：SESSION-001。"
+SESSION_ALERT_RECONNECT_FAILED = "账号重连失败，请联系管理员处理。日志编号：SESSION-002。"
 
 _BLOCK_MARKERS = (
     "403",
     "cloudflare",
     "captcha",
+    "验证码",
+    "风控",
     "verify code",
     "verification code",
-    "remote login",
     "risk control",
     "account abnormal",
 )
@@ -178,12 +181,27 @@ class AccountSessionRuntime:
             try:
                 return await func()
             except RemoteLoginRequired as exc:
+                self._record_failure(exc)
+                if self._is_blocked():
+                    await self._notify_session_reconnect_failed(str(exc))
+                    raise
+                self._state = SESSION_RECONNECTING
+                await self._notify_session_reconnecting(str(exc))
                 recovered = await self.recover(f"{reason}:remote_login")
                 if not recovered:
+                    await self._notify_session_reconnect_failed("recover_after_api_failure returned False")
                     raise
-                return await func()
+                try:
+                    return await func()
+                except Exception as retry_exc:
+                    self._record_failure(retry_exc)
+                    if self._is_blocked():
+                        await self._notify_session_reconnect_failed(str(retry_exc))
+                    raise
             except Exception as exc:
                 self._record_failure(exc)
+                if self._is_blocked():
+                    await self._notify_session_reconnect_failed(str(exc))
                 raise
 
     async def recover(self, reason: str) -> bool:
@@ -191,10 +209,12 @@ class AccountSessionRuntime:
         _ = reason
         if self._is_blocked():
             self._state = SESSION_BLOCKED
+            await self._notify_session_reconnect_failed(self._blocked_reason)
             return False
         async with self._recover_lock:
             if self._is_blocked():
                 self._state = SESSION_BLOCKED
+                await self._notify_session_reconnect_failed(self._blocked_reason)
                 return False
 
             self._state = SESSION_RECONNECTING
@@ -202,6 +222,8 @@ class AccountSessionRuntime:
                 ok = await self.session.recover_after_api_failure()
             except Exception as exc:
                 self._record_failure(exc)
+                if self._is_blocked():
+                    await self._notify_session_reconnect_failed(str(exc))
                 raise
 
             if ok:
@@ -248,13 +270,51 @@ class AccountSessionRuntime:
     def _record_failure(self, reason: object) -> None:
         message = _normalize_error_message(reason) or "unknown_runtime_error"
         self._last_failure_reason = message
-        if _is_blocking_message(message):
+        if self._is_failure_blocking(reason, message):
             self._state = SESSION_BLOCKED
             self._blocked_reason = message
             # Block automated retries for 5 minutes on risk/captcha/403 markers.
             self._blocked_until = time.time() + 300
         else:
             self._state = PLATFORM_RATE_LIMITED
+
+    def _is_failure_blocking(self, reason: object, message: str) -> bool:
+        if isinstance(reason, RemoteLoginRequired):
+            if reason.blocking:
+                return True
+            return _is_blocking_message(message)
+        return _is_blocking_message(message)
+
+    async def _notify_session_reconnecting(self, detail: str | None = None) -> None:
+        await self._safe_send_alert(
+            alert_type="session_reconnecting",
+            title=SESSION_ALERT_RECONNECTING,
+            detail=detail,
+        )
+
+    async def _notify_session_reconnect_failed(self, detail: str | None = None) -> None:
+        await self._safe_send_alert(
+            alert_type="session_reconnect_failed",
+            title=SESSION_ALERT_RECONNECT_FAILED,
+            detail=detail,
+        )
+
+    async def _safe_send_alert(self, *, alert_type: str, title: str, detail: str | None) -> None:
+        try:
+            await self.alert_service.send(
+                operator_id=self.operator_id,
+                alert_type=alert_type,
+                title=title,
+                detail=detail,
+                account_id=self.account_id,
+            )
+        except Exception:
+            logger.exception(
+                "session runtime alert send failed account_id=%d platform=%s alert_type=%s",
+                self.account_id,
+                self.platform_type,
+                alert_type,
+            )
 
 
 class SessionRuntimeRegistry:

@@ -89,8 +89,19 @@ class LoginResult:
 class RemoteLoginRequired(RuntimeError):
     """Raised when the platform indicates the current session is no longer valid."""
 
-    def __init__(self, *, raw_state: int, message: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        raw_state: int,
+        message: str = "",
+        category: str = "session_invalid",
+        blocking: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         self.raw_state = raw_state
+        self.category = category
+        self.blocking = blocking
+        self.status_code = status_code
         super().__init__(message or f"remote login required, state={raw_state}")
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from datetime import datetime
 import json
 import logging
 import time
@@ -67,6 +68,10 @@ MAX_RESTART_FAILURES = 5
 SETTLEMENT_WAIT_SECONDS_DEFAULT = 30
 SETTLEMENT_WAIT_SECONDS_MIN = 10
 SETTLEMENT_WAIT_SECONDS_MAX = 120
+SETTLEMENT_FIRST_FETCH_DELAY_SECONDS = 20
+SETTLEMENT_RETRY_DELAYS = [10, 5, 8, 10]
+SETTLEMENT_MAX_PENDING_SECONDS = 600
+SETTLEMENT_BRANCH_IDLE_SECONDS = 1
 
 # 缁撶畻鏁版嵁鎷夊彇閲嶈瘯
 SETTLE_DATA_RETRY_MAX = 6
@@ -79,6 +84,11 @@ API_RETRY_MAX = 3
 # 璺ㄨ繘绋嬩簰鏂ラ攣
 LOCK_TTL_MINUTES = 5
 LOCK_RENEW_INTERVAL = 60  # 绉?
+
+# 鍏变韩蹇収涓嬫敞鍓嶆柊椴滃害淇濇姢
+SNAPSHOT_FRESHNESS_SECONDS = 35
+SNAPSHOT_STALE_MESSAGE_CODE = "SHARED-002"
+MARKET_CLOSED_MESSAGE_CODE = "MARKET-001"
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,14 @@ class IssueExecutionPlan:
     groups: list[TimingGroup]
     executed_strategy_ids: set[int] = field(default_factory=set)
     skipped_strategy_reasons: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass
+class SettlementPendingIssue:
+    issue: str
+    registered_at: float
+    next_attempt_at: float
+    retry_index: int = 0
 
 
 class WorkerStartupError(RuntimeError):
@@ -214,6 +232,10 @@ class AccountWorker:
         self.settling_only: bool = False
         self._settling_deadline: float | None = None
         self._on_settle_complete: Optional[asyncio.coroutines] = None  # 缁撶畻瀹屾垚鍥炶皟
+        self._settlement_pending_issues: dict[str, SettlementPendingIssue] = {}
+        self._settlement_branch_task: Optional[asyncio.Task] = None
+        self._settlement_branch_wakeup: Optional[asyncio.Event] = None
+        self._settlement_branch_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # 
@@ -477,48 +499,32 @@ class AccountWorker:
         *,
         bet_timing: int,
         strategy_ids: list[int] | None = None,
+        expected_issue: str | None = None,
     ) -> tuple[InstallInfo, str | None]:
-        """Refresh the current issue snapshot before submitting one timing group."""
-        try:
-            if self.session_runtime is not None:
-                refreshed = await self.session_runtime.run_platform_call(
-                    "worker_group_revalidate_install",
-                    self.adapter.get_current_install,
-                )
-            else:
-                refreshed = await self.adapter.get_current_install()
-        except Exception:
-            logger.exception(
-                "group revalidation failed issue=%s account_id=%d bet_timing=%ds",
-                install.issue,
-                self.account_id,
-                bet_timing,
-            )
-            log_countdown_validation(
-                operator_id=self.operator_id,
-                account_id=self.account_id,
-                issue=install.issue,
-                phase="pre_submit",
-                allowed=False,
-                state=install.state,
-                close_countdown_sec=install.close_countdown_sec,
-                platform_type=self._platform_type,
-                expected_issue=install.issue,
-                current_issue=install.issue,
-                bet_timing=bet_timing,
-                reason="precheck_failed",
-                strategy_ids=sorted(strategy_ids or []),
-            )
-            return install, "precheck_failed"
+        """Validate one timing group with local snapshot state only."""
+        market_data_state = self._market_data_state(install)
+        draw_state = self._draw_state(install)
+        snapshot_age_seconds = self._current_snapshot_age_seconds()
 
         reason: str | None = None
-        if refreshed.issue != install.issue:
+        if expected_issue and install.issue != expected_issue:
             reason = "issue_changed"
-        elif refreshed.state != 1:
+        elif market_data_state == "market_closed":
+            reason = "market_closed"
+        elif market_data_state in {"shared_error", "shared_stale"}:
+            reason = "snapshot_unavailable"
+        elif draw_state in {"draw_pending", "draw_wait_retry"}:
+            reason = draw_state
+        elif (
+            snapshot_age_seconds is not None
+            and snapshot_age_seconds > SNAPSHOT_FRESHNESS_SECONDS
+        ):
+            reason = "snapshot_stale"
+        elif install.state != 1:
             reason = "state_not_open"
-        elif refreshed.close_countdown_sec <= SKIP_THRESHOLD:
+        elif install.close_countdown_sec <= SKIP_THRESHOLD:
             reason = "remaining_too_small"
-        elif refreshed.close_countdown_sec > bet_timing:
+        elif install.close_countdown_sec > bet_timing:
             reason = "window_not_open"
 
         log_countdown_validation(
@@ -527,16 +533,71 @@ class AccountWorker:
             issue=install.issue,
             phase="pre_submit",
             allowed=reason is None,
-            state=refreshed.state,
-            close_countdown_sec=refreshed.close_countdown_sec,
+            state=install.state,
+            close_countdown_sec=install.close_countdown_sec,
             platform_type=self._platform_type,
-            expected_issue=install.issue,
-            current_issue=refreshed.issue,
+            expected_issue=expected_issue or install.issue,
+            current_issue=install.issue,
             bet_timing=bet_timing,
             reason=reason,
             strategy_ids=sorted(strategy_ids or []),
         )
-        return refreshed, reason
+        if reason in {"snapshot_unavailable", "snapshot_stale", "draw_pending", "draw_wait_retry"}:
+            message_code = (
+                str(getattr(install, "message_code", "") or "").strip()
+                or SNAPSHOT_STALE_MESSAGE_CODE
+            )
+            logger.warning(
+                "共享快照异常，跳过本期下注 issue=%s account_id=%d reason=%s snapshot_age=%s 日志编号：%s。",
+                install.issue,
+                self.account_id,
+                reason,
+                snapshot_age_seconds,
+                message_code,
+            )
+        elif reason == "market_closed":
+            logger.info(
+                "当前处于停盘，停止本期新下注 issue=%s account_id=%d 日志编号：%s。",
+                install.issue,
+                self.account_id,
+                MARKET_CLOSED_MESSAGE_CODE,
+            )
+        return install, reason
+
+    def _current_snapshot_age_seconds(self) -> int | None:
+        """Return latest local snapshot age from poller metadata."""
+        last_success_at = getattr(self.poller, "last_success_at", None)
+        if not isinstance(last_success_at, datetime):
+            return None
+        now = (
+            datetime.now(last_success_at.tzinfo)
+            if last_success_at.tzinfo is not None
+            else datetime.now()
+        )
+        return max(0, int((now - last_success_at).total_seconds()))
+
+    def _main_loop_sleep_seconds(self, install: InstallInfo) -> int:
+        """Keep the non-settlement main loop paced after settlement was split out."""
+        poll_interval = max(1, int(getattr(self.poller, "poll_interval", 5) or 5))
+        open_countdown = max(0, int(getattr(install, "open_countdown_sec", 0) or 0))
+        close_countdown = max(0, int(getattr(install, "close_countdown_sec", 0) or 0))
+        countdown = open_countdown or close_countdown or poll_interval
+        return max(1, min(poll_interval, countdown))
+
+    @staticmethod
+    def _market_data_state(install: InstallInfo) -> str:
+        return str(
+            getattr(
+                install,
+                "market_data_state",
+                getattr(install, "shared_market_state", "shared_ok"),
+            )
+            or "shared_ok"
+        ).strip().lower()
+
+    @staticmethod
+    def _draw_state(install: InstallInfo) -> str:
+        return str(getattr(install, "draw_state", "normal") or "normal").strip().lower()
 
     async def _has_unsettled_orders(self) -> bool:
         """Return whether this worker still has unsettled orders in either ledger."""
@@ -545,16 +606,214 @@ class AccountWorker:
                 "SELECT ("
                 "  SELECT COUNT(*) FROM bet_orders "
                 "  WHERE account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match')"
+                "  AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout', 'settle_failed')"
                 ") + ("
                 "  SELECT COUNT(*) FROM simulation_bet_orders "
                 "  WHERE account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match')"
+                "  AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout', 'settle_failed')"
                 ") AS cnt",
                 (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
         ).fetchone()
+        return (row["cnt"] if row else 0) > 0 or bool(self._settlement_pending_issues)
+
+    @staticmethod
+    def _settlement_retry_delay(retry_index: int) -> int:
+        if retry_index < len(SETTLEMENT_RETRY_DELAYS):
+            return SETTLEMENT_RETRY_DELAYS[retry_index]
+        return SETTLEMENT_RETRY_DELAYS[-1]
+
+    def _wake_settlement_branch(self) -> None:
+        if self._settlement_branch_wakeup is not None:
+            self._settlement_branch_wakeup.set()
+
+    async def _ensure_settlement_branch_started(self) -> None:
+        if self._settlement_branch_task and not self._settlement_branch_task.done():
+            return
+        self._settlement_branch_wakeup = asyncio.Event()
+        self._settlement_branch_task = asyncio.create_task(self._settlement_branch_loop())
+        self._wake_settlement_branch()
+
+    async def _stop_settlement_branch(self) -> None:
+        task = self._settlement_branch_task
+        self._settlement_branch_task = None
+        self._settlement_branch_wakeup = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _has_issue_unsettled_orders(
+        self,
+        issue: str,
+        *,
+        include_recoverable: bool = True,
+    ) -> bool:
+        statuses = ["bet_success", "settlement_pending", "pending_match", "settling"]
+        if include_recoverable:
+            statuses.extend(["settle_timeout", "settle_failed"])
+        placeholders = ",".join("?" * len(statuses))
+        params = (
+            issue,
+            self.account_id,
+            self.operator_id,
+            *statuses,
+            issue,
+            self.account_id,
+            self.operator_id,
+            *statuses,
+        )
+        row = await (
+            await self.db.execute(
+                "SELECT ("
+                "  SELECT COUNT(*) FROM bet_orders "
+                "  WHERE issue=? AND account_id=? AND operator_id=? "
+                f"  AND status IN ({placeholders})"
+                ") + ("
+                "  SELECT COUNT(*) FROM simulation_bet_orders "
+                "  WHERE issue=? AND account_id=? AND operator_id=? "
+                f"  AND status IN ({placeholders})"
+                ") AS cnt",
+                params,
+            )
+        ).fetchone()
         return (row["cnt"] if row else 0) > 0
+
+    async def _register_issue_for_settlement(
+        self,
+        issue: str,
+        *,
+        open_countdown_sec: int = 0,
+        immediate: bool = False,
+    ) -> None:
+        if not issue:
+            return
+        await self.db.execute(
+            "UPDATE bet_orders SET status='settlement_pending' "
+            "WHERE issue=? AND account_id=? AND operator_id=? AND status='bet_success'",
+            (issue, self.account_id, self.operator_id),
+        )
+        await self.db.execute(
+            "UPDATE simulation_bet_orders SET status='settlement_pending' "
+            "WHERE issue=? AND account_id=? AND operator_id=? AND status='bet_success'",
+            (issue, self.account_id, self.operator_id),
+        )
+        await self.db.commit()
+        if not await self._has_issue_unsettled_orders(issue):
+            self._settlement_pending_issues.pop(issue, None)
+            return
+        now = time.time()
+        first_delay = 0 if immediate else max(0, int(open_countdown_sec)) + SETTLEMENT_FIRST_FETCH_DELAY_SECONDS
+        entry = self._settlement_pending_issues.get(issue)
+        if entry is None:
+            self._settlement_pending_issues[issue] = SettlementPendingIssue(
+                issue=issue,
+                registered_at=now,
+                next_attempt_at=now + first_delay,
+            )
+        self._wake_settlement_branch()
+
+    async def _mark_issue_settle_timeout(self, issue: str, elapsed: int) -> None:
+        await self._mark_issue_orders_settle_failed(issue)
+        await self.alert_service.send(
+            operator_id=self.operator_id,
+            alert_type="settle_data_expired",
+            title=f"结算补偿超时 issue={issue}",
+            detail=f"超过 {elapsed}s 仍未完成结算，已标记为 settle_failed",
+            account_id=self.account_id,
+        )
+
+    async def _try_settle_pending_issue(self, issue: str) -> bool:
+        install = await self._fetch_install_with_retry()
+        if install is None:
+            return False
+
+        pre_result = str(getattr(install, "pre_result", "") or "").strip()
+        if not pre_result or str(getattr(install, "pre_issue", "") or "") != issue:
+            return False
+
+        balls, sum_value = _parse_result(pre_result)
+        if not balls:
+            return False
+
+        await self.settler._save_lottery_result(issue, pre_result, sum_value)
+        await self.settler.settle(
+            issue=issue,
+            balls=balls,
+            sum_value=sum_value,
+            platform_type=self._platform_type,
+            adapter=self.adapter,
+            is_recovery=True,
+        )
+        await self._feedback_settlement_results(issue)
+        await self.reconciler.reconcile(
+            issue=issue,
+            account_id=self.account_id,
+        )
+        return not await self._has_issue_unsettled_orders(issue)
+
+    async def _settlement_branch_loop(self) -> None:
+        while self.running:
+            if not self._settlement_pending_issues:
+                try:
+                    if self._settlement_branch_wakeup is not None:
+                        await asyncio.wait_for(
+                            self._settlement_branch_wakeup.wait(),
+                            timeout=SETTLEMENT_BRANCH_IDLE_SECONDS,
+                        )
+                        self._settlement_branch_wakeup.clear()
+                    else:
+                        await asyncio.sleep(SETTLEMENT_BRANCH_IDLE_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            next_entry = min(
+                self._settlement_pending_issues.values(),
+                key=lambda item: item.next_attempt_at,
+            )
+            wait_seconds = max(0.0, next_entry.next_attempt_at - time.time())
+            if wait_seconds > 0:
+                try:
+                    if self._settlement_branch_wakeup is not None:
+                        await asyncio.wait_for(
+                            self._settlement_branch_wakeup.wait(),
+                            timeout=wait_seconds,
+                        )
+                        self._settlement_branch_wakeup.clear()
+                    else:
+                        await asyncio.sleep(wait_seconds)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            issue = next_entry.issue
+            async with self._settlement_branch_lock:
+                entry = self._settlement_pending_issues.get(issue)
+                if entry is None:
+                    continue
+                elapsed = int(time.time() - entry.registered_at)
+                if elapsed >= SETTLEMENT_MAX_PENDING_SECONDS:
+                    await self._mark_issue_settle_timeout(issue, elapsed)
+                    self._settlement_pending_issues.pop(issue, None)
+                    continue
+                try:
+                    settled = await self._try_settle_pending_issue(issue)
+                except Exception:
+                    logger.exception(
+                        "settlement branch failed issue=%s account_id=%d",
+                        issue,
+                        self.account_id,
+                    )
+                    settled = False
+                if settled:
+                    self._settlement_pending_issues.pop(issue, None)
+                    continue
+                delay = self._settlement_retry_delay(entry.retry_index)
+                entry.retry_index += 1
+                entry.next_attempt_at = time.time() + delay
 
     async def enter_settling_mode(self) -> None:
         """Enter settling mode and keep the worker alive for settlement catch-up."""
@@ -576,12 +835,12 @@ class AccountWorker:
                     "SELECT issue, SUM(cnt) as cnt FROM ("
                     "  SELECT issue, COUNT(*) as cnt FROM bet_orders "
                     "  WHERE account_id=? AND operator_id=? "
-                    "  AND status IN ('bet_success', 'pending_match') "
+                    "  AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout', 'settle_failed') "
                     "  GROUP BY issue "
                     "  UNION ALL "
                     "  SELECT issue, COUNT(*) as cnt FROM simulation_bet_orders "
                     "  WHERE account_id=? AND operator_id=? "
-                    "  AND status IN ('bet_success', 'pending_match') "
+                    "  AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout', 'settle_failed') "
                     "  GROUP BY issue"
                     ") GROUP BY issue",
                     (self.account_id, self.operator_id, self.account_id, self.operator_id),
@@ -671,6 +930,7 @@ class AccountWorker:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        await self._stop_settlement_branch()
 
         await self._release_lock()
         self.status = "stopped"
@@ -785,6 +1045,7 @@ class AccountWorker:
 
         # 琛ョ粨绠?
         await self._recover_unsettled_orders()
+        await self._ensure_settlement_branch_started()
 
         logger.info(
             "杩涘叆鍊掕鏃跺惊鐜?Worker operator_id=%d account_id=%d",
@@ -792,117 +1053,55 @@ class AccountWorker:
             self.account_id,
         )
 
-        while self.running:
-            # 0. 閿佺画绾︼紙姣忔寰幆杩唬寮€濮嬫椂锛?
-            if not await self._renew_lock():
-                break  # 澶遍攣锛岄€€鍑哄惊鐜?
+        try:
+            while self.running:
+                # 0. 閿佺画绾︼紙姣忔寰幆杩唬寮€濮嬫椂锛?
+                if not await self._renew_lock():
+                    break  # 澶遍攣锛岄€€鍑哄惊鐜?
 
-            # 1. 鑾峰彇褰撳墠鏈熷彿淇℃伅
-            install = startup_install
-            startup_install = None
-            if install is None:
-                install = await self._fetch_install_with_retry()
-            if install is None:
-                await asyncio.sleep(60)
-                continue
+                # 1. 鑾峰彇褰撳墠鏈熷彿淇℃伅
+                install = startup_install
+                startup_install = None
+                if install is None:
+                    install = await self._fetch_install_with_retry()
+                if install is None:
+                    await asyncio.sleep(60)
+                    continue
 
-            # 2. 璁板綍褰撳墠鏈熷彿锛堟姇娉ㄧ殑鏄?install.issue锛岀粨绠楁椂闇€瑕侀獙璇佽鏈熷彿鐨勫紑濂栫粨鏋滐級
-            pre_issue = install.issue
+                # 2. 璁板綍褰撳墠鏈熷彿锛堟姇娉ㄧ殑鏄?install.issue锛岀粨绠楁椂闇€瑕侀獙璇佽鏈熷彿鐨勫紑濂栫粨鏋滐級
+                pre_issue = install.issue
 
-            # 3. 鎶曟敞闃舵锛堢粨绠楁ā寮忎笅璺宠繃锛?
-            settlement_anchor = install
-            if not self.settling_only:
-                settlement_anchor = await self._run_due_strategy_windows(install)
-            if False and not self.settling_only:
-                if install.state == 1 and self._should_bet(install):
-                    signals = await self._collect_signals(install)
-                    if signals:
-                        try:
-                            report = await self.executor.execute(install, signals)
-                            await self._apply_execution_report(report)
-                        except Exception:
-                            logger.exception(
-                                "鎶曟敞寮傚父 issue=%s account_id=%d",
-                                install.issue,
-                                self.account_id,
-                            )
-
-            # 4. 绛夊緟寮€濂栧€掕鏃跺綊闆?
-            if (
-                settlement_anchor.issue == pre_issue
-                and settlement_anchor.open_countdown_sec > 0
-            ):
-                await asyncio.sleep(settlement_anchor.open_countdown_sec)
-
-            # 5. 棰濆绛夊緟 settlement_wait_seconds
-            await asyncio.sleep(self._settlement_wait_seconds)
-
-            # 6. 鎷夊彇鏂版湡鍙?+ 涓婃湡寮€濂栫粨鏋?
-            new_install = await self._fetch_settlement_data(pre_issue)
-            if new_install is None:
-                continue  # 宸插彂鍛婅锛岃烦杩囨湰鏈?
-
-            # 7. 鎸佷箙鍖栧紑濂栫粨鏋?
-            balls, sum_value = _parse_result(new_install.pre_result)
-            await self.settler._save_lottery_result(
-                new_install.pre_issue,
-                new_install.pre_result,
-                sum_value,
-            )
-
-            # 8. 鎵ц缁撶畻
-            try:
-                await self.settler.settle(
-                    issue=new_install.pre_issue,
-                    balls=balls,
-                    sum_value=sum_value,
-                    platform_type=self._platform_type,
-                    adapter=self.adapter,
-                )
-            except Exception:
-                logger.exception(
-                    "缁撶畻寮傚父 issue=%s account_id=%d",
-                    new_install.pre_issue,
-                    self.account_id,
-                )
-
-            # 8.5 缁撶畻缁撴灉鍙嶉缁欑瓥鐣ワ紙椹卞姩椹竵鍊嶅锛?
-            await self._feedback_settlement_results(new_install.pre_issue)
-
-            # 9. 瀵硅处
-            try:
-                await self.reconciler.reconcile(
-                    issue=new_install.pre_issue,
-                    account_id=self.account_id,
-                )
-            except Exception:
-                logger.exception(
-                    "瀵硅处寮傚父 issue=%s account_id=%d",
-                    new_install.pre_issue,
-                    self.account_id,
-                )
-
-            # 10. 缁撶畻妯″紡妫€鏌?
-            if self.settling_only:
-                # 瓒呮椂妫€鏌?
-                if self._settling_deadline and time.time() > self._settling_deadline:
-                    logger.warning(
-                        "缁撶畻妯″紡瓒呮椂 account_id=%d", self.account_id,
+                # 3. 鎶曟敞闃舵锛堢粨绠楁ā寮忎笅璺宠繃锛?
+                settlement_anchor = install
+                if not self.settling_only:
+                    settlement_anchor = await self._run_due_strategy_windows(install)
+                    await self._register_issue_for_settlement(
+                        pre_issue,
+                        open_countdown_sec=settlement_anchor.open_countdown_sec,
                     )
-                    await self._handle_settling_timeout()
-                    await self._cleanup_after_settling()
-                    break
 
-                # 妫€鏌ユ槸鍚﹁繕鏈夋湭缁撶畻璁㈠崟
-                if not await self._has_unsettled_orders():
-                    logger.info(
-                        "缁撶畻妯″紡瀹屾垚锛氭墍鏈夎鍗曞凡缁撶畻 account_id=%d",
-                        self.account_id,
-                    )
-                    self.running = False
-                    self.status = "stopped"
-                    await self._cleanup_after_settling()
-                    break
+                # 4. 缁撶畻妯″紡妫€鏌?
+                if self.settling_only:
+                    if self._settling_deadline and time.time() > self._settling_deadline:
+                        logger.warning(
+                            "缁撶畻妯″紡瓒呮椂 account_id=%d", self.account_id,
+                        )
+                        await self._handle_settling_timeout()
+                        await self._cleanup_after_settling()
+                        break
+                    if not await self._has_unsettled_orders():
+                        logger.info(
+                            "缁撶畻妯″紡瀹屾垚锛氭墍鏈夎鍗曞凡缁撶畻 account_id=%d",
+                            self.account_id,
+                        )
+                        self.running = False
+                        self.status = "stopped"
+                        await self._cleanup_after_settling()
+                        break
+                else:
+                    await asyncio.sleep(self._main_loop_sleep_seconds(settlement_anchor))
+        finally:
+            await self._stop_settlement_branch()
 
     # ------------------------------------------------------------------
     # 7.2 _fetch_install_with_retry
@@ -916,6 +1115,11 @@ class AccountWorker:
         while self.running and not self.settling_only:
             if current_install.issue != plan.issue:
                 self._mark_pending_groups_skipped("issue_changed")
+                return current_install
+
+            market_data_state = self._market_data_state(current_install)
+            if market_data_state == "market_closed":
+                self._mark_pending_groups_skipped("market_closed")
                 return current_install
 
             if current_install.state != 1:
@@ -934,14 +1138,9 @@ class AccountWorker:
                         current_install,
                         bet_timing=group.bet_timing,
                         strategy_ids=group.strategy_ids,
+                        expected_issue=plan.issue,
                     )
                     if revalidate_reason == "window_not_open":
-                        break
-                    if revalidate_reason == "precheck_failed":
-                        # Transient revalidation failures should not kill the
-                        # rest of the current issue. Keep pending groups alive,
-                        # wait for the next poll tick, and retry with a fresh
-                        # snapshot after session recovery.
                         break
                     if revalidate_reason is not None:
                         self._mark_pending_groups_skipped(revalidate_reason)
@@ -973,6 +1172,10 @@ class AccountWorker:
                             sorted(signal_strategy_ids),
                             "execution_failed",
                         )
+                        await self._run_post_bet_failure_diagnostics(
+                            issue=current_install.issue,
+                            bet_timing=group.bet_timing,
+                        )
                         logger.exception(
                             "bet execution failed issue=%s account_id=%d group=%ds",
                             current_install.issue,
@@ -1003,6 +1206,26 @@ class AccountWorker:
             current_install = next_install
 
         return current_install
+
+    async def _run_post_bet_failure_diagnostics(
+        self,
+        *,
+        issue: str,
+        bet_timing: int,
+    ) -> None:
+        """Run account diagnosis only after a real bet execution failure."""
+        try:
+            if self.session_runtime is not None:
+                await self.session_runtime.recover("worker_bet_failure")
+            else:
+                await self.session.recover_after_api_failure()
+        except Exception:
+            logger.exception(
+                "bet failure diagnostics failed issue=%s account_id=%d group=%ds",
+                issue,
+                self.account_id,
+                bet_timing,
+            )
 
     async def _fetch_install_with_retry(self) -> Optional[InstallInfo]:
         """鑾峰彇褰撳墠鏈熷彿淇℃伅锛岀綉缁滃紓甯告椂鎸?5s 鈫?10s 鈫?30s 閲嶈瘯
@@ -1089,7 +1312,7 @@ class AccountWorker:
     async def _fetch_settlement_data(self, expected_pre_issue: str) -> Optional[InstallInfo]:
         """鎷夊彇鏂版湡鍙凤紝楠岃瘉 PreLotteryResult 鏈夋晥鎬э紝鏈€澶氶噸璇?6 娆?
 
-        鍏ㄩ儴澶辫触鏃讹細real 璁㈠崟鏍囪 settle_failed + sim 璁㈠崟鐢?check_win 闄嶇骇缁撶畻 + 鍙戝憡璀︺€?
+        鍏ㄩ儴澶辫触鏃讹細淇濇寔寰呰ˉ鍋垮苟浜ゅ埌缁撶畻鍒嗘敮缁х画閲嶈瘯銆?
         """
         for attempt in range(SETTLE_DATA_RETRY_MAX):
             install = await self._fetch_install_with_retry()
@@ -1107,13 +1330,12 @@ class AccountWorker:
             if attempt < SETTLE_DATA_RETRY_MAX - 1:
                 await asyncio.sleep(SETTLE_DATA_RETRY_INTERVAL)
 
-        # 6 娆￠噸璇曞け璐?鈫?闄嶇骇澶勭悊
+        # 6 娆￠噸璇曞け璐?鈫?淇濇寔寰呯粨绠楋紝浜ゅ埌鍚庡彴鍒嗘敮缁х画琛ュ伩
         logger.warning(
-            "Settlement data missing issue=%s account_id=%d, downgrade path triggered",
+            "Settlement data missing issue=%s account_id=%d, keep pending for compensation",
             expected_pre_issue,
             self.account_id,
         )
-        await self._handle_settlement_data_missing(expected_pre_issue)
 
         await self.alert_service.send(
             operator_id=self.operator_id,
@@ -1125,34 +1347,11 @@ class AccountWorker:
         return None
 
     async def _handle_settlement_data_missing(self, issue: str) -> None:
-        """缁撶畻鏁版嵁缂哄け鏃剁殑闄嶇骇澶勭悊
+        """Legacy hook kept for compatibility.
 
-        real 璁㈠崟鏍囪 settle_failed锛宻im 璁㈠崟鐢?check_win 闄嶇骇缁撶畻銆?
+        Missing settlement data must stay pending and be retried by settlement branch.
         """
-        rows = await (
-            await self.db.execute(
-                "SELECT * FROM bet_orders WHERE issue=? AND account_id=? "
-                "AND operator_id=? AND status='bet_success'",
-                (issue, self.account_id, self.operator_id),
-            )
-        ).fetchall()
-        orders = [dict(r) for r in rows]
-        if not orders:
-            return
-
-        real_orders = [o for o in orders if o.get("simulation", 0) == 0]
-        sim_orders = [o for o in orders if o.get("simulation", 0) == 1]
-
-        # real 璁㈠崟鏍囪 settle_failed
-        if real_orders:
-            await self.settler._mark_orders_settle_failed(real_orders)
-
-        # sim 璁㈠崟鐢?check_win 闄嶇骇缁撶畻锛堟棤寮€濂栫粨鏋滐紝鏃犳硶璁＄畻锛屼篃鏍囪 settle_failed锛?
-        # 娉ㄦ剰锛欰C1.4 璇?sim 璁㈠崟浣跨敤鏈湴 check_win 闄嶇骇缁撶畻锛屼絾鏃犲紑濂栫粨鏋滄椂鏃犳硶璁＄畻
-        # 璁捐鏂囨。璇?sim 璁㈠崟鐢?check_win 闄嶇骇缁撶畻锛屼絾杩欓渶瑕佸紑濂栫粨鏋?
-        # 杩欓噷 sim 璁㈠崟涔熸爣璁?settle_failed锛堝洜涓烘病鏈夊紑濂栨暟鎹棤娉曡绠楋級
-        if sim_orders:
-            await self.settler._mark_orders_settle_failed(sim_orders)
+        await self._register_issue_for_settlement(issue, immediate=True)
 
     # ------------------------------------------------------------------
     # 7.4 鍏ㄦ柊鍚姩妫€娴嬶紙AC1.5锛?
@@ -1224,11 +1423,11 @@ class AccountWorker:
                 "SELECT DISTINCT issue FROM ("
                 "  SELECT issue FROM bet_orders "
                 "  WHERE account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
+                "  AND status IN ('bet_success', 'settlement_pending', 'pending_match', 'settle_timeout', 'settle_failed', 'settling') "
                 "  UNION "
                 "  SELECT issue FROM simulation_bet_orders "
                 "  WHERE account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout')"
+                "  AND status IN ('bet_success', 'settlement_pending', 'pending_match', 'settle_timeout', 'settle_failed', 'settling')"
                 ")",
                 (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
@@ -1275,29 +1474,20 @@ class AccountWorker:
                         is_recovery=True,
                     )
                     await self._feedback_settlement_results(issue)
+                    await self.reconciler.reconcile(
+                        issue=issue,
+                        account_id=self.account_id,
+                    )
+                    if await self._has_issue_unsettled_orders(issue):
+                        await self._register_issue_for_settlement(issue, immediate=True)
                     logger.info("琛ョ粨绠楀畬鎴?issue=%s account_id=%d", issue, self.account_id)
                 except Exception:
                     logger.exception(
                         "琛ョ粨绠楀紓甯?issue=%s account_id=%d", issue, self.account_id,
                     )
+                    await self._register_issue_for_settlement(issue, immediate=True)
             else:
-                # 鏃犲紑濂栫粨鏋?鈫?妫€鏌ヨ鍗曞勾榫勶紝鏂拌鍗曡烦杩?
-                if await self._has_recent_orders(issue, max_age_seconds=180):
-                    logger.info(
-                        "琛ョ粨绠楄烦杩囷細鏈熷彿 %s 鏈夎繎3鍒嗛挓鍐呯殑鏂拌鍗曪紝鐣欑粰姝ｅ父鍛ㄦ湡 account_id=%d",
-                        issue, self.account_id,
-                    )
-                    continue
-
-                # 鑰佽鍗?鈫?鏍囪 settle_failed + 鍙戝憡璀?
-                await self._mark_issue_orders_settle_failed(issue)
-                await self.alert_service.send(
-                    operator_id=self.operator_id,
-                    alert_type="settle_data_expired",
-                    title=f"琛ョ粨绠楁暟鎹繃鏈?鏈熷彿 {issue}",
-                    detail=f"鍘嗗彶寮€濂栫粨鏋滀腑鏃?issue={issue} 鐨勮褰曪紝涓旇鍗曞凡瓒呰繃3鍒嗛挓",
-                    account_id=self.account_id,
-                )
+                await self._register_issue_for_settlement(issue, immediate=True)
 
     async def _has_recent_orders(self, issue: str, max_age_seconds: int = 180) -> bool:
         """妫€鏌ユ寚瀹氭湡鍙锋槸鍚︽湁璺濅粖涓嶈秴杩?max_age_seconds 鐨勮鍗?
@@ -1312,11 +1502,11 @@ class AccountWorker:
                 "SELECT bet_at, created_at FROM ("
                 "  SELECT bet_at, created_at FROM bet_orders "
                 "  WHERE issue=? AND account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
+                "  AND status IN ('bet_success', 'settlement_pending', 'pending_match', 'settle_timeout') "
                 "  UNION ALL "
                 "  SELECT bet_at, created_at FROM simulation_bet_orders "
                 "  WHERE issue=? AND account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match', 'settle_timeout')"
+                "  AND status IN ('bet_success', 'settlement_pending', 'pending_match', 'settle_timeout')"
                 ") ORDER BY bet_at DESC LIMIT 1",
                 (
                     issue,
@@ -1360,10 +1550,10 @@ class AccountWorker:
         rows = await (
             await self.db.execute(
                 "SELECT id, status, 0 as simulation FROM bet_orders WHERE account_id=? AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match') "
+                "AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout') "
                 "UNION ALL "
                 "SELECT id, status, 1 as simulation FROM simulation_bet_orders WHERE account_id=? AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match')",
+                "AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout')",
                 (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
         ).fetchall()
@@ -1408,11 +1598,11 @@ class AccountWorker:
                 "SELECT DISTINCT issue FROM ("
                 "  SELECT issue FROM bet_orders "
                 "  WHERE account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match') "
+                "  AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout', 'settle_failed') "
                 "  UNION "
                 "  SELECT issue FROM simulation_bet_orders "
                 "  WHERE account_id=? AND operator_id=? "
-                "  AND status IN ('bet_success', 'pending_match')"
+                "  AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout', 'settle_failed')"
                 ")",
                 (self.account_id, self.operator_id, self.account_id, self.operator_id),
             )
@@ -1644,11 +1834,11 @@ class AccountWorker:
             await self.db.execute(
                 "SELECT id, status, 0 as simulation FROM bet_orders WHERE issue=? AND account_id=? "
                 "AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match', 'settle_timeout') "
+                "AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout') "
                 "UNION ALL "
                 "SELECT id, status, 1 as simulation FROM simulation_bet_orders WHERE issue=? AND account_id=? "
                 "AND operator_id=? "
-                "AND status IN ('bet_success', 'pending_match', 'settle_timeout')",
+                "AND status IN ('bet_success', 'settlement_pending', 'settling', 'pending_match', 'settle_timeout')",
                 (
                     issue,
                     self.account_id,

@@ -15,12 +15,18 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
-from app.engine.adapters.base import LoginResult
-from app.engine.session_runtime import AccountSessionRuntime, SESSION_BLOCKED
+from app.engine.adapters.base import LoginResult, RemoteLoginRequired
+from app.engine.session_runtime import (
+    AccountSessionRuntime,
+    SESSION_BLOCKED,
+    SESSION_ALERT_RECONNECTING,
+    SESSION_ALERT_RECONNECT_FAILED,
+)
 from app.engine.session import (
     SessionManager,
     RETRY_DELAYS,
@@ -658,6 +664,116 @@ async def test_session_runtime_ensure_logged_in_single_flight(db, mock_alert_ser
 
     assert results == [True, True, True]
     assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_remote_login_recover_and_retry_once(db, mock_alert_service):
+    adapter = AsyncMock()
+    adapter.close = AsyncMock(return_value=None)
+    runtime = AccountSessionRuntime(
+        db=db,
+        alert_service=mock_alert_service,
+        operator_id=1,
+        account_id=100,
+        account_name="acc",
+        password="pw",
+        platform_type="JND28WEB",
+        adapter=adapter,
+    )
+    runtime.session.ensure_session = AsyncMock(return_value=True)
+    runtime.session.recover_after_api_failure = AsyncMock(return_value=True)
+    runtime.session.session_token = "tok"
+    call_count = 0
+
+    async def flaky_call():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RemoteLoginRequired(
+                raw_state=-2,
+                message="remote login detected",
+                category="remote_login",
+                blocking=False,
+            )
+        return {"ok": True}
+
+    result = await runtime.run_platform_call("probe", flaky_call)
+    assert result == {"ok": True}
+    assert call_count == 2
+    runtime.session.recover_after_api_failure.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_blocking_remote_login_enters_backoff(db, mock_alert_service):
+    adapter = AsyncMock()
+    adapter.close = AsyncMock(return_value=None)
+    runtime = AccountSessionRuntime(
+        db=db,
+        alert_service=mock_alert_service,
+        operator_id=1,
+        account_id=101,
+        account_name="acc",
+        password="pw",
+        platform_type="JND28WEB",
+        adapter=adapter,
+    )
+    runtime.session.ensure_session = AsyncMock(return_value=True)
+    runtime.session.recover_after_api_failure = AsyncMock(return_value=True)
+    runtime.session.session_token = "tok"
+
+    async def blocked_call():
+        raise RemoteLoginRequired(
+            raw_state=403,
+            message="captcha required",
+            category="captcha_required",
+            blocking=True,
+            status_code=403,
+        )
+
+    with pytest.raises(RemoteLoginRequired):
+        await runtime.run_platform_call("probe", blocked_call)
+
+    snapshot = runtime.snapshot()
+    assert snapshot.state == SESSION_BLOCKED
+    assert snapshot.blocked_until is not None
+    assert snapshot.blocked_until >= time.time() + 295
+    assert await runtime.ensure_logged_in("retry") is False
+    runtime.session.recover_after_api_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_runtime_emits_session_alert_codes(db, mock_alert_service):
+    adapter = AsyncMock()
+    adapter.close = AsyncMock(return_value=None)
+    runtime = AccountSessionRuntime(
+        db=db,
+        alert_service=mock_alert_service,
+        operator_id=1,
+        account_id=102,
+        account_name="acc",
+        password="pw",
+        platform_type="JND28WEB",
+        adapter=adapter,
+    )
+    runtime.session.ensure_session = AsyncMock(return_value=True)
+    runtime.session.recover_after_api_failure = AsyncMock(return_value=False)
+    runtime.session.session_token = "tok"
+
+    async def remote_login():
+        raise RemoteLoginRequired(
+            raw_state=-2,
+            message="remote login detected",
+            category="remote_login",
+            blocking=False,
+        )
+
+    with pytest.raises(RemoteLoginRequired):
+        await runtime.run_platform_call("probe", remote_login)
+
+    send_calls = mock_alert_service.send.call_args_list
+    titles = [c.kwargs.get("title") for c in send_calls]
+    assert SESSION_ALERT_RECONNECTING in titles
+    assert SESSION_ALERT_RECONNECT_FAILED in titles
 
 
 @pytest.mark.asyncio

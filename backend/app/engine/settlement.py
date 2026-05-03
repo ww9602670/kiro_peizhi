@@ -76,7 +76,8 @@ class IllegalStateTransition(Exception):
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "pending": {"betting"},
     "betting": {"bet_success", "bet_failed"},
-    "bet_success": {"settling", "pending_match", "settle_timeout", "settle_failed"},
+    "bet_success": {"settlement_pending", "settling", "pending_match", "settle_timeout", "settle_failed"},
+    "settlement_pending": {"settling", "pending_match", "settle_timeout", "settle_failed"},
     "settling": {"settled", "settle_failed", "settle_timeout"},
     "pending_match": {"settling", "settle_timeout"},
     "settled": {"reconcile_error"},
@@ -275,7 +276,7 @@ class SettlementProcessor:
         已在不可覆盖终态（settled, bet_failed, reconcile_error）的订单不会被查出。
         当 self.account_id 不为 None 时，按 account_id 过滤，避免跨账户误匹配。
         """
-        statuses = ['bet_success', 'pending_match']
+        statuses = ['bet_success', 'settlement_pending', 'pending_match']
         if include_recoverable:
             statuses.extend(['settle_timeout', 'settle_failed'])
 
@@ -301,7 +302,7 @@ class SettlementProcessor:
 
     async def _get_settleable_sim_orders(self, issue: str, include_recoverable: bool = False) -> list[dict]:
         """查询可结算的模拟订单。"""
-        statuses = ['bet_success', 'pending_match']
+        statuses = ['bet_success', 'settlement_pending', 'pending_match']
         if include_recoverable:
             statuses.extend(['settle_timeout', 'settle_failed'])
 
@@ -727,6 +728,32 @@ class SettlementProcessor:
                     order["id"], current_status,
                 )
 
+    async def _mark_orders_settlement_pending(self, orders: list[dict]) -> None:
+        """Keep orders in a recoverable pending-settlement state."""
+        for order in orders:
+            current_status = order["status"]
+            if current_status in {"settlement_pending", "pending_match", "settling"}:
+                continue
+            if current_status in NON_OVERRIDABLE_TERMINAL_STATES:
+                continue
+            try:
+                if order.get("simulation"):
+                    await simulation_bet_order_update(
+                        self.db,
+                        order_id=order["id"],
+                        operator_id=self.operator_id,
+                        status="settlement_pending",
+                    )
+                else:
+                    await self._atomic_transition(
+                        order["id"], current_status, "settlement_pending",
+                    )
+            except IllegalStateTransition:
+                logger.warning(
+                    "标记 settlement_pending 跳过 order_id=%d: 非法转换 %s→settlement_pending",
+                    order["id"], current_status,
+                )
+
     async def _settle_real(
         self,
         orders: list[dict],
@@ -768,15 +795,15 @@ class SettlementProcessor:
                 recover_session=True,
             )
         except Exception:
-            # 3 次重试全部失败 → settle_failed + 告警
-            logger.exception("getBetChecked 3 次重试全部失败 期号 %s", issue)
-            await self._mark_orders_settle_failed(orders)
+            # 3 次重试全部失败：保持待结算，交给补偿分支继续重试
+            logger.exception("getBetChecked 3 次重试全部失败 期号 %s，保持待结算", issue)
+            await self._mark_orders_settlement_pending(orders)
             if self.alert_service:
                 await self.alert_service.send(
                     operator_id=self.operator_id,
                     alert_type="settle_api_failed",
                     title=f"getBetChecked 调用失败 期号 {issue}",
-                    detail=f"3 次重试全部失败，{len(orders)} 笔订单标记 settle_failed",
+                    detail=f"3 次重试全部失败，{len(orders)} 笔订单保持待结算并由补偿分支重试",
                 )
             return
 
@@ -940,10 +967,10 @@ class SettlementProcessor:
                 await self.db.commit()
             return
 
-        # bet_success → pending_match
-        if current_status == "bet_success":
+        # bet_success / settlement_pending → pending_match
+        if current_status in {"bet_success", "settlement_pending"}:
             await self._atomic_transition(
-                order_id, "bet_success", "pending_match",
+                order_id, current_status, "pending_match",
                 pending_match_count=0,
             )
 

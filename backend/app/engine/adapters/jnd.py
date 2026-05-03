@@ -189,6 +189,23 @@ class JNDAdapter(PlatformAdapter):
         sample = (text or "").lstrip("\ufeff\r\n\t ").lower()
         return sample.startswith("<!doctype") or sample.startswith("<html")
 
+    @classmethod
+    def _classify_remote_login(cls, *, message: str, raw_state: int, status_code: int | None = None) -> tuple[str, bool]:
+        normalized = cls._safe_text(message).strip().lower()
+        if status_code == 401:
+            return ("http_401", False)
+        if status_code == 403:
+            return ("http_403", True)
+        if "captcha" in normalized or "验证码" in normalized or "verify code" in normalized:
+            return ("captcha_required", True)
+        if "risk" in normalized or "风控" in normalized or "cloudflare" in normalized:
+            return ("risk_control", True)
+        if "login page" in normalized:
+            return ("login_page", False)
+        if "remote login" in normalized or "session" in normalized or raw_state < 0:
+            return ("remote_login", False)
+        return ("session_invalid", False)
+
     async def _post(
         self,
         url: str,
@@ -219,6 +236,7 @@ class JNDAdapter(PlatformAdapter):
                     raise RemoteLoginRequired(
                         raw_state=-2,
                         message="platform returned login page",
+                        category="login_page",
                     )
                 payload = text.lstrip("\ufeff\r\n\t ")
                 try:
@@ -228,8 +246,31 @@ class JNDAdapter(PlatformAdapter):
                 if self._response_indicates_remote_login(parsed):
                     raw_state = self._safe_int(parsed.get("State"), -2)
                     msg = self._safe_text(parsed.get("Msg")) or f"State={raw_state}"
-                    raise RemoteLoginRequired(raw_state=raw_state, message=msg)
+                    category, blocking = self._classify_remote_login(message=msg, raw_state=raw_state)
+                    raise RemoteLoginRequired(
+                        raw_state=raw_state,
+                        message=msg,
+                        category=category,
+                        blocking=blocking,
+                    )
                 return parsed
+        except aiohttp.ClientResponseError as exc:
+            status_code = int(getattr(exc, "status", 0) or 0)
+            if status_code in (401, 403):
+                message = f"http status {status_code}"
+                category, blocking = self._classify_remote_login(
+                    message=message,
+                    raw_state=-status_code,
+                    status_code=status_code,
+                )
+                raise RemoteLoginRequired(
+                    raw_state=-status_code,
+                    message=message,
+                    category=category,
+                    blocking=blocking,
+                    status_code=status_code,
+                ) from exc
+            raise
         except aiohttp.ContentTypeError:
             #  content-type
             async with session.post(
@@ -364,7 +405,13 @@ class JNDAdapter(PlatformAdapter):
                 msg,
                 self._safe_response_summary(data),
             )
-            raise RemoteLoginRequired(raw_state=raw_state, message=msg)
+            category, blocking = self._classify_remote_login(message=msg, raw_state=raw_state)
+            raise RemoteLoginRequired(
+                raw_state=raw_state,
+                message=msg,
+                category=category,
+                blocking=blocking,
+            )
 
         issue = self._require_text(data, "Installments")
         normalized_state = self._normalize_state(raw_state)

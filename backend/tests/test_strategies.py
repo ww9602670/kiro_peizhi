@@ -785,7 +785,7 @@ async def test_create_strategy_rejected_without_effective_verification_run(clien
 
 
 @pytest.mark.asyncio
-async def test_create_strategy_rejected_when_verification_stale(client):
+async def test_create_strategy_allows_verification_stale(client):
     uid = _uid()
     token, _, acc_id = await _create_operator_with_account(f"create_stale_{uid}")
     headers = {"Authorization": f"Bearer {token}"}
@@ -808,9 +808,10 @@ async def test_create_strategy_rejected_when_verification_stale(client):
         },
     )
 
-    assert resp.status_code == 400
-    assert resp.json()["code"] == 1002
-    assert "verification_stale" in resp.json()["message"]
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"]["name"] == "stale_create"
 
 
 @pytest.mark.asyncio
@@ -1154,7 +1155,7 @@ async def test_start_strategy_rejected_without_effective_verification_run(client
 
 
 @pytest.mark.asyncio
-async def test_start_strategy_rejected_when_verification_stale(client, mock_engine):
+async def test_start_strategy_allows_verification_stale(client, mock_engine):
     uid = _uid()
     token, _, acc_id = await _create_operator_with_account(f"start_stale_{uid}")
     headers = {"Authorization": f"Bearer {token}"}
@@ -1180,13 +1181,12 @@ async def test_start_strategy_rejected_when_verification_stale(client, mock_engi
     await db.commit()
 
     resp = await client.post(f"/api/v1/strategies/{sid}/start", headers=headers)
-    assert resp.status_code == 400
-    assert resp.json()["code"] == 4002
-    assert "verification_stale" in resp.json()["message"]
-    mock_engine.start_worker.assert_not_called()
+    assert resp.status_code == 200
+    assert resp.json()["code"] == 0
+    mock_engine.start_worker.assert_called_once()
     list_resp = await client.get("/api/v1/strategies", headers=headers)
     strategy = next(item for item in list_resp.json()["data"] if item["id"] == sid)
-    assert strategy["status"] == "stopped"
+    assert strategy["status"] == "running"
 
 
 @pytest.mark.asyncio
@@ -1251,6 +1251,43 @@ async def test_update_strategy(client):
     data = resp.json()["data"]
     assert data["name"] == "upd_new"
     assert data["base_amount"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_update_strategy_allows_verification_stale(client):
+    uid = _uid()
+    token, _, acc_id = await _create_operator_with_account(f"upd_stale_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "upd_stale_orig",
+            "type": "flat",
+            "play_code": "DX1",
+            "base_amount": 10.0,
+        },
+    )
+    sid = create_resp.json()["data"]["id"]
+
+    db = await get_shared_db()
+    await db.execute(
+        "UPDATE account_verification_runs SET stale=1, stale_reason='test_stale' WHERE account_id=?",
+        (acc_id,),
+    )
+    await db.commit()
+
+    resp = await client.put(
+        f"/api/v1/strategies/{sid}",
+        headers=headers,
+        json={"name": "upd_stale_new", "base_amount": 22.0},
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["name"] == "upd_stale_new"
+    assert data["base_amount"] == 22.0
 
 
 @pytest.mark.asyncio

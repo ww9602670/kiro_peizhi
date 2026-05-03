@@ -145,35 +145,67 @@ class TestSharedMarketContracts:
             shared_group_id=group_id,
             issue="20260420001",
             state="OPEN",
+            market_data_state="shared_ok",
+            draw_state="normal",
             close_countdown_sec=20,
             open_countdown_sec=90,
             pre_issue="20260420000",
             open_result="1,2,3",
             fetched_at="2026-04-20 10:00:00",
-            source_status="online",
+            next_normal_refresh_at="2026-04-20 10:00:25",
+            snapshot_version=1,
         )
         assert first["issue"] == "20260420001"
+        assert first["market_data_state"] == "shared_ok"
+        assert first["draw_state"] == "normal"
+        assert first["snapshot_version"] == 1
 
         second = await shared_market_snapshot_upsert(
             db,
             shared_group_id=group_id,
             issue="20260420002",
             state="CLOSE",
+            market_data_state="shared_stale",
+            draw_state="draw_wait_retry",
             close_countdown_sec=5,
             open_countdown_sec=60,
             pre_issue="20260420001",
             open_result="2,2,2",
             fetched_at="2026-04-20 10:01:00",
-            source_status="stale",
+            next_draw_retry_at="2026-04-20 10:01:10",
+            snapshot_version=2,
             last_error="timeout",
+            message_code="SHARED-002",
+            message_text="数据更新变慢，可能影响投注，请联系管理员处理。",
         )
         assert second["issue"] == "20260420002"
         assert second["source_status"] == "stale"
+        assert second["market_data_state"] == "shared_stale"
+        assert second["draw_state"] == "draw_wait_retry"
+        assert second["snapshot_version"] == 2
+        assert second["next_draw_retry_at"] == "2026-04-20 10:01:10"
+        assert second["message_code"] == "SHARED-002"
 
         latest = await shared_market_snapshot_get_latest(db, shared_group_id=group_id)
         assert latest is not None
         assert latest["issue"] == "20260420002"
         assert latest["last_error"] == "timeout"
+        assert latest["market_data_state"] == "shared_stale"
+        assert latest["draw_state"] == "draw_wait_retry"
+        assert latest["snapshot_version"] == 2
+        assert latest["current_issue"] == "20260420002"
+
+        # Older snapshot_version must not overwrite newer snapshot.
+        third = await shared_market_snapshot_upsert(
+            db,
+            shared_group_id=group_id,
+            issue="20260420003",
+            state="OPEN",
+            snapshot_version=1,
+            fetched_at="2026-04-20 10:02:00",
+        )
+        assert third["issue"] == "20260420002"
+        assert third["snapshot_version"] == 2
 
         count_row = await (
             await db.execute(

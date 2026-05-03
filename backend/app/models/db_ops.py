@@ -1771,6 +1771,88 @@ async def shared_market_group_resolve_by_url(
     return _row_to_dict(row)
 
 
+_SNAPSHOT_MARKET_STATE_ALIASES = {
+    "shared_ok": "shared_ok",
+    "shared_error": "shared_error",
+    "shared_stale": "shared_stale",
+    "market_closed": "market_closed",
+    # legacy aliases
+    "shared_hit": "shared_ok",
+    "local_fallback": "shared_error",
+    "processing": "shared_ok",
+}
+
+_SNAPSHOT_DRAW_STATE_ALIASES = {
+    "normal": "normal",
+    "draw_pending": "draw_pending",
+    "draw_wait_retry": "draw_wait_retry",
+    # legacy aliases
+    "processing": "draw_pending",
+}
+
+
+def _normalize_snapshot_market_data_state(
+    value: object,
+    *,
+    source_status: object = None,
+) -> str:
+    text = str(value or "").strip().lower()
+    if text in _SNAPSHOT_MARKET_STATE_ALIASES:
+        return _SNAPSHOT_MARKET_STATE_ALIASES[text]
+    source = str(source_status or "").strip().lower()
+    if source in {"error", "failed", "offline"}:
+        return "shared_error"
+    if source in {"stale", "expired"}:
+        return "shared_stale"
+    if source in {"closed", "market_closed"}:
+        return "market_closed"
+    return "shared_ok"
+
+
+def _normalize_snapshot_draw_state(value: object) -> str:
+    text = str(value or "").strip().lower()
+    return _SNAPSHOT_DRAW_STATE_ALIASES.get(text, "normal")
+
+
+def _normalize_snapshot_source_status(value: object, *, market_data_state: str) -> str:
+    text = str(value or "").strip().lower()
+    if text:
+        return text
+    if market_data_state == "shared_error":
+        return "error"
+    if market_data_state == "shared_stale":
+        return "stale"
+    if market_data_state == "market_closed":
+        return "closed"
+    return "online"
+
+
+def _normalize_snapshot_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    market_data_state = _normalize_snapshot_market_data_state(
+        row.get("market_data_state"),
+        source_status=row.get("source_status"),
+    )
+    row["market_data_state"] = market_data_state
+    row["draw_state"] = _normalize_snapshot_draw_state(row.get("draw_state"))
+    row["snapshot_version"] = int(row.get("snapshot_version") or 0)
+    row["next_normal_refresh_at"] = row.get("next_normal_refresh_at")
+    row["next_draw_retry_at"] = row.get("next_draw_retry_at")
+    row["message_code"] = row.get("message_code")
+    row["message_text"] = row.get("message_text")
+
+    # Legacy compatibility during migration.
+    if not row.get("current_issue"):
+        row["current_issue"] = row.get("issue")
+    if row.get("current_state") is None:
+        row["current_state"] = row.get("state")
+    if row.get("pre_result") is None:
+        row["pre_result"] = row.get("open_result")
+    row["shared_market_state"] = market_data_state
+    return row
+
+
 async def shared_market_snapshot_upsert(
     db: aiosqlite.Connection,
     *,
@@ -1782,38 +1864,92 @@ async def shared_market_snapshot_upsert(
     pre_issue: str | None = None,
     open_result: str | None = None,
     fetched_at: str | None = None,
-    source_status: str = "online",
+    source_status: str | None = None,
     last_error: str | None = None,
+    market_data_state: str | None = None,
+    draw_state: str | None = None,
+    next_normal_refresh_at: str | None = None,
+    next_draw_retry_at: str | None = None,
+    snapshot_version: int | None = None,
+    message_code: str | None = None,
+    message_text: str | None = None,
 ) -> dict[str, Any]:
     now = _now()
     resolved_fetched_at = fetched_at or now
+    existing_row = await (await db.execute(
+        "SELECT snapshot_version FROM shared_market_snapshots WHERE shared_group_id=?",
+        (shared_group_id,),
+    )).fetchone()
+    existing_version = int(existing_row["snapshot_version"] or 0) if existing_row else 0
+    try:
+        resolved_snapshot_version = (
+            int(snapshot_version)
+            if snapshot_version is not None
+            else existing_version + 1
+        )
+    except (TypeError, ValueError):
+        resolved_snapshot_version = existing_version + 1
+    if resolved_snapshot_version < 0:
+        resolved_snapshot_version = 0
+
+    resolved_market_data_state = _normalize_snapshot_market_data_state(
+        market_data_state,
+        source_status=source_status,
+    )
+    resolved_draw_state = _normalize_snapshot_draw_state(draw_state)
+    resolved_source_status = _normalize_snapshot_source_status(
+        source_status,
+        market_data_state=resolved_market_data_state,
+    )
+
     await db.execute(
         """INSERT INTO shared_market_snapshots
-           (shared_group_id, issue, state, close_countdown_sec, open_countdown_sec,
-            pre_issue, open_result, fetched_at, source_status, last_error, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (shared_group_id, issue, state, snapshot_version, market_data_state, draw_state,
+            close_countdown_sec, open_countdown_sec, pre_issue, open_result, fetched_at,
+            next_normal_refresh_at, next_draw_retry_at, source_status, last_error,
+            message_code, message_text, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(shared_group_id) DO UPDATE SET
                issue=excluded.issue,
                state=excluded.state,
+               snapshot_version=excluded.snapshot_version,
+               market_data_state=excluded.market_data_state,
+               draw_state=excluded.draw_state,
                close_countdown_sec=excluded.close_countdown_sec,
                open_countdown_sec=excluded.open_countdown_sec,
                pre_issue=excluded.pre_issue,
                open_result=excluded.open_result,
                fetched_at=excluded.fetched_at,
+               next_normal_refresh_at=excluded.next_normal_refresh_at,
+               next_draw_retry_at=excluded.next_draw_retry_at,
                source_status=excluded.source_status,
                last_error=excluded.last_error,
-               updated_at=excluded.updated_at""",
+               message_code=excluded.message_code,
+               message_text=excluded.message_text,
+               updated_at=excluded.updated_at
+           WHERE excluded.snapshot_version > shared_market_snapshots.snapshot_version
+              OR (
+                  excluded.snapshot_version = shared_market_snapshots.snapshot_version
+                  AND excluded.fetched_at >= shared_market_snapshots.fetched_at
+              )""",
         (
             shared_group_id,
             issue,
             state,
+            resolved_snapshot_version,
+            resolved_market_data_state,
+            resolved_draw_state,
             close_countdown_sec,
             open_countdown_sec,
             pre_issue,
             open_result,
             resolved_fetched_at,
-            source_status,
+            next_normal_refresh_at,
+            next_draw_retry_at,
+            resolved_source_status,
             last_error,
+            message_code,
+            message_text,
             now,
             now,
         ),
@@ -1823,7 +1959,7 @@ async def shared_market_snapshot_upsert(
         "SELECT * FROM shared_market_snapshots WHERE shared_group_id=?",
         (shared_group_id,),
     )).fetchone()
-    return _row_to_dict(row)  # type: ignore
+    return _normalize_snapshot_row(_row_to_dict(row))  # type: ignore
 
 
 async def shared_market_snapshot_get_latest(
@@ -1838,7 +1974,7 @@ async def shared_market_snapshot_get_latest(
            LIMIT 1""",
         (shared_group_id,),
     )).fetchone()
-    return _row_to_dict(row)
+    return _normalize_snapshot_row(_row_to_dict(row))
 
 
 async def shared_market_group_url_exists(

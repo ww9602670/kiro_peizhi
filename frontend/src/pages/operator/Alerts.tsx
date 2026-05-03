@@ -26,6 +26,11 @@ const LEVEL_LABEL: Record<string, string> = {
   info: '信息',
 };
 
+function shouldShowAlertDetail(title: string, detail: string | null): boolean {
+  if (!detail) return false;
+  return !title.includes('日志编号：');
+}
+
 export default function Alerts() {
   const {
     alerts,
@@ -149,7 +154,7 @@ export default function Alerts() {
                 </div>
                 <div className="alert-card-body">
                   <h3 className="alert-card-title">{alert.title}</h3>
-                  {alert.detail && (
+                  {shouldShowAlertDetail(alert.title, alert.detail) && (
                     <p className="alert-card-detail">{alert.detail}</p>
                   )}
                 </div>

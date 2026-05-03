@@ -104,13 +104,13 @@ def _parse_allowed_platform_types(value: object) -> set[str]:
 
 
 def _is_platform_verified_for_restore(account: dict[str, Any], platform_type: str) -> bool:
-    effective_run_id = _parse_effective_verification_run_id(account)
-    if effective_run_id is None:
-        return False
-    if _is_truthy_flag(account.get("verification_stale")):
-        return False
     allowed_platforms = _parse_allowed_platform_types(account.get("allowed_strategy_platform_types"))
-    return (platform_type or "").upper() in allowed_platforms
+    normalized_platform = (platform_type or "").upper()
+    if allowed_platforms:
+        return normalized_platform in allowed_platforms
+    if _is_truthy_flag(account.get("verification_stale")):
+        return True
+    return _parse_effective_verification_run_id(account) is not None
 
 
 def _is_detector_betting_account(account: dict[str, Any]) -> bool:

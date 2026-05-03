@@ -22,6 +22,7 @@ import aiosqlite
 from app.database import DDL_STATEMENTS, INSERT_DEFAULT_ADMIN, get_shared_db
 from app.engine.alert import (
     ALERT_LEVEL_MAP,
+    ALERT_OPERATOR_COPY,
     CONSECUTIVE_FAIL_THRESHOLD,
     SYSTEM_ALERT_TYPES,
     SYSTEM_API_FAIL_THRESHOLD,
@@ -90,7 +91,7 @@ class TestAlertLevelMap:
     """ 12 """
 
     def test_all_types_present(self):
-        assert len(ALERT_LEVEL_MAP) == 22
+        assert len(ALERT_LEVEL_MAP) == 25
 
     @pytest.mark.parametrize(
         "alert_type,expected_level",
@@ -141,7 +142,7 @@ class TestSendSystemAlert:
         assert row is not None
         assert row["operator_id"] == 1
         assert row["level"] == "critical"
-        assert row["title"] == " API "
+        assert row["title"] == "系统接口异常率升高，请联系管理员处理。日志编号：SYSTEM-001。"
 
     @pytest.mark.asyncio
     async def test_send_consecutive_fail(self, db, alert_service):
@@ -336,7 +337,11 @@ class TestOperatorAlertTypes:
         ).fetchone()
         assert row is not None
         assert row["level"] == ALERT_LEVEL_MAP[alert_type]
-        assert row["title"] == title
+        if alert_type in ALERT_OPERATOR_COPY:
+            code, message = ALERT_OPERATOR_COPY[alert_type]
+            assert row["title"] == f"{message}日志编号：{code}。"
+        else:
+            assert row["title"] == title
         assert row["detail"] == detail
         assert row["is_read"] == 0
 
@@ -588,11 +593,11 @@ class TestDataIsolation:
 
         resp_a = await client.get("/api/v1/alerts", headers={"Authorization": f"Bearer {token_a}"})
         assert resp_a.json()["data"]["total"] == 1
-        assert resp_a.json()["data"]["items"][0]["title"] == "A "
+        assert resp_a.json()["data"]["items"][0]["title"] == "账号登录失败，请联系管理员处理。日志编号：SESSION-003。"
 
         resp_b = await client.get("/api/v1/alerts", headers={"Authorization": f"Bearer {token_b}"})
         assert resp_b.json()["data"]["total"] == 1
-        assert resp_b.json()["data"]["items"][0]["title"] == "B "
+        assert resp_b.json()["data"]["items"][0]["title"] == "本期下注失败，请检查账号和平台状态。日志编号：BET-003。"
 
     @pytest.mark.asyncio
     async def test_mark_read_isolation(self, client):

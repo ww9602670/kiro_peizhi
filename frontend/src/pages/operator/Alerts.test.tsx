@@ -92,6 +92,22 @@ describe('Alerts', () => {
     expect(screen.getByText('超时')).toBeInTheDocument();
   });
 
+  it('带日志编号的告警不展示详情', () => {
+    setupHook({
+      alerts: [
+        {
+          ...sampleAlerts[0],
+          title: '账号重连失败，请联系管理员处理。日志编号：SESSION-002。',
+          detail: 'raw stacktrace',
+        },
+      ],
+      total: 1,
+    });
+    render(<Alerts />);
+    expect(screen.getByText('账号重连失败，请联系管理员处理。日志编号：SESSION-002。')).toBeInTheDocument();
+    expect(screen.queryByText('raw stacktrace')).not.toBeInTheDocument();
+  });
+
   it('未读告警显示"标记已读"按钮', () => {
     setupHook();
     render(<Alerts />);

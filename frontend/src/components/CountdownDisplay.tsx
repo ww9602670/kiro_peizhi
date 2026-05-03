@@ -1,7 +1,7 @@
 /**
  * Countdown display component.
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useLotteryCountdown } from '@/hooks/useLotteryCountdown';
 import { STATE_DISPLAY_MAP, LotteryStateEnum } from '@/types/api/lottery';
 import type { RecentLotteryResult } from '@/types/api/dashboard';
@@ -24,7 +24,13 @@ const SUM_GREEN = new Set([1, 4, 7, 10, 16, 19, 22, 25]);
 const SUM_BLUE = new Set([2, 5, 8, 11, 17, 20, 23, 26]);
 const SUM_SPECIAL = new Set([0, 13, 14, 27]);
 const COLLAPSED_RECENT_RESULT_COUNT = 3;
+
 const WAITING_DRAW_DISPLAY = { label: '等待开奖', color: 'yellow' };
+const CLOSED_DISPLAY = { label: '封盘中', color: 'red' };
+const MARKET_CLOSED_DISPLAY = { label: '当前处于停盘', color: 'gray' };
+const SHARED_002_DEFAULT_TEXT =
+  '数据更新变慢，可能影响投注，请联系管理员处理。日志编号：SHARED-002。';
+const DRAW_WAIT_RETRY_DEFAULT_TEXT = '开奖数据暂未获取，10秒后再次刷新';
 
 function parseBalls(result: string): number[] | null {
   if (!result || !result.trim()) return null;
@@ -101,19 +107,58 @@ function HistoryResultBalls({ result, showSum = true }: { result: string; showSu
 
 export function CountdownDisplay({ platformType, recentResults }: CountdownDisplayProps = {}) {
   const [historyExpanded, setHistoryExpanded] = useState(false);
+  const sharedAlertKeyRef = useRef<string>('');
   const { data, closeCountdown, openCountdown, error, lastUpdateTime } = useLotteryCountdown({
     platformType,
   });
 
+  const marketDataState = data?.market_data_state;
+  const messageCode = data?.message_code?.trim().toUpperCase();
+  const messageText = data?.message_text?.trim();
+
+  const shouldShowSharedSlowAlert =
+    marketDataState === 'shared_error' ||
+    marketDataState === 'shared_stale' ||
+    messageCode === 'SHARED-002';
+  const sharedSlowAlertText = messageCode === 'SHARED-002'
+    ? messageText || SHARED_002_DEFAULT_TEXT
+    : shouldShowSharedSlowAlert
+      ? SHARED_002_DEFAULT_TEXT
+      : '';
+  const sharedAlertKey = shouldShowSharedSlowAlert
+    ? `${marketDataState || ''}|${messageCode || 'SHARED-002'}|${sharedSlowAlertText}`
+    : '';
+
+  useEffect(() => {
+    if (!sharedAlertKey) {
+      sharedAlertKeyRef.current = '';
+      return;
+    }
+    if (sharedAlertKeyRef.current === sharedAlertKey) {
+      return;
+    }
+    sharedAlertKeyRef.current = sharedAlertKey;
+    if (typeof window !== 'undefined' && typeof window.alert === 'function') {
+      window.alert(sharedSlowAlertText);
+    }
+  }, [sharedAlertKey, sharedSlowAlertText]);
+
   const fallbackStateDisplay =
     STATE_DISPLAY_MAP[data?.state as LotteryStateEnum] ??
     STATE_DISPLAY_MAP[LotteryStateEnum.UNKNOWN];
+  const isMarketClosed = marketDataState === 'market_closed';
   const stateDisplay =
-    data && closeCountdown <= 0 && openCountdown <= 0
-      ? WAITING_DRAW_DISPLAY
-      : data && closeCountdown <= 0
-        ? STATE_DISPLAY_MAP[LotteryStateEnum.CLOSED]
-        : fallbackStateDisplay;
+    isMarketClosed
+      ? MARKET_CLOSED_DISPLAY
+      : data && closeCountdown <= 0 && openCountdown <= 0
+        ? WAITING_DRAW_DISPLAY
+        : data && closeCountdown <= 0
+          ? CLOSED_DISPLAY
+          : fallbackStateDisplay;
+  const drawWaitRetryNotice = data?.draw_state === 'draw_wait_retry'
+    ? messageText || DRAW_WAIT_RETRY_DEFAULT_TEXT
+    : null;
+
   const historyResults = recentResults ?? [];
   const visibleHistoryResults = historyExpanded
     ? historyResults
@@ -124,10 +169,10 @@ export function CountdownDisplay({ platformType, recentResults }: CountdownDispl
     <div className="countdown-display">
       {error && (
         <div className="error-banner">
-          {error}{' '}
-          {lastUpdateTime && `(更新时间 ${lastUpdateTime.toLocaleTimeString()})`}
+          {error} {lastUpdateTime && `(更新时间 ${lastUpdateTime.toLocaleTimeString()})`}
         </div>
       )}
+      {drawWaitRetryNotice && <div className="error-banner">{drawWaitRetryNotice}</div>}
 
       <div className="issue-row">
         <span className="issue-label">上期开奖</span>
