@@ -35,7 +35,11 @@ import './StrategyForm.css';
 
 type WaveStrategyType = 'red_wave_double_martin' | 'green_wave_single_martin';
 type OmissionRandomStrategyType = 'omission_random_flat' | 'omission_random_martin';
-type AiRandomStrategyType = 'ai_random_flat' | 'ai_random_martin';
+type AiRandomStrategyType =
+  | 'ai_random_flat'
+  | 'ai_random_martin'
+  | 'ai_same_random_flat'
+  | 'ai_same_random_martin';
 type RandomPickStrategyType = OmissionRandomStrategyType | AiRandomStrategyType;
 type StrategyTypeValue = StrategyType | '';
 
@@ -53,6 +57,8 @@ const OMISSION_RANDOM_FLAT_TYPE: OmissionRandomStrategyType = 'omission_random_f
 const OMISSION_RANDOM_MARTIN_TYPE: OmissionRandomStrategyType = 'omission_random_martin';
 const AI_RANDOM_FLAT_TYPE: AiRandomStrategyType = 'ai_random_flat';
 const AI_RANDOM_MARTIN_TYPE: AiRandomStrategyType = 'ai_random_martin';
+const AI_SAME_RANDOM_FLAT_TYPE: AiRandomStrategyType = 'ai_same_random_flat';
+const AI_SAME_RANDOM_MARTIN_TYPE: AiRandomStrategyType = 'ai_same_random_martin';
 const LUCKYSB_PLATFORM_TYPE: StrategyPlatformType = 'LUCKYSB';
 const DW3_DISPLAY_NAME = '三字定位';
 const DEFAULT_BET_TIMING = 88;
@@ -99,6 +105,8 @@ const STRATEGY_TYPE_OPTIONS: Array<{
   label: string;
   jndOnly?: boolean;
 }> = [
+  { type: AI_SAME_RANDOM_FLAT_TYPE, permission: AI_SAME_RANDOM_FLAT_TYPE, label: 'AI推荐同号平注', jndOnly: true },
+  { type: AI_SAME_RANDOM_MARTIN_TYPE, permission: AI_SAME_RANDOM_MARTIN_TYPE, label: 'AI推荐同号平注马丁', jndOnly: true },
   { type: 'flat', permission: 'flat', label: '平注' },
   { type: 'martin', permission: 'martin', label: '马丁' },
   { type: OMISSION_RANDOM_FLAT_TYPE, permission: OMISSION_RANDOM_FLAT_TYPE, label: '遗漏随机平注', jndOnly: true },
@@ -138,7 +146,16 @@ function isOmissionRandomType(type: StrategyTypeValue): type is OmissionRandomSt
 }
 
 function isAiRandomType(type: StrategyTypeValue): type is AiRandomStrategyType {
-  return type === AI_RANDOM_FLAT_TYPE || type === AI_RANDOM_MARTIN_TYPE;
+  return (
+    type === AI_RANDOM_FLAT_TYPE ||
+    type === AI_RANDOM_MARTIN_TYPE ||
+    type === AI_SAME_RANDOM_FLAT_TYPE ||
+    type === AI_SAME_RANDOM_MARTIN_TYPE
+  );
+}
+
+function isAiSameRandomType(type: StrategyTypeValue): type is AiRandomStrategyType {
+  return type === AI_SAME_RANDOM_FLAT_TYPE || type === AI_SAME_RANDOM_MARTIN_TYPE;
 }
 
 function isRandomPickStrategyType(type: StrategyTypeValue): type is RandomPickStrategyType {
@@ -174,7 +191,8 @@ function isMartinLike(type: StrategyTypeValue) {
     type === 'martin' ||
     isWaveStrategyType(type) ||
     type === OMISSION_RANDOM_MARTIN_TYPE ||
-    type === AI_RANDOM_MARTIN_TYPE
+    type === AI_RANDOM_MARTIN_TYPE ||
+    type === AI_SAME_RANDOM_MARTIN_TYPE
   );
 }
 
@@ -419,7 +437,11 @@ export default function StrategyForm({
   const isLuckySb = platformType === LUCKYSB_PLATFORM_TYPE;
   const isWaveStrategy = isWaveStrategyType(type);
   const isAiRandomStrategy = isAiRandomType(type);
+  const isAiSameRandomStrategy = isAiSameRandomType(type);
   const isRandomPickStrategy = isRandomPickStrategyType(type);
+  const randomPickCategoryOptions = isAiSameRandomStrategy
+    ? OMISSION_RANDOM_CATEGORY_OPTIONS.filter((option) => option.key !== 'sum')
+    : OMISSION_RANDOM_CATEGORY_OPTIONS;
   const activeWaveStrategyType = isWaveStrategyType(type) ? type : null;
 
   const selectedAccount = accounts.find((a) => a.id === accountId);
@@ -547,7 +569,10 @@ export default function StrategyForm({
       return;
     }
     if (!selectableStrategyTypeOptions.some((option) => option.type === type)) {
-      setType(selectableStrategyTypeOptions[0].type);
+      const fallbackType =
+        selectableStrategyTypeOptions.find((option) => option.type === 'flat')?.type ??
+        selectableStrategyTypeOptions[0].type;
+      setType(fallbackType);
     }
   }, [isEdit, selectableStrategyTypeOptions, type]);
 
@@ -585,6 +610,12 @@ export default function StrategyForm({
 
   const handleStrategyTypeSelect = (nextType: StrategyType) => {
     setType(nextType);
+    if (isAiSameRandomType(nextType)) {
+      setOmissionRandomCategories((current) => {
+        const withoutSum = current.filter((category) => category !== 'sum');
+        return withoutSum.length > 0 ? withoutSum : ['ball1'];
+      });
+    }
     if (nextType === RED_WAVE_DOUBLE_TYPE || nextType === GREEN_WAVE_SINGLE_TYPE) {
       setWaveDirections((current) => {
         const normalized = normalizeWaveDirections(nextType, current);
@@ -604,11 +635,12 @@ export default function StrategyForm({
   };
 
   const toggleOmissionRandomCategory = (category: OmissionRandomCategory) => {
+    if (isAiSameRandomStrategy && category === 'sum') return;
     setOmissionRandomCategories((previous) => {
       if (previous.includes(category)) {
         return previous.filter((item) => item !== category);
       }
-      return OMISSION_RANDOM_CATEGORY_OPTIONS
+      return randomPickCategoryOptions
         .map((option) => option.key)
         .filter((item) => [...previous, category].includes(item));
     });
@@ -700,7 +732,11 @@ export default function StrategyForm({
       return;
     }
 
-    if (isRandomPickStrategy && omissionRandomCategories.length === 0) {
+    const selectedRandomPickCategories = isAiSameRandomStrategy
+      ? omissionRandomCategories.filter((category) => category !== 'sum')
+      : omissionRandomCategories;
+
+    if (isRandomPickStrategy && selectedRandomPickCategories.length === 0) {
       setFormError('请选择随机选号类型');
       return;
     }
@@ -743,12 +779,12 @@ export default function StrategyForm({
     const randomPickConfig = isRandomPickStrategy
       ? {
           pick_count: omissionRandomPickCount,
-          categories: omissionRandomCategories,
+          categories: selectedRandomPickCategories,
           weight_mode: isAiRandomStrategy ? 'pure_random' : 'omission_plus_random',
         }
       : null;
     const randomPickPlayCode = isRandomPickStrategy
-      ? buildOmissionRandomPlayCode(omissionRandomCategories)
+      ? buildOmissionRandomPlayCode(selectedRandomPickCategories)
       : '';
 
     setSubmitting(true);
@@ -957,6 +993,24 @@ export default function StrategyForm({
                   </button>
                   <button
                     type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === AI_SAME_RANDOM_FLAT_TYPE)}
+                    className={`type-toggle-btn ${type === AI_SAME_RANDOM_FLAT_TYPE ? 'type-toggle-active' : ''}`}
+                    onClick={() => handleStrategyTypeSelect(AI_SAME_RANDOM_FLAT_TYPE)}
+                    disabled={submitting}
+                  >
+                    AI推荐同号平注
+                  </button>
+                  <button
+                    type="button"
+                    hidden={!selectableStrategyTypeOptions.some((option) => option.type === AI_SAME_RANDOM_MARTIN_TYPE)}
+                    className={`type-toggle-btn ${type === AI_SAME_RANDOM_MARTIN_TYPE ? 'type-toggle-active' : ''}`}
+                    onClick={() => handleStrategyTypeSelect(AI_SAME_RANDOM_MARTIN_TYPE)}
+                    disabled={submitting}
+                  >
+                    AI推荐同号平注马丁
+                  </button>
+                  <button
+                    type="button"
                     hidden={!selectableStrategyTypeOptions.some((option) => option.type === RED_WAVE_DOUBLE_TYPE)}
                     className={`type-toggle-btn ${type === RED_WAVE_DOUBLE_TYPE ? 'type-toggle-active' : ''}`}
                     onClick={() => {
@@ -1084,7 +1138,7 @@ export default function StrategyForm({
             <div className="form-field">
               <span className="form-label">随机选号类型</span>
               <div className="direction-grid">
-                {OMISSION_RANDOM_CATEGORY_OPTIONS.map((option) => {
+                {randomPickCategoryOptions.map((option) => {
                   const checked = omissionRandomCategories.includes(option.key);
                   return (
                     <label key={option.key} className="direction-option">

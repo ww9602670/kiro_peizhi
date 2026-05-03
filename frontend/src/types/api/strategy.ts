@@ -19,7 +19,9 @@ export type StrategyType =
   | 'omission_random_flat'
   | 'omission_random_martin'
   | 'ai_random_flat'
-  | 'ai_random_martin';
+  | 'ai_random_martin'
+  | 'ai_same_random_flat'
+  | 'ai_same_random_martin';
 
 export type StrategyPermissionType =
   | StrategyType

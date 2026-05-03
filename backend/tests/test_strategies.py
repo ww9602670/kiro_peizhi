@@ -369,6 +369,37 @@ class TestSchemaValidation:
         }
         assert s.martin_sequence is None
 
+    def test_ai_same_random_flat_normalizes_config_without_sum(self):
+        from app.schemas.strategy import StrategyCreate
+        s = StrategyCreate(
+            account_id=1,
+            name="ai_same_random",
+            type="ai_same_random_flat",
+            play_code="placeholder",
+            base_amount=10.0,
+            strategy_config={"pick_count": 4, "categories": ["ball3", "ball1"]},
+            martin_sequence=[1, 2, 4],
+        )
+        assert s.play_code == "OMR_BALL1,OMR_BALL3"
+        assert s.strategy_config == {
+            "pick_count": 4,
+            "categories": ["ball1", "ball3"],
+            "weight_mode": "pure_random",
+        }
+        assert s.martin_sequence is None
+
+    def test_ai_same_random_rejects_sum_config(self):
+        from app.schemas.strategy import StrategyCreate
+        with pytest.raises(Exception):
+            StrategyCreate(
+                account_id=1,
+                name="ai_same_random",
+                type="ai_same_random_flat",
+                play_code="placeholder",
+                base_amount=10.0,
+                strategy_config={"pick_count": 4, "categories": ["ball1", "sum"]},
+            )
+
 
 # 
 # 5.  API
@@ -532,6 +563,40 @@ async def test_create_ai_random_martin_strategy(client):
     assert data["play_code"] == "OMR_BALL1,OMR_SUM"
     assert data["strategy_config"]["pick_count"] == 4
     assert data["strategy_config"]["categories"] == ["ball1", "sum"]
+    assert data["strategy_config"]["weight_mode"] == "pure_random"
+    assert data["martin_sequence"] == [1, 2, 4]
+
+
+@pytest.mark.asyncio
+async def test_create_ai_same_random_martin_strategy(client):
+    uid = _uid()
+    token, op_id, acc_id = await _create_operator_with_account(f"aisr_{uid}")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/strategies",
+        headers=headers,
+        json={
+            "account_id": acc_id,
+            "name": "ai_same_random",
+            "type": "ai_same_random_martin",
+            "play_code": "placeholder",
+            "base_amount": 5.0,
+            "martin_sequence": [1, 2, 4],
+            "strategy_config": {
+                "pick_count": 4,
+                "categories": ["ball3", "ball1"],
+            },
+            "bet_timing": 45,
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["type"] == "ai_same_random_martin"
+    assert data["play_code"] == "OMR_BALL1,OMR_BALL3"
+    assert data["strategy_config"]["pick_count"] == 4
+    assert data["strategy_config"]["categories"] == ["ball1", "ball3"]
     assert data["strategy_config"]["weight_mode"] == "pure_random"
     assert data["martin_sequence"] == [1, 2, 4]
 

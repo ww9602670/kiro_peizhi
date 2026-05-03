@@ -29,6 +29,8 @@ function readDismissed(key: string): string[] {
 }
 
 function getStrategyTypeLabel(type: string): string {
+  if (type === 'ai_same_random_flat') return 'AI推荐同号平注';
+  if (type === 'ai_same_random_martin') return 'AI推荐同号平注马丁';
   if (type === 'flat') return '普通';
   if (type === 'martin') return '马丁';
   if (type === 'omission_random_flat') return '遗漏随机平注';

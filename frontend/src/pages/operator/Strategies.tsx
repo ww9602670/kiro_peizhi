@@ -25,6 +25,8 @@ import StrategyForm from './StrategyForm';
 import './Strategies.css';
 
 function getTypeBadge(type: string): { label: string; className: string } {
+  if (type === 'ai_same_random_flat') return { label: 'AI推荐同号平注', className: 'type-badge-flat' };
+  if (type === 'ai_same_random_martin') return { label: 'AI推荐同号平注马丁', className: 'type-badge-martin' };
   if (type === 'red_wave_double_martin') return { label: '红波双马丁', className: 'type-badge-martin' };
   if (type === 'green_wave_single_martin') return { label: '绿波追单', className: 'type-badge-martin' };
   if (type === 'omission_random_flat') return { label: '遗漏随机平注', className: 'type-badge-flat' };
@@ -36,7 +38,11 @@ function getTypeBadge(type: string): { label: string; className: string } {
 }
 
 function getOmissionRandomConfigDisplay(strategy: StrategyInfo): string {
-  if (!strategy.type.startsWith('omission_random_') && !strategy.type.startsWith('ai_random_')) return '';
+  if (
+    !strategy.type.startsWith('omission_random_') &&
+    !strategy.type.startsWith('ai_random_') &&
+    !strategy.type.startsWith('ai_same_random_')
+  ) return '';
   const pickCount = strategy.strategy_config?.pick_count;
   return pickCount ? `每类${pickCount}个` : '';
 }

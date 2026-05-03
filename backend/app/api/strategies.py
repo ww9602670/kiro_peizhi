@@ -57,6 +57,7 @@ from app.utils.omission_random import (
     AI_RANDOM_WEIGHT_MODE,
     OMISSION_WEIGHT_MODE,
     build_omission_play_code,
+    is_ai_same_random_type,
     is_ai_random_type,
     is_random_pick_type,
     normalize_strategy_config,
@@ -577,6 +578,8 @@ async def update_strategy(
         elif is_random_pick_type(existing["type"]):
             try:
                 categories = parse_omission_play_code(body.play_code)
+                if is_ai_same_random_type(existing["type"]) and "sum" in categories:
+                    raise ValueError("sum category is not supported")
                 update_fields["play_code"] = build_omission_play_code(categories)
             except ValueError as exc:
                 raise BizError(1002, str(exc), status_code=400)
@@ -618,6 +621,7 @@ async def update_strategy(
             normalized_config = normalize_strategy_config(
                 body.strategy_config,
                 weight_mode=weight_mode,
+                allow_sum=not is_ai_same_random_type(existing["type"]),
             )
         except ValueError as exc:
             raise BizError(1002, str(exc), status_code=400)

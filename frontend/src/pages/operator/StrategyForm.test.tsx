@@ -58,6 +58,8 @@ const allStrategyPermissions: StrategyPermissionType[] = [
   'omission_random_martin',
   'ai_random_flat',
   'ai_random_martin',
+  'ai_same_random_flat',
+  'ai_same_random_martin',
 ];
 
 const accounts: AccountInfo[] = [
@@ -502,6 +504,50 @@ describe('StrategyForm', () => {
           strategy_config: {
             pick_count: 6,
             categories: ['ball1', 'ball2'],
+            weight_mode: 'pure_random',
+          },
+          platform_type: 'JND28WEB',
+        }),
+      );
+    });
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it('submits ai-same-random martin strategy without sum category', async () => {
+    const user = userEvent.setup();
+    const onDone = vi.fn();
+
+    render(
+      <StrategyForm
+        strategy={null}
+        initialAccountId={1}
+        onDone={onDone}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((document.getElementById('sf-account') as HTMLSelectElement).value).toBe('1');
+    });
+
+    await user.type(document.getElementById('sf-name') as HTMLInputElement, 'same martin');
+    await user.click(screen.getByRole('button', { name: /同号平注马丁/ }));
+    const categoryCheckboxes = Array.from(document.querySelectorAll('.direction-checkbox')) as HTMLInputElement[];
+    expect(categoryCheckboxes).toHaveLength(3);
+    await user.click(categoryCheckboxes[1]);
+    await user.click(categoryCheckboxes[2]);
+    await user.click(document.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    await waitFor(() => {
+      expect(mockCreateStrategy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          account_id: 1,
+          type: 'ai_same_random_martin',
+          play_code: 'OMR_BALL1,OMR_BALL2,OMR_BALL3',
+          martin_sequence: [1, 2, 4, 8, 16],
+          strategy_config: {
+            pick_count: 3,
+            categories: ['ball1', 'ball2', 'ball3'],
             weight_mode: 'pure_random',
           },
           platform_type: 'JND28WEB',

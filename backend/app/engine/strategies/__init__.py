@@ -13,6 +13,8 @@ from app.engine.strategies.red_wave_double import (
 from app.engine.strategies.omission_random import (
     AiRandomFlatStrategy,
     AiRandomMartinStrategy,
+    AiSameRandomFlatStrategy,
+    AiSameRandomMartinStrategy,
     OmissionRandomFlatStrategy,
     OmissionRandomMartinStrategy,
 )
@@ -24,6 +26,8 @@ __all__ = [
     "RedWaveDoubleMartinStrategy",
     "AiRandomFlatStrategy",
     "AiRandomMartinStrategy",
+    "AiSameRandomFlatStrategy",
+    "AiSameRandomMartinStrategy",
     "OmissionRandomFlatStrategy",
     "OmissionRandomMartinStrategy",
 ]

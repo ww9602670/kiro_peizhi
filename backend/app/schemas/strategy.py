@@ -15,6 +15,7 @@ from app.utils.omission_random import (
     AI_RANDOM_WEIGHT_MODE,
     OMISSION_WEIGHT_MODE,
     build_omission_play_code,
+    is_ai_same_random_type,
     is_ai_random_type,
     is_random_pick_martin_type,
     is_random_pick_type,
@@ -33,6 +34,8 @@ StrategyPermissionType = Literal[
     "omission_random_martin",
     "ai_random_flat",
     "ai_random_martin",
+    "ai_same_random_flat",
+    "ai_same_random_martin",
 ]
 
 STRATEGY_PERMISSION_TYPES: tuple[str, ...] = (
@@ -46,6 +49,8 @@ STRATEGY_PERMISSION_TYPES: tuple[str, ...] = (
     "omission_random_martin",
     "ai_random_flat",
     "ai_random_martin",
+    "ai_same_random_flat",
+    "ai_same_random_martin",
 )
 _STRATEGY_PERMISSION_TYPE_SET = set(STRATEGY_PERMISSION_TYPES)
 
@@ -156,6 +161,8 @@ class StrategyCreate(BaseModel):
         "omission_random_martin",
         "ai_random_flat",
         "ai_random_martin",
+        "ai_same_random_flat",
+        "ai_same_random_martin",
     ]
     play_code: str = Field(..., min_length=1)
     base_amount: float = Field(..., gt=0)
@@ -177,6 +184,7 @@ class StrategyCreate(BaseModel):
             self.strategy_config = normalize_strategy_config(
                 self.strategy_config,
                 weight_mode=weight_mode,
+                allow_sum=not is_ai_same_random_type(self.type),
             )
             self.play_code = build_omission_play_code(self.strategy_config["categories"])
             if is_random_pick_martin_type(self.type):

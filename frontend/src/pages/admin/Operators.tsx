@@ -32,6 +32,8 @@ import { useToast } from '@/hooks/useToast';
 import './Operators.css';
 
 const STRATEGY_PERMISSION_OPTIONS: Array<{ value: StrategyPermissionType; label: string }> = [
+  { value: 'ai_same_random_flat', label: 'AI推荐同号平注' },
+  { value: 'ai_same_random_martin', label: 'AI推荐同号平注马丁' },
   { value: 'flat', label: '平注' },
   { value: 'martin', label: '马丁' },
   { value: 'dw3_flat', label: '三字定位平注' },

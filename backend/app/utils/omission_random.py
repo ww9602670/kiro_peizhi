@@ -10,7 +10,10 @@ OMISSION_RANDOM_TYPES = (OMISSION_RANDOM_FLAT_TYPE, OMISSION_RANDOM_MARTIN_TYPE)
 AI_RANDOM_FLAT_TYPE = "ai_random_flat"
 AI_RANDOM_MARTIN_TYPE = "ai_random_martin"
 AI_RANDOM_TYPES = (AI_RANDOM_FLAT_TYPE, AI_RANDOM_MARTIN_TYPE)
-RANDOM_PICK_TYPES = OMISSION_RANDOM_TYPES + AI_RANDOM_TYPES
+AI_SAME_RANDOM_FLAT_TYPE = "ai_same_random_flat"
+AI_SAME_RANDOM_MARTIN_TYPE = "ai_same_random_martin"
+AI_SAME_RANDOM_TYPES = (AI_SAME_RANDOM_FLAT_TYPE, AI_SAME_RANDOM_MARTIN_TYPE)
+RANDOM_PICK_TYPES = OMISSION_RANDOM_TYPES + AI_RANDOM_TYPES + AI_SAME_RANDOM_TYPES
 
 OMISSION_WEIGHT_MODE = "omission_plus_random"
 AI_RANDOM_WEIGHT_MODE = "pure_random"
@@ -40,7 +43,11 @@ def is_omission_random_type(strategy_type: str | None) -> bool:
 
 
 def is_ai_random_type(strategy_type: str | None) -> bool:
-    return str(strategy_type or "") in AI_RANDOM_TYPES
+    return str(strategy_type or "") in AI_RANDOM_TYPES + AI_SAME_RANDOM_TYPES
+
+
+def is_ai_same_random_type(strategy_type: str | None) -> bool:
+    return str(strategy_type or "") in AI_SAME_RANDOM_TYPES
 
 
 def is_random_pick_type(strategy_type: str | None) -> bool:
@@ -48,7 +55,11 @@ def is_random_pick_type(strategy_type: str | None) -> bool:
 
 
 def is_random_pick_martin_type(strategy_type: str | None) -> bool:
-    return str(strategy_type or "") in (OMISSION_RANDOM_MARTIN_TYPE, AI_RANDOM_MARTIN_TYPE)
+    return str(strategy_type or "") in (
+        OMISSION_RANDOM_MARTIN_TYPE,
+        AI_RANDOM_MARTIN_TYPE,
+        AI_SAME_RANDOM_MARTIN_TYPE,
+    )
 
 
 def normalize_categories(raw_categories: Any) -> list[str]:
@@ -85,6 +96,7 @@ def normalize_strategy_config(
     raw_config: Any,
     *,
     weight_mode: str = OMISSION_WEIGHT_MODE,
+    allow_sum: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(raw_config, dict):
         raise ValueError("strategy_config is required")
@@ -92,9 +104,13 @@ def normalize_strategy_config(
     if weight_mode not in {OMISSION_WEIGHT_MODE, AI_RANDOM_WEIGHT_MODE}:
         raise ValueError("invalid weight_mode")
 
+    categories = normalize_categories(raw_config.get("categories"))
+    if not allow_sum and "sum" in categories:
+        raise ValueError("sum category is not supported")
+
     config = {
         "pick_count": normalize_pick_count(raw_config.get("pick_count")),
-        "categories": normalize_categories(raw_config.get("categories")),
+        "categories": categories,
         "weight_mode": weight_mode,
     }
     runtime_state = raw_config.get("runtime_state")

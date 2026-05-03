@@ -1,9 +1,13 @@
 import random
 
+import pytest
+
 from app.engine.strategies.base import LotteryResult, StrategyContext
 from app.engine.strategies.omission_random import (
     AiRandomFlatStrategy,
     AiRandomMartinStrategy,
+    AiSameRandomFlatStrategy,
+    AiSameRandomMartinStrategy,
     OmissionRandomFlatStrategy,
     OmissionRandomMartinStrategy,
 )
@@ -127,6 +131,67 @@ def test_ai_random_flat_uses_pure_uniform_pick_mode():
     assert {signal.metadata["strategy_kind"] for signal in signals} == {"ai_random"}
     assert sum(1 for signal in signals if signal.key_code.startswith("B1QH")) == 4
     assert sum(1 for signal in signals if signal.key_code.startswith("HZ")) == 4
+
+
+def test_ai_same_random_flat_uses_same_digits_for_selected_balls():
+    strategy = AiSameRandomFlatStrategy(
+        base_amount=100,
+        config={"pick_count": 4, "categories": ["ball1", "ball2", "ball3"]},
+        rng=random.Random(5),
+    )
+
+    signals = strategy.compute(_ctx())
+
+    assert len(signals) == 12
+    digits_by_prefix = {
+        prefix: {
+            int(signal.key_code.rsplit("QH", 1)[1])
+            for signal in signals
+            if signal.key_code.startswith(prefix)
+        }
+        for prefix in ("B1QH", "B2QH", "B3QH")
+    }
+    assert digits_by_prefix["B1QH"] == digits_by_prefix["B2QH"]
+    assert digits_by_prefix["B1QH"] == digits_by_prefix["B3QH"]
+    assert all(not signal.key_code.startswith("HZ") for signal in signals)
+    assert {signal.metadata["strategy_kind"] for signal in signals} == {"ai_same_random"}
+
+
+def test_ai_same_random_rejects_sum_category():
+    with pytest.raises(ValueError, match="sum category"):
+        AiSameRandomFlatStrategy(
+            base_amount=100,
+            config={"pick_count": 3, "categories": ["ball1", "sum"]},
+            rng=random.Random(1),
+        )
+
+
+def test_ai_same_random_martin_keeps_category_levels_and_shared_digits():
+    strategy = AiSameRandomMartinStrategy(
+        base_amount=100,
+        sequence=[1, 2, 4],
+        config={"pick_count": 3, "categories": ["ball1", "ball2"]},
+        rng=random.Random(6),
+    )
+
+    strategy.on_result(0, -300, key_code="ball2", martin_level=0)
+    signals = strategy.compute(_ctx())
+
+    ball1_amounts = {signal.amount for signal in signals if signal.key_code.startswith("B1QH")}
+    ball2_amounts = {signal.amount for signal in signals if signal.key_code.startswith("B2QH")}
+    ball1_digits = {
+        int(signal.key_code.rsplit("QH", 1)[1])
+        for signal in signals
+        if signal.key_code.startswith("B1QH")
+    }
+    ball2_digits = {
+        int(signal.key_code.rsplit("QH", 1)[1])
+        for signal in signals
+        if signal.key_code.startswith("B2QH")
+    }
+    assert ball1_amounts == {100}
+    assert ball2_amounts == {200}
+    assert ball1_digits == ball2_digits
 
 
 def test_ai_random_martin_does_not_adapt_history_window_or_reverse_weight():

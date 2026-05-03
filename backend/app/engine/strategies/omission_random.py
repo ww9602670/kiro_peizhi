@@ -14,6 +14,8 @@ from app.utils.omission_random import (
     ADAPTIVE_HISTORY_WINDOWS,
     AI_RANDOM_FLAT_TYPE,
     AI_RANDOM_MARTIN_TYPE,
+    AI_SAME_RANDOM_FLAT_TYPE,
+    AI_SAME_RANDOM_MARTIN_TYPE,
     AI_RANDOM_WEIGHT_MODE,
     CATEGORY_LABELS,
     DEFAULT_HISTORY_WINDOW,
@@ -84,6 +86,7 @@ class _OmissionRandomBaseStrategy(BaseStrategy):
     settlement_scope = "category"
     strategy_kind = "omission_random"
     weight_mode = OMISSION_WEIGHT_MODE
+    allow_sum_category = True
 
     def __init__(
         self,
@@ -96,7 +99,11 @@ class _OmissionRandomBaseStrategy(BaseStrategy):
         operator_id: int = 0,
         rng: random.Random | None = None,
     ) -> None:
-        normalized = normalize_strategy_config(config, weight_mode=self.weight_mode)
+        normalized = normalize_strategy_config(
+            config,
+            weight_mode=self.weight_mode,
+            allow_sum=self.allow_sum_category,
+        )
         if base_amount <= 0:
             raise ValueError("base_amount must be > 0")
         self._base_amount = int(base_amount)
@@ -448,6 +455,37 @@ class _AiRandomBaseStrategy(_OmissionRandomBaseStrategy):
         state.round_loss = 0
 
 
+class _AiSameRandomBaseStrategy(_AiRandomBaseStrategy):
+    strategy_kind = "ai_same_random"
+    allow_sum_category = False
+
+    def compute(self, ctx: StrategyContext) -> list[BetInstruction]:
+        shared_picks = self._uniform_sample(key_codes_for_category("ball1"), self._pick_count)
+        shared_values = [key_code_value("ball1", key_code) for key_code in shared_picks]
+
+        instructions: list[BetInstruction] = []
+        for category in self._categories:
+            state = self._states[category]
+            amount = self._amount_for_state(state)
+            category_codes = key_codes_for_category(category)
+            for value in shared_values:
+                instructions.append(
+                    BetInstruction(
+                        key_code=category_codes[value],
+                        amount=amount,
+                        martin_level=state.level if self.is_martin else None,
+                        metadata={
+                            "strategy_kind": self.strategy_kind,
+                            "category": category,
+                            "shared_value": value,
+                            "history_window": state.history_window,
+                            "reverse_active": state.reverse_active,
+                        },
+                    )
+                )
+        return instructions
+
+
 @register_strategy(OMISSION_RANDOM_FLAT_TYPE)
 class OmissionRandomFlatStrategy(_OmissionRandomBaseStrategy):
     def name(self) -> str:
@@ -482,6 +520,26 @@ class AiRandomMartinStrategy(_AiRandomBaseStrategy):
 
     def name(self) -> str:
         return AI_RANDOM_MARTIN_TYPE
+
+    def _amount_for_state(self, state: CategoryState) -> int:
+        multiplier = self._sequence[state.level]
+        return int(self._base_amount * multiplier)
+
+
+@register_strategy(AI_SAME_RANDOM_FLAT_TYPE)
+class AiSameRandomFlatStrategy(_AiSameRandomBaseStrategy):
+    def name(self) -> str:
+        return AI_SAME_RANDOM_FLAT_TYPE
+
+
+@register_strategy(AI_SAME_RANDOM_MARTIN_TYPE)
+class AiSameRandomMartinStrategy(_AiSameRandomBaseStrategy):
+    @property
+    def is_martin(self) -> bool:
+        return True
+
+    def name(self) -> str:
+        return AI_SAME_RANDOM_MARTIN_TYPE
 
     def _amount_for_state(self, state: CategoryState) -> int:
         multiplier = self._sequence[state.level]

@@ -685,6 +685,8 @@ class EngineManager:
         from app.engine.strategies.omission_random import (
             AiRandomFlatStrategy,
             AiRandomMartinStrategy,
+            AiSameRandomFlatStrategy,
+            AiSameRandomMartinStrategy,
             OmissionRandomFlatStrategy,
             OmissionRandomMartinStrategy,
         )
@@ -692,6 +694,8 @@ class EngineManager:
         from app.utils.omission_random import (
             AI_RANDOM_FLAT_TYPE,
             AI_RANDOM_MARTIN_TYPE,
+            AI_SAME_RANDOM_FLAT_TYPE,
+            AI_SAME_RANDOM_MARTIN_TYPE,
             OMISSION_RANDOM_FLAT_TYPE,
             OMISSION_RANDOM_MARTIN_TYPE,
         )
@@ -764,18 +768,27 @@ class EngineManager:
                 logger.warning("unknown strategy type=%s", strategy_type)
                 return None
 
-            if strategy_type in (OMISSION_RANDOM_FLAT_TYPE, AI_RANDOM_FLAT_TYPE):
+            if strategy_type in (
+                OMISSION_RANDOM_FLAT_TYPE,
+                AI_RANDOM_FLAT_TYPE,
+                AI_SAME_RANDOM_FLAT_TYPE,
+            ):
                 kwargs = {
                     "base_amount": base_amount,
                     "config": strategy_config,
                     "strategy_name": str(strategy_data.get("name") or strategy_type),
                 }
-                strategy_cls = (
-                    AiRandomFlatStrategy
-                    if strategy_type == AI_RANDOM_FLAT_TYPE
-                    else OmissionRandomFlatStrategy
-                )
-            elif strategy_type in (OMISSION_RANDOM_MARTIN_TYPE, AI_RANDOM_MARTIN_TYPE):
+                if strategy_type == AI_RANDOM_FLAT_TYPE:
+                    strategy_cls = AiRandomFlatStrategy
+                elif strategy_type == AI_SAME_RANDOM_FLAT_TYPE:
+                    strategy_cls = AiSameRandomFlatStrategy
+                else:
+                    strategy_cls = OmissionRandomFlatStrategy
+            elif strategy_type in (
+                OMISSION_RANDOM_MARTIN_TYPE,
+                AI_RANDOM_MARTIN_TYPE,
+                AI_SAME_RANDOM_MARTIN_TYPE,
+            ):
                 if not seq_values:
                     logger.warning("missing martin_sequence strategy_id=%s", strategy_data.get("id"))
                     return None
@@ -787,11 +800,12 @@ class EngineManager:
                     "alert_service": self.alert_service,
                     "operator_id": int(strategy_data.get("operator_id") or 0),
                 }
-                strategy_cls = (
-                    AiRandomMartinStrategy
-                    if strategy_type == AI_RANDOM_MARTIN_TYPE
-                    else OmissionRandomMartinStrategy
-                )
+                if strategy_type == AI_RANDOM_MARTIN_TYPE:
+                    strategy_cls = AiRandomMartinStrategy
+                elif strategy_type == AI_SAME_RANDOM_MARTIN_TYPE:
+                    strategy_cls = AiSameRandomMartinStrategy
+                else:
+                    strategy_cls = OmissionRandomMartinStrategy
             elif strategy_type == "flat":
                 kwargs: dict[str, Any] = {
                     "key_codes": key_codes,
