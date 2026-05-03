@@ -72,6 +72,8 @@ SETTLEMENT_FIRST_FETCH_DELAY_SECONDS = 20
 SETTLEMENT_RETRY_DELAYS = [10, 5, 8, 10]
 SETTLEMENT_MAX_PENDING_SECONDS = 600
 SETTLEMENT_BRANCH_IDLE_SECONDS = 1
+SETTLEMENT_ACCOUNT_JITTER_SECONDS_MAX = 3
+DRAW_WAIT_RETRY_DEFAULT_SLEEP_SECONDS = 10
 
 # 缁撶畻鏁版嵁鎷夊彇閲嶈瘯
 SETTLE_DATA_RETRY_MAX = 6
@@ -578,11 +580,56 @@ class AccountWorker:
 
     def _main_loop_sleep_seconds(self, install: InstallInfo) -> int:
         """Keep the non-settlement main loop paced after settlement was split out."""
+        draw_state = self._draw_state(install)
+        if draw_state == "draw_wait_retry":
+            return self._seconds_until_refresh_at(
+                getattr(install, "next_draw_retry_at", None),
+                default_seconds=DRAW_WAIT_RETRY_DEFAULT_SLEEP_SECONDS,
+            )
+
         poll_interval = max(1, int(getattr(self.poller, "poll_interval", 5) or 5))
         open_countdown = max(0, int(getattr(install, "open_countdown_sec", 0) or 0))
         close_countdown = max(0, int(getattr(install, "close_countdown_sec", 0) or 0))
         countdown = open_countdown or close_countdown or poll_interval
         return max(1, min(poll_interval, countdown))
+
+    @staticmethod
+    def _seconds_until_refresh_at(
+        refresh_at: object,
+        *,
+        default_seconds: int,
+        now: datetime | None = None,
+    ) -> int:
+        text = str(refresh_at or "").strip()
+        if not text:
+            return max(1, int(default_seconds))
+        parsed: datetime | None = None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            return max(1, int(default_seconds))
+        current = now
+        if current is None:
+            current = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        elif parsed.tzinfo is not None and current.tzinfo is None:
+            current = current.replace(tzinfo=parsed.tzinfo)
+        elif parsed.tzinfo is None and current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+        delta_seconds = (parsed - current).total_seconds()
+        if delta_seconds <= 0:
+            return 1
+        return max(1, int(delta_seconds + 0.999))
+
+    def _settlement_account_jitter_seconds(self) -> int:
+        return int(self.account_id) % (SETTLEMENT_ACCOUNT_JITTER_SECONDS_MAX + 1)
 
     @staticmethod
     def _market_data_state(install: InstallInfo) -> str:
@@ -705,7 +752,11 @@ class AccountWorker:
             self._settlement_pending_issues.pop(issue, None)
             return
         now = time.time()
-        first_delay = 0 if immediate else max(0, int(open_countdown_sec)) + SETTLEMENT_FIRST_FETCH_DELAY_SECONDS
+        first_delay = 0 if immediate else (
+            max(0, int(open_countdown_sec))
+            + SETTLEMENT_FIRST_FETCH_DELAY_SECONDS
+            + self._settlement_account_jitter_seconds()
+        )
         entry = self._settlement_pending_issues.get(issue)
         if entry is None:
             self._settlement_pending_issues[issue] = SettlementPendingIssue(
@@ -1120,6 +1171,10 @@ class AccountWorker:
             market_data_state = self._market_data_state(current_install)
             if market_data_state == "market_closed":
                 self._mark_pending_groups_skipped("market_closed")
+                return current_install
+            draw_state = self._draw_state(current_install)
+            if draw_state in {"draw_pending", "draw_wait_retry"}:
+                self._mark_pending_groups_skipped(draw_state)
                 return current_install
 
             if current_install.state != 1:

@@ -9,6 +9,7 @@ import pytest
 from app.engine.adapters.base import InstallInfo, LoginResult, RemoteLoginRequired
 from app.engine.shared_market_runtime import (
     DEFAULT_COLLECTOR_INTERVAL_SECONDS,
+    DRAW_FIRST_REFRESH_DELAY_SECONDS,
     DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS,
     DRAW_STATE_PENDING,
     DRAW_STATE_WAIT_RETRY,
@@ -21,6 +22,7 @@ from app.engine.shared_market_runtime import (
     SharedMarketRuntime,
     SharedMarketContracts,
     SharedMarketSnapshot,
+    _next_normal_collector_sleep_seconds,
     normalize_market_url,
 )
 
@@ -212,6 +214,21 @@ def test_normalize_market_url_rejects_invalid_scheme():
 def test_shared_collector_default_interval_and_freshness_are_aligned():
     assert DEFAULT_COLLECTOR_INTERVAL_SECONDS == 25.0
     assert DEFAULT_SHARED_MARKET_FRESHNESS_SECONDS > DEFAULT_COLLECTOR_INTERVAL_SECONDS
+
+
+def test_next_normal_collector_sleep_aligns_first_post_draw_refresh():
+    assert _next_normal_collector_sleep_seconds(
+        open_countdown_sec=90,
+        collector_interval_seconds=25,
+    ) == 25
+    assert _next_normal_collector_sleep_seconds(
+        open_countdown_sec=20,
+        collector_interval_seconds=25,
+    ) == 20 + DRAW_FIRST_REFRESH_DELAY_SECONDS
+    assert _next_normal_collector_sleep_seconds(
+        open_countdown_sec=25,
+        collector_interval_seconds=25,
+    ) == 25 + DRAW_FIRST_REFRESH_DELAY_SECONDS
 
 
 def test_shared_snapshot_to_install_subtracts_snapshot_age():

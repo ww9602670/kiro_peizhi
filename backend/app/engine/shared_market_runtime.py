@@ -26,6 +26,7 @@ DEFAULT_COLLECTOR_INTERVAL_SECONDS = 25.0
 DEFAULT_COLLECTOR_ERROR_BACKOFF_SECONDS = 5.0
 DEFAULT_LOCAL_FALLBACK_INTERVAL_SECONDS = 80
 DEFAULT_SHARED_CAPTCHA_LOGIN_ATTEMPTS = 3
+DRAW_FIRST_REFRESH_DELAY_SECONDS = 10.0
 DRAW_PENDING_RETRY_INTERVALS_SECONDS = (10.0, 10.0, 10.0, 5.0, 3.0, 1.0)
 DRAW_WAIT_RETRY_INTERVAL_SECONDS = 10.0
 SHARED_ERROR_MESSAGE_CODE = "SHARED-002"
@@ -266,6 +267,21 @@ def _snapshot_age_seconds(
     elif fetched_at.tzinfo is None and current.tzinfo is not None:
         current = current.replace(tzinfo=None)
     return max(0, int((current - fetched_at).total_seconds()))
+
+
+def _next_normal_collector_sleep_seconds(
+    *,
+    open_countdown_sec: int,
+    collector_interval_seconds: float,
+) -> float:
+    """Schedule normal collection so the first post-draw refresh happens on time."""
+    normal_interval = max(0.5, float(collector_interval_seconds))
+    countdown = max(0, int(open_countdown_sec))
+    if countdown <= 0:
+        return normal_interval
+    if countdown <= normal_interval:
+        return float(countdown) + DRAW_FIRST_REFRESH_DELAY_SECONDS
+    return normal_interval
 
 
 @dataclass(slots=True)
@@ -1415,7 +1431,10 @@ class SharedMarketRuntime:
                             draw_refresh.retry_index += 1
                             next_draw_retry_at = now + timedelta(seconds=sleep_seconds)
                     else:
-                        sleep_seconds = self._collector_interval_seconds
+                        sleep_seconds = _next_normal_collector_sleep_seconds(
+                            open_countdown_sec=open_countdown_sec,
+                            collector_interval_seconds=self._collector_interval_seconds,
+                        )
                         next_normal_refresh_at = now + timedelta(seconds=sleep_seconds)
 
                 await self._contracts.snapshot_upsert(

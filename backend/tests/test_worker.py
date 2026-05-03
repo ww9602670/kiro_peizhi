@@ -28,6 +28,9 @@ from app.engine.worker import (
     SETTLE_DATA_RETRY_INTERVAL,
     API_RETRY_DELAYS,
     API_RETRY_MAX,
+    DRAW_WAIT_RETRY_DEFAULT_SLEEP_SECONDS,
+    SETTLEMENT_FIRST_FETCH_DELAY_SECONDS,
+    SETTLEMENT_ACCOUNT_JITTER_SECONDS_MAX,
     StrategyRuntimeProfile,
     WorkerStartupError,
     _parse_result,
@@ -999,6 +1002,34 @@ class TestIssueExecutionPlan:
         worker.adapter.get_current_install.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_run_due_strategy_windows_waits_on_draw_wait_retry_without_polling(self):
+        worker = _make_worker(
+            strategies={1: MagicMock(), 2: MagicMock()},
+            strategy_profiles={
+                1: StrategyRuntimeProfile(strategy_id=1, bet_timing=60),
+                2: StrategyRuntimeProfile(strategy_id=2, bet_timing=40),
+            },
+        )
+        worker.running = True
+        worker.poller.last_success_at = datetime.now()
+        install = _make_install(close_countdown_sec=0, open_countdown_sec=0)
+        setattr(install, "draw_state", "draw_wait_retry")
+        worker.executor.execute = AsyncMock()
+        worker._fetch_install_with_retry = AsyncMock()
+
+        result = await worker._run_due_strategy_windows(install)
+
+        assert result is install
+        assert worker._issue_execution_plan is not None
+        assert worker._issue_execution_plan.skipped_strategy_reasons == {
+            1: "draw_wait_retry",
+            2: "draw_wait_retry",
+        }
+        worker.executor.execute.assert_not_awaited()
+        worker._fetch_install_with_retry.assert_not_called()
+        worker.adapter.get_current_install.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_run_due_strategy_windows_skips_issue_when_snapshot_stale(self):
         worker = _make_worker(
             strategies={1: MagicMock(), 2: MagicMock()},
@@ -1203,6 +1234,45 @@ def _make_worker_with_db(has_records: bool = True, **overrides) -> AccountWorker
     worker.settler._save_lottery_result = AsyncMock()
     worker._lock_token = "test-lock-token"  # 预设 lock token
     return worker
+
+
+class TestWorkerTimingCompletion:
+    def test_draw_wait_retry_sleep_uses_next_retry_timestamp(self):
+        worker = _make_worker()
+        now = datetime(2026, 5, 3, 12, 0, 0)
+        install = _make_install(close_countdown_sec=0, open_countdown_sec=0)
+        setattr(install, "draw_state", "draw_wait_retry")
+        setattr(install, "next_draw_retry_at", "2026-05-03 12:00:10")
+
+        assert worker._seconds_until_refresh_at(
+            getattr(install, "next_draw_retry_at"),
+            default_seconds=DRAW_WAIT_RETRY_DEFAULT_SLEEP_SECONDS,
+            now=now,
+        ) == 10
+
+    def test_draw_wait_retry_sleep_uses_default_when_timestamp_missing(self):
+        worker = _make_worker()
+        install = _make_install(close_countdown_sec=0, open_countdown_sec=0)
+        setattr(install, "draw_state", "draw_wait_retry")
+
+        assert worker._main_loop_sleep_seconds(install) == DRAW_WAIT_RETRY_DEFAULT_SLEEP_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_register_issue_for_settlement_adds_account_jitter(self):
+        worker = _make_worker_with_db(account_id=102)
+
+        with patch("app.engine.worker.time.time", return_value=1000):
+            await worker._register_issue_for_settlement(
+                "20250302001",
+                open_countdown_sec=20,
+            )
+
+        entry = worker._settlement_pending_issues["20250302001"]
+        expected_jitter = 102 % (SETTLEMENT_ACCOUNT_JITTER_SECONDS_MAX + 1)
+        assert expected_jitter == 2
+        assert entry.next_attempt_at == (
+            1000 + 20 + SETTLEMENT_FIRST_FETCH_DELAY_SECONDS + expected_jitter
+        )
 
 
 # ==================================================================
