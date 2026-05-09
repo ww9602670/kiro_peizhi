@@ -37,11 +37,16 @@ from app.models.db_ops import (
     account_verification_run_get_running,
     account_verification_runs_mark_stale_by_account,
     account_verification_runs_refresh_stale,
+    account_shared_route_get,
+    account_shared_route_mark_pending,
+    account_shared_route_upsert,
     account_update,
     alert_create,
     odds_batch_upsert,
     odds_list_by_account,
+    operator_list_all,
     operator_strategy_permission_list,
+    shared_market_group_resolve_by_url,
 )
 from app.schemas.account import (
     AccountCreate,
@@ -58,6 +63,7 @@ from app.utils.omission_random import (
     normalize_categories,
     parse_omission_play_code,
 )
+from app.utils.platform_url import normalize_platform_url
 from app.utils.response import BizError
 
 router = APIRouter()
@@ -124,8 +130,45 @@ def _safe_text(value: object) -> str:
     return "" if value is None else str(value)
 
 
+def _discovered_shared_group_id(result: object) -> int | None:
+    candidate = result[0] if isinstance(result, (tuple, list)) and result else result
+    if candidate in (None, ""):
+        return None
+    try:
+        return int(candidate)
+    except (TypeError, ValueError):
+        return None
+
+
 def _now_bjt() -> str:
     return datetime.now(_BJT).strftime("%Y-%m-%d %H:%M:%S")
+
+
+_DETECTION_STATUS_ALIASES = {
+    "pending": "untested",
+    "matched": "success",
+    "review_required": "failed",
+}
+
+
+def _normalize_platform_type(value: object) -> str:
+    return _safe_text(value or "JND28WEB").strip().upper() or "JND28WEB"
+
+
+def _normalize_probe_platform_type(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        value = next(iter(value), "JND28WEB")
+    return _normalize_platform_type(value)
+
+
+def _normalize_detection_status(value: object) -> str:
+    raw = _safe_text(value).strip().lower()
+    return _DETECTION_STATUS_ALIASES.get(raw, raw)
+
+
+def _candidate_shared_platform_types(account: dict[str, Any]) -> list[str]:
+    platform_types = get_allowed_platform_types(_safe_text(account.get("game_type")))
+    return platform_types or ["JND28WEB"]
 
 
 def _set_adapter_platform_type(adapter: PlatformAdapter, platform_type: str) -> None:
@@ -700,16 +743,207 @@ async def _build_account_info(
     )
 
 
+async def _uncovered_url_context(db, *, normalized_url: str) -> dict[str, Any] | None:
+    record = await (
+        await db.execute(
+            """SELECT detection_status, failure_reason, detection_error,
+                      matched_shared_group_id, shared_group_id
+                 FROM shared_market_uncovered_urls
+                WHERE normalized_url=?""",
+            (normalized_url,),
+        )
+    ).fetchone()
+    return dict(record) if record else None
+
+
+def _shared_market_route_payload(
+    route: dict[str, Any] | None,
+    *,
+    platform_type: str,
+    normalized_url: str | None,
+    uncovered_url: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state = (route or {}).get("data_source_state") or "local"
+    detection_status = _normalize_detection_status(
+        (uncovered_url or {}).get("detection_status")
+    )
+    if not detection_status:
+        detection_status = "success" if state in {"shared", "shared_pending"} else "untested"
+
+    return {
+        "platform_type": platform_type,
+        "normalized_url": normalized_url,
+        "data_source_state": state,
+        "shared_group_id": (route or {}).get("shared_group_id"),
+        "shared_group_key": (route or {}).get("shared_group_key"),
+        "pending_shared_group_id": (route or {}).get("pending_shared_group_id"),
+        "pending_shared_group_key": (route or {}).get("pending_shared_group_key"),
+        "handoff_after_issue": (route or {}).get("handoff_after_issue"),
+        "handoff_confirmed_issue": (route or {}).get("handoff_confirmed_issue"),
+        "fallback_reason": (route or {}).get("fallback_reason"),
+        "last_switch_at": (route or {}).get("last_switch_at"),
+        "last_checked_at": (route or {}).get("last_checked_at"),
+        "detection_status": detection_status,
+        "failure_reason": (uncovered_url or {}).get("failure_reason")
+        or (uncovered_url or {}).get("detection_error")
+        or (route or {}).get("fallback_reason"),
+    }
+
+
+async def _build_shared_market_route_payload(
+    db,
+    *,
+    row: dict,
+    platform_type: str | None = None,
+) -> dict[str, Any]:
+    resolved_platform_type = _normalize_platform_type(
+        platform_type or _candidate_shared_platform_types(row)[0]
+    )
+    normalized_url = normalize_platform_url(row.get("platform_url"))
+    route = await account_shared_route_get(
+        db,
+        account_id=int(row["id"]),
+        platform_type=resolved_platform_type,
+    )
+    uncovered_url = (
+        await _uncovered_url_context(db, normalized_url=normalized_url)
+        if normalized_url
+        else None
+    )
+    return _shared_market_route_payload(
+        route,
+        platform_type=resolved_platform_type,
+        normalized_url=normalized_url or None,
+        uncovered_url=uncovered_url,
+    )
+
+
+async def _build_account_payload(
+    *,
+    db,
+    row: dict,
+    odds_synced: bool | None = None,
+    odds_count: int | None = None,
+    odds_message: str | None = None,
+) -> dict[str, Any]:
+    info = await _build_account_info(
+        db=db,
+        row=row,
+        odds_synced=odds_synced,
+        odds_count=odds_count,
+        odds_message=odds_message,
+    )
+    payload = info.model_dump()
+    payload["shared_market_route"] = await _build_shared_market_route_payload(
+        db,
+        row=row,
+    )
+    return payload
+
+
+async def _resolve_shared_group_for_route(
+    db,
+    *,
+    normalized_url: str,
+    platform_type: str,
+) -> dict[str, Any] | None:
+    group = await shared_market_group_resolve_by_url(
+        db,
+        normalized_url=normalized_url,
+        only_enabled=True,
+    )
+    if group is None:
+        return None
+    collector_platform_type = _normalize_platform_type(
+        group.get("collector_platform_type") or platform_type
+    )
+    if collector_platform_type != _normalize_platform_type(platform_type):
+        return None
+    return group
+
+
+async def _notify_admins_shared_detection_failed(
+    db,
+    *,
+    account: dict,
+    normalized_url: str,
+    platform_type: str,
+    failure_reason: str,
+) -> None:
+    detail = json.dumps(
+        {
+            "shared_group_id": None,
+            "collector_account_name": None,
+            "error_class": "url_detection_failed",
+            "error_text": failure_reason,
+            "consecutive_error_count": 1,
+            "last_success_at": None,
+            "dedupe_key": f"shared_url_detection:{platform_type}:{normalized_url}",
+            "normalized_url": normalized_url,
+            "platform_type": platform_type,
+            "account_id": account.get("id"),
+            "account_name": account.get("account_name"),
+        },
+        sort_keys=True,
+    )
+    admins = await operator_list_all(db)
+    for admin in admins:
+        if admin.get("role") != "admin" or admin.get("status") != "active":
+            continue
+        await alert_create(
+            db,
+            operator_id=int(admin["id"]),
+            type="shared_market_error",
+            level="warning",
+            title="shared url detection failed",
+            detail=detail,
+        )
+
+
+async def _sync_shared_market_routes_on_bind(db, *, account: dict) -> None:
+    normalized_url = normalize_platform_url(account.get("platform_url"))
+    if not normalized_url:
+        return
+
+    for platform_type in _candidate_shared_platform_types(account):
+        normalized_platform_type = _normalize_platform_type(platform_type)
+        group = await _resolve_shared_group_for_route(
+            db,
+            normalized_url=normalized_url,
+            platform_type=normalized_platform_type,
+        )
+        if group is None:
+            await account_shared_route_upsert(
+                db,
+                account_id=int(account["id"]),
+                operator_id=int(account["operator_id"]),
+                platform_type=normalized_platform_type,
+                normalized_url=normalized_url,
+                data_source_state="local",
+            )
+            continue
+
+        await account_shared_route_upsert(
+            db,
+            account_id=int(account["id"]),
+            operator_id=int(account["operator_id"]),
+            platform_type=normalized_platform_type,
+            normalized_url=normalized_url,
+            data_source_state="shared",
+            shared_group_id=int(group["shared_group_id"]),
+        )
+
+
 @router.get("/accounts")
 async def list_accounts(
     operator: dict = Depends(get_current_operator),
     db=Depends(get_db_conn),
 ):
     rows = await account_list_by_operator(db, operator_id=operator["id"])
-    result: list[AccountInfo] = []
+    result: list[dict[str, Any]] = []
     for row in rows:
-        result.append(await _build_account_info(db=db, row=row))
-    return ApiResponse[list[AccountInfo]](data=result)
+        result.append(await _build_account_payload(db=db, row=row))
+    return ApiResponse(data=result)
 
 
 @router.post("/accounts")
@@ -736,8 +970,10 @@ async def bind_account(
             raise BizError(4002, "account already bound", status_code=409)
         raise
 
-    return ApiResponse[AccountInfo](
-        data=await _build_account_info(
+    await _sync_shared_market_routes_on_bind(db, account=row)
+
+    return ApiResponse(
+        data=await _build_account_payload(
             db=db,
             row=row,
             odds_synced=False,
@@ -771,7 +1007,14 @@ async def _run_account_verification_flow(
     account: dict,
     session_runtime: AccountSessionRuntime | None,
 ) -> tuple[dict, list[PlatformCapabilityProbe]]:
-    candidate_platform_types = get_allowed_platform_types(account["game_type"])
+    candidate_platform_types = []
+    seen_platform_types: set[str] = set()
+    for raw_platform_type in get_allowed_platform_types(account["game_type"]):
+        platform_type = _normalize_platform_type(raw_platform_type)
+        if platform_type in seen_platform_types:
+            continue
+        candidate_platform_types.append(platform_type)
+        seen_platform_types.add(platform_type)
     if not candidate_platform_types:
         raise BizError(
             1002,
@@ -868,38 +1111,101 @@ async def _run_account_verification_flow(
 async def _record_shared_market_url(
     request: Request,
     *,
+    db,
     account: dict,
 ) -> None:
+    normalized_url = normalize_platform_url(account.get("platform_url"))
+    if not normalized_url:
+        return
+
     engine = getattr(request.app.state, "engine", None)
     runtime = getattr(engine, "shared_market_runtime", None)
-    if runtime is None:
-        return
+    detection_failure: tuple[str, str] | None = None
 
-    platform_url = account.get("platform_url")
-    if not platform_url:
-        return
-
-    game_type = _safe_text(account.get("game_type"))
-    candidate_platform_types = get_allowed_platform_types(game_type)
-    if not candidate_platform_types:
-        return
-
-    for candidate_platform_type in candidate_platform_types:
-        try:
-            discovered_group_id, _ = await runtime.discover_and_bind_uncovered_url(
-                platform_type=candidate_platform_type,
-                platform_url=platform_url,
-                account_id=int(account.get("id") or 0),
-                sample_raw_url=platform_url,
+    for candidate_platform_type in _candidate_shared_platform_types(account):
+        platform_type = _normalize_platform_type(candidate_platform_type)
+        group = await _resolve_shared_group_for_route(
+            db,
+            normalized_url=normalized_url,
+            platform_type=platform_type,
+        )
+        if group is not None:
+            await account_shared_route_upsert(
+                db,
+                account_id=int(account["id"]),
+                operator_id=int(account["operator_id"]),
+                platform_type=platform_type,
+                normalized_url=normalized_url,
+                data_source_state="shared",
+                shared_group_id=int(group["shared_group_id"]),
             )
+            return
+
+        await account_shared_route_upsert(
+            db,
+            account_id=int(account["id"]),
+            operator_id=int(account["operator_id"]),
+            platform_type=platform_type,
+            normalized_url=normalized_url,
+            data_source_state="local",
+        )
+
+        if runtime is None:
+            detection_failure = (platform_type, "shared_market_runtime_unavailable")
+            break
+
+        try:
+            discovery_result = await runtime.discover_and_bind_uncovered_url(
+                platform_type=platform_type,
+                platform_url=normalized_url,
+                account_id=int(account.get("id") or 0),
+                sample_raw_url=account.get("platform_url"),
+            )
+            discovered_group_id = _discovered_shared_group_id(discovery_result)
             if discovered_group_id is not None:
-                break
-        except Exception:
+                try:
+                    await account_shared_route_mark_pending(
+                        db,
+                        account_id=int(account["id"]),
+                        operator_id=int(account["operator_id"]),
+                        platform_type=platform_type,
+                        normalized_url=normalized_url,
+                        pending_shared_group_id=int(discovered_group_id),
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "shared_market_route_pending_failed account_id=%s platform=%s group_id=%s",
+                        account.get("id"),
+                        platform_type,
+                        discovered_group_id,
+                    )
+                    await _notify_admins_shared_detection_failed(
+                        db,
+                        account=account,
+                        normalized_url=normalized_url,
+                        platform_type=platform_type,
+                        failure_reason=str(exc)[:200],
+                    )
+                return
+
+            detection_failure = (platform_type, "no_shared_group_matched")
+        except Exception as exc:
             logger.exception(
                 "shared_market_discovery_hook_failed account_id=%s platform=%s",
                 account.get("id"),
-                candidate_platform_type,
+                platform_type,
             )
+            detection_failure = (platform_type, str(exc)[:200])
+
+    if detection_failure is not None:
+        platform_type, failure_reason = detection_failure
+        await _notify_admins_shared_detection_failed(
+            db,
+            account=account,
+            normalized_url=normalized_url,
+            platform_type=platform_type,
+            failure_reason=failure_reason,
+        )
 
 
 async def _verify_account(
@@ -908,7 +1214,7 @@ async def _verify_account(
     operator: dict,
     db,
     request: Request,
-) -> ApiResponse[AccountInfo]:
+) -> ApiResponse[dict[str, Any]]:
     account = await account_get_by_id(db, account_id=account_id, operator_id=operator["id"])
     if not account:
         raise BizError(4001, "account not found", status_code=404)
@@ -977,29 +1283,30 @@ async def _verify_account(
         logger.exception("account verification failed account_id=%s", account_id)
         await account_verification_run_fail(
             db,
-            verification_run_id=run["id"],
+            verification_run_id=int(run["id"]),
             run_status="failed",
             stale_reason=(str(exc) or "")[:200],
         )
         raise BizError(4003, f"account verification failed: {exc}", status_code=400)
 
-    payload_capabilities = [
-        {
-            "platform_type": item.platform_type,
-            "verify_status": item.verify_status,
-            "market_state": item.market_state,
-            "detected_issue": item.detected_issue,
-            "last_verified_at": item.last_verified_at,
-            "odds_synced": item.odds_synced,
-            "odds_count": item.odds_count,
-            "odds_message": item.odds_message,
-            "last_error": item.last_error,
+    payload_by_platform: dict[str, dict[str, Any]] = {}
+    for item in capabilities:
+        platform_type = _normalize_probe_platform_type(item.platform_type)
+        payload_by_platform[platform_type] = {
+            "platform_type": platform_type,
+            "verify_status": _safe_text(item.verify_status),
+            "market_state": _safe_text(item.market_state),
+            "detected_issue": None if item.detected_issue is None else _safe_text(item.detected_issue),
+            "last_verified_at": _safe_text(item.last_verified_at),
+            "odds_synced": bool(item.odds_synced),
+            "odds_count": int(item.odds_count or 0),
+            "odds_message": _safe_text(item.odds_message),
+            "last_error": None if item.last_error is None else _safe_text(item.last_error),
         }
-        for item in capabilities
-    ]
+    payload_capabilities = list(payload_by_platform.values())
     await account_verification_run_complete(
         db,
-        verification_run_id=run["id"],
+        verification_run_id=int(run["id"]),
         capabilities=payload_capabilities,
     )
 
@@ -1018,10 +1325,11 @@ async def _verify_account(
 
     await _record_shared_market_url(
         request=request,
+        db=db,
         account=refreshed_row,
     )
-    return ApiResponse[AccountInfo](
-        data=await _build_account_info(
+    return ApiResponse(
+        data=await _build_account_payload(
             db=db,
             row=refreshed_row,
             odds_synced=odds_synced,
@@ -1100,7 +1408,7 @@ async def manual_logout(
     )
     if not row:
         raise BizError(4001, "account not found", status_code=404)
-    return ApiResponse[AccountInfo](data=await _build_account_info(db=db, row=row))
+    return ApiResponse(data=await _build_account_payload(db=db, row=row))
 
 
 @router.post("/accounts/{account_id}/kill-switch")
@@ -1122,4 +1430,4 @@ async def toggle_kill_switch(
     )
     if not row:
         raise BizError(4001, "account not found", status_code=404)
-    return ApiResponse[AccountInfo](data=await _build_account_info(db=db, row=row))
+    return ApiResponse(data=await _build_account_payload(db=db, row=row))

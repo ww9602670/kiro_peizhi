@@ -1,4 +1,4 @@
-﻿"""AccountWorker  
+"""AccountWorker  
 
 Phase 10.1:  AccountWorker EngineManager 
 
@@ -63,6 +63,9 @@ SKIP_THRESHOLD = SAFE_CLOSE_THRESHOLD
 # 
 RESTART_DELAYS = [5, 10, 30]
 MAX_RESTART_FAILURES = 5
+STARTUP_LOGIN_RETRY_DELAYS = [5, 10, 30]
+STARTUP_LOGIN_MAX_RETRIES = 3
+STARTUP_LOGIN_TIMEOUT_SECONDS = 30
 
 # 鍊掕鏃堕┍鍔ㄧ粨绠楅厤缃?
 SETTLEMENT_WAIT_SECONDS_DEFAULT = 30
@@ -134,6 +137,25 @@ class SettlementPendingIssue:
 
 class WorkerStartupError(RuntimeError):
     """Raised when a worker cannot become ready during startup."""
+
+
+def _is_nonretryable_login_error(exc: Exception) -> bool:
+    message = (str(exc) or "").lower()
+    return any(
+        marker in message
+        for marker in (
+            "password",
+            "credential",
+            "invalid account",
+            "account not found",
+            "captcha",
+            "forbidden",
+            "unauthorized",
+            "密码",
+            "账号不存在",
+            "验证码",
+        )
+    )
 
 
 def _parse_result(result_str: str) -> tuple[list[int], int]:
@@ -283,6 +305,120 @@ class AccountWorker:
         self.status = "error"
         self.running = False
         await self._persist_strategy_statuses("error")
+
+    async def _send_startup_login_failure_alert(
+        self,
+        *,
+        reason: str,
+        attempts: int,
+    ) -> None:
+        try:
+            await self.alert_service.send(
+                operator_id=self.operator_id,
+                alert_type="login_fail",
+                title=f"Worker startup login failed after {attempts} attempts",
+                detail=(
+                    f"account_id={self.account_id}, platform={self._platform_type}, "
+                    f"attempts={attempts}, reason={reason[:300]}"
+                ),
+                account_id=self.account_id,
+            )
+        except Exception:
+            logger.exception(
+                "startup login failure alert failed account_id=%d platform=%s",
+                self.account_id,
+                self._platform_type,
+            )
+
+    async def _startup_login_once(self, *, final_attempt: bool = False) -> bool:
+        if self.session_runtime is not None:
+            return await self.session_runtime.ensure_logged_in("worker_startup")
+        if isinstance(self.session, SessionManager):
+            return await self.session.login(
+                max_attempts=1,
+                retry_delays=[],
+                pause_after_failures=0,
+                pause_duration=0,
+                mark_login_error_on_exhausted=final_attempt,
+                alert_on_exhausted=False,
+            )
+        return await self.session.login()
+
+    def _startup_login_failure_reason(self) -> str:
+        reason = getattr(self.session, "last_login_failure_reason", None)
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+        return "session login failed"
+
+    async def _startup_login_with_retry(self) -> bool:
+        total_allowed_attempts = STARTUP_LOGIN_MAX_RETRIES + 1
+        for attempt_index in range(total_allowed_attempts):
+            attempt_no = attempt_index + 1
+            try:
+                login_ok = await asyncio.wait_for(
+                    self._startup_login_once(
+                        final_attempt=attempt_index >= STARTUP_LOGIN_MAX_RETRIES,
+                    ),
+                    timeout=STARTUP_LOGIN_TIMEOUT_SECONDS,
+                )
+                if not login_ok:
+                    reason = self._startup_login_failure_reason()
+                    retryable = not _is_nonretryable_login_error(
+                        WorkerStartupError(reason),
+                    )
+                    last_exc = WorkerStartupError(reason)
+                else:
+                    if attempt_no > 1:
+                        logger.info(
+                            "startup login recovered account_id=%d platform=%s attempt=%d",
+                            self.account_id,
+                            self._platform_type,
+                            attempt_no,
+                        )
+                    return True
+            except asyncio.TimeoutError as exc:
+                reason = f"startup login timeout after {STARTUP_LOGIN_TIMEOUT_SECONDS}s"
+                retryable = True
+                last_exc: Exception = exc
+            except Exception as exc:
+                reason = str(exc) or type(exc).__name__
+                retryable = not _is_nonretryable_login_error(exc)
+                last_exc = exc
+
+            if not retryable:
+                await self._send_startup_login_failure_alert(
+                    reason=reason,
+                    attempts=attempt_no,
+                )
+                raise WorkerStartupError(
+                    f"startup login rejected account_id={self.account_id} "
+                    f"platform={self._platform_type}: {reason}"
+                ) from last_exc
+
+            if attempt_index >= STARTUP_LOGIN_MAX_RETRIES:
+                await self._send_startup_login_failure_alert(
+                    reason=reason,
+                    attempts=attempt_no,
+                )
+                raise WorkerStartupError(
+                    f"startup login failed after retries account_id={self.account_id} "
+                    f"platform={self._platform_type}: {reason}"
+                ) from last_exc
+
+            delay = STARTUP_LOGIN_RETRY_DELAYS[
+                min(attempt_index, len(STARTUP_LOGIN_RETRY_DELAYS) - 1)
+            ]
+            logger.warning(
+                "startup login transient failure account_id=%d platform=%s attempt=%d/%d "
+                "retry_in=%ss reason=%s",
+                self.account_id,
+                self._platform_type,
+                attempt_no,
+                total_allowed_attempts,
+                delay,
+                reason,
+            )
+            await asyncio.sleep(delay)
 
     def add_strategy(
         self,
@@ -1073,10 +1209,7 @@ class AccountWorker:
             self.operator_id,
             self.account_id,
         )
-        if self.session_runtime is not None:
-            login_ok = await self.session_runtime.ensure_logged_in("worker_startup")
-        else:
-            login_ok = await self.session.login()
+        login_ok = await self._startup_login_with_retry()
         if not login_ok:
             raise WorkerStartupError(
                 f"session login failed account_id={self.account_id} platform={self._platform_type}"

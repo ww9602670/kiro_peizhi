@@ -331,6 +331,7 @@
 
 .shared-review-table {
   width: 100%;
+  min-width: 980px;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -351,7 +352,75 @@
 }
 
 .shared-review-url {
+  display: block;
   word-break: break-all;
+}
+
+.shared-cell-main {
+  color: #111827;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.shared-cell-sub {
+  display: block;
+  margin-top: 4px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.shared-status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid #d1d5db;
+  background: #f9fafb;
+  color: #374151;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.shared-status-pill-ok,
+.shared-status-pill-shared,
+.shared-status-pill-success,
+.shared-status-pill-matched {
+  border-color: #86efac;
+  background: #f0fdf4;
+  color: #15803d;
+}
+
+.shared-status-pill-warming,
+.shared-status-pill-detecting,
+.shared-status-pill-shared-pending,
+.shared-status-pill-pending,
+.shared-status-pill-review-required,
+.shared-status-pill-untested {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+}
+
+.shared-status-pill-degraded,
+.shared-status-pill-market-closed,
+.shared-status-pill-local,
+.shared-status-pill-ignored {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.shared-status-pill-failed,
+.shared-status-pill-shared-error-local-fallback {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
 }
 
 .shared-review-actions {
@@ -424,6 +493,7 @@
   .shared-review-table,
   .shared-review-table tbody {
     display: block;
+    min-width: 0;
   }
   .shared-review-table tr {
     display: block;
@@ -451,7 +521,15 @@
     margin-right: 12px;
     text-align: left;
     white-space: nowrap;
-    min-width: 72px;
+    min-width: 96px;
+  }
+  .shared-review-url,
+  .shared-cell-main,
+  .shared-cell-sub {
+    text-align: right;
+  }
+  .mono-url {
+    max-width: 100%;
   }
   .shared-review-table td:last-child {
     border-bottom: none;

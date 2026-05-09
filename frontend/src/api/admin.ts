@@ -15,7 +15,10 @@ import type { AdminDashboard } from '@/types/api/dashboard';
 import type { PagedData } from '@/types/api/common';
 import type {
   OperatorStrategyPermissionInfo,
+  SharedMarketDataSourceState,
+  SharedMarketDetectionStatus,
   SharedMarketGroupInfo,
+  SharedMarketRouteInfo,
   SharedMarketUncoveredUrlInfo,
   StrategyPermissionType,
 } from '@/types/api/strategy';
@@ -86,13 +89,34 @@ export async function listSharedMarketUncoveredUrls(params?: {
   page?: number;
   page_size?: number;
   status?: string;
+  detection_status?: SharedMarketDetectionStatus | string;
 }) {
   const parts: string[] = [];
   if (params?.page !== undefined) parts.push(`page=${params.page}`);
   if (params?.page_size !== undefined) parts.push(`page_size=${params.page_size}`);
   if (params?.status) parts.push(`status=${encodeURIComponent(params.status)}`);
+  if (params?.detection_status) parts.push(`detection_status=${encodeURIComponent(params.detection_status)}`);
   const qs = parts.length > 0 ? `?${parts.join('&')}` : '';
   return request<PagedData<SharedMarketUncoveredUrlInfo>>(`/admin/shared-market-uncovered-urls${qs}`);
+}
+
+export async function listSharedMarketRoutes(params?: {
+  page?: number;
+  page_size?: number;
+  state?: SharedMarketDataSourceState | string;
+  operator_id?: number;
+  account_id?: number;
+  shared_group_id?: number;
+}) {
+  const parts: string[] = [];
+  if (params?.page !== undefined) parts.push(`page=${params.page}`);
+  if (params?.page_size !== undefined) parts.push(`page_size=${params.page_size}`);
+  if (params?.state) parts.push(`state=${encodeURIComponent(params.state)}`);
+  if (params?.operator_id !== undefined) parts.push(`operator_id=${params.operator_id}`);
+  if (params?.account_id !== undefined) parts.push(`account_id=${params.account_id}`);
+  if (params?.shared_group_id !== undefined) parts.push(`shared_group_id=${params.shared_group_id}`);
+  const qs = parts.length > 0 ? `?${parts.join('&')}` : '';
+  return request<PagedData<SharedMarketRouteInfo>>(`/admin/shared-market-routes${qs}`);
 }
 
 export async function ignoreSharedMarketUncoveredUrl(recordId: number) {

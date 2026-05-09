@@ -273,13 +273,18 @@ class SharedMarketUncoveredUrlInfo(BaseModel):
     last_seen_at: str
     hit_count: int
     detection_status: str
+    detection_attempts: int = 0
+    next_detect_at: str | None = None
+    last_checked_at: str | None = None
     last_account_id: int | None = None
     last_platform_type: str | None = None
     sample_raw_url: str | None = None
     status: str
     failure_reason: str | None = None
+    detection_error: str | None = None
     shared_group_id: int | None = None
     shared_group_key: str | None = None
+    matched_shared_group_id: int | None = None
 
 
 class SharedMarketGroupInfo(BaseModel):
@@ -289,6 +294,15 @@ class SharedMarketGroupInfo(BaseModel):
     collector_platform_type: str | None = None
     collector_account_name: str | None = None
     primary_url: str | None = None
+    collector_owner_key: str | None = None
+    collector_health_state: str | None = None
+    collector_last_success_at: str | None = None
+    collector_last_error_at: str | None = None
+    collector_last_error_class: str | None = None
+    collector_last_error: str | None = None
+    collector_consecutive_error_count: int | None = None
+    collector_preheated_at: str | None = None
+    collector_alerted_at: str | None = None
     source_status: str | None = None
     last_error: str | None = None
     snapshot_issue: str | None = None
@@ -296,6 +310,30 @@ class SharedMarketGroupInfo(BaseModel):
     snapshot_open_result: str | None = None
     snapshot_fetched_at: str | None = None
     snapshot_updated_at: str | None = None
+    provider_owner_key: str | None = None
+    provider_kind: str | None = None
+    provider_account_name: str | None = None
+
+
+class SharedMarketRouteInfo(BaseModel):
+    account_id: int
+    operator_id: int | None = None
+    operator_name: str | None = None
+    account_name: str | None = None
+    platform_type: str
+    normalized_url: str | None = None
+    data_source_state: str
+    shared_group_id: int | None = None
+    shared_group_key: str | None = None
+    pending_shared_group_id: int | None = None
+    pending_shared_group_key: str | None = None
+    handoff_after_issue: str | None = None
+    handoff_confirmed_issue: str | None = None
+    fallback_reason: str | None = None
+    last_switch_at: str | None = None
+    last_checked_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
 
 class SharedMarketUncoveredJoinGroupRequest(BaseModel):
     shared_group_id: int

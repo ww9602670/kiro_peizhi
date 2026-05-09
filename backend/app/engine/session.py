@@ -59,6 +59,7 @@ class SessionManager:
         self.login_fail_count = 0
         self.captcha_fail_count = 0
         self._login_error = False
+        self.last_login_failure_reason: str | None = None
 
     def _get_captcha_service(self) -> CaptchaService:
         if self._captcha_service is None:
@@ -79,8 +80,18 @@ class SessionManager:
             last_login_at=self._now() if self.session_token else None,
         )
 
-    async def login(self) -> bool:
+    async def login(
+        self,
+        *,
+        max_attempts: int | None = None,
+        retry_delays: list[int] | None = None,
+        pause_after_failures: int | None = None,
+        pause_duration: int | None = None,
+        mark_login_error_on_exhausted: bool = True,
+        alert_on_exhausted: bool = True,
+    ) -> bool:
         if self._login_error:
+            self.last_login_failure_reason = "login_error"
             logger.warning(
                 "Account %d platform=%s is blocked by login_error",
                 self.account_id,
@@ -88,7 +99,13 @@ class SessionManager:
             )
             return False
 
-        for attempt in range(MAX_LOGIN_ATTEMPTS):
+        self.last_login_failure_reason = None
+        attempt_limit = MAX_LOGIN_ATTEMPTS if max_attempts is None else max(1, int(max_attempts))
+        delays = RETRY_DELAYS if retry_delays is None else list(retry_delays)
+        pause_after = PAUSE_AFTER_FAILURES if pause_after_failures is None else int(pause_after_failures)
+        pause_for = PAUSE_DURATION if pause_duration is None else max(0, int(pause_duration))
+
+        for attempt in range(attempt_limit):
             try:
                 result = await self._attempt_login()
                 if result.success:
@@ -115,6 +132,7 @@ class SessionManager:
                     return True
 
                 self.login_fail_count += 1
+                self.last_login_failure_reason = result.message or "login failed"
                 await self._persist_platform_session(status="login_failed")
                 logger.warning(
                     "Account %d platform=%s login failed on attempt %d: %s",
@@ -125,6 +143,7 @@ class SessionManager:
                 )
             except CaptchaError as exc:
                 self.captcha_fail_count += 1
+                self.last_login_failure_reason = str(exc) or "captcha failed"
                 logger.warning(
                     "Account %d platform=%s captcha failure on attempt %d (%d/%d): %s",
                     self.account_id,
@@ -144,19 +163,21 @@ class SessionManager:
                     )
                     return False
 
-            if attempt < len(RETRY_DELAYS):
-                await asyncio.sleep(RETRY_DELAYS[attempt])
-            if attempt == PAUSE_AFTER_FAILURES - 1:
-                await asyncio.sleep(PAUSE_DURATION)
+            if attempt < len(delays):
+                await asyncio.sleep(delays[attempt])
+            if pause_after > 0 and attempt == pause_after - 1 and pause_for > 0:
+                await asyncio.sleep(pause_for)
 
-        await self._mark_login_error()
-        await self.alert_service.send(
-            operator_id=self.operator_id,
-            alert_type="login_fail",
-            title=f"Login failed {self.login_fail_count} times",
-            detail=f"Account {self.account_name} platform={self.platform_type} reached retry limit",
-            account_id=self.account_id,
-        )
+        if mark_login_error_on_exhausted:
+            await self._mark_login_error()
+        if alert_on_exhausted:
+            await self.alert_service.send(
+                operator_id=self.operator_id,
+                alert_type="login_fail",
+                title=f"Login failed {self.login_fail_count} times",
+                detail=f"Account {self.account_name} platform={self.platform_type} reached retry limit",
+                account_id=self.account_id,
+            )
         return False
 
     async def _attempt_login(self) -> LoginResult:

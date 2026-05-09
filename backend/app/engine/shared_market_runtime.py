@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 
@@ -26,6 +26,8 @@ DEFAULT_COLLECTOR_INTERVAL_SECONDS = 25.0
 DEFAULT_COLLECTOR_ERROR_BACKOFF_SECONDS = 5.0
 DEFAULT_LOCAL_FALLBACK_INTERVAL_SECONDS = 80
 DEFAULT_SHARED_CAPTCHA_LOGIN_ATTEMPTS = 3
+DEFAULT_SHARED_COLLECTOR_ALERT_THRESHOLD = 2
+DEFAULT_SHARED_COLLECTOR_ALERT_COOLDOWN_SECONDS = 30 * 60
 DRAW_FIRST_REFRESH_DELAY_SECONDS = 10.0
 DRAW_PENDING_RETRY_INTERVALS_SECONDS = (10.0, 10.0, 10.0, 5.0, 3.0, 1.0)
 DRAW_WAIT_RETRY_INTERVAL_SECONDS = 10.0
@@ -40,6 +42,16 @@ MARKET_STATE_MARKET_CLOSED = "market_closed"
 DRAW_STATE_NORMAL = "normal"
 DRAW_STATE_PENDING = "draw_pending"
 DRAW_STATE_WAIT_RETRY = "draw_wait_retry"
+
+PROVIDER_KIND_DEDICATED_COLLECTOR = "dedicated_collector"
+PROVIDER_KIND_DETECTOR = "detector"
+PROVIDER_KIND_WORKER = "worker"
+COLLECTOR_HEALTH_OK = "ok"
+COLLECTOR_HEALTH_DEGRADED = "degraded"
+COLLECTOR_HEALTH_FAILED = "failed"
+COLLECTOR_HEALTH_MARKET_CLOSED = "market_closed"
+COLLECTOR_ERROR_MARKET_CLOSED = "market_closed"
+COLLECTOR_ERROR_NO_NEW_DRAW = "no_new_draw"
 
 # Legacy aliases kept for compatibility during rollout.
 PUBLIC_STATE_SHARED_HIT = "shared_hit"
@@ -110,6 +122,37 @@ def _requires_shared_relogin(exc: BaseException) -> bool:
         return True
     message = _safe_text(exc).lower()
     return any(marker in message for marker in _SHARED_RELOGIN_ERROR_MARKERS)
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def classify_shared_collector_error(exc: BaseException) -> str:
+    message = _safe_text(exc).lower()
+    exc_name = type(exc).__name__.lower()
+    combined = f"{exc_name} {message}"
+    if "market_closed" in combined or "market closed" in combined or "停盘" in message:
+        return COLLECTOR_ERROR_MARKET_CLOSED
+    if "no_new_draw" in combined or "no new draw" in combined or "same issue" in combined or "未开奖" in message:
+        return COLLECTOR_ERROR_NO_NEW_DRAW
+    if "password" in combined or "credential" in combined or "密码" in message:
+        return "password_error"
+    if "captcha" in combined or "ocr" in combined or "验证码" in message:
+        return "captcha_failed"
+    if isinstance(exc, RemoteLoginRequired) or "session" in combined or "token" in combined or "unauthorized" in combined:
+        return "session_invalid"
+    if "login" in combined or "auth" in combined or "登录" in message:
+        return "login_failed"
+    if "timeout" in combined or "timed out" in combined or "network" in combined or "connection" in combined:
+        return "network_timeout"
+    if "json" in combined or "parse" in combined or "format" in combined or "schema" in combined or "payload" in combined:
+        return "data_format_error"
+    return "api_error"
+
+
+def _is_alertable_collector_error(error_class: str) -> bool:
+    return error_class not in {COLLECTOR_ERROR_MARKET_CLOSED, COLLECTOR_ERROR_NO_NEW_DRAW}
 
 
 def _login_method_accepts_captcha(login_method: Any) -> bool:
@@ -326,6 +369,43 @@ class SharedMarketSnapshot:
         )
 
 
+@dataclass(slots=True)
+class SharedCollectorPreheatResult:
+    started_count: int = 0
+    already_running_count: int = 0
+    skipped_count: int = 0
+    ok_count: int = 0
+    market_closed_count: int = 0
+    degraded_count: int = 0
+    failed_count: int = 0
+    timeout_count: int = 0
+    details: list[dict[str, Any]] = field(default_factory=list)
+
+    def add_detail(self, detail: dict[str, Any]) -> None:
+        status = _safe_stripped_text(detail.get("status")).lower()
+        if bool(detail.get("collector_started")):
+            self.started_count += 1
+        elif status == "started":
+            self.started_count += 1
+        if bool(detail.get("collector_already_running")):
+            self.already_running_count += 1
+        elif status == "already_running":
+            self.already_running_count += 1
+        if status == "skipped":
+            self.skipped_count += 1
+        elif status == "ok":
+            self.ok_count += 1
+        elif status == "market_closed":
+            self.market_closed_count += 1
+        elif status == "degraded":
+            self.degraded_count += 1
+        elif status == "failed":
+            self.failed_count += 1
+        elif status == "timeout":
+            self.timeout_count += 1
+        self.details.append(detail)
+
+
 class SharedMarketContracts:
     """Frozen db-op contract bridge for shared market runtime."""
 
@@ -368,6 +448,9 @@ class SharedMarketContracts:
         shared_group_id: int,
         install: InstallInfo,
         source_status: str,
+        provider_owner_key: str,
+        provider_kind: str,
+        provider_account_name: str | None = None,
         last_error: str | None = None,
         market_data_state: str | None = None,
         draw_state: str | None = None,
@@ -399,18 +482,9 @@ class SharedMarketContracts:
                     "snapshot_version": snapshot_version,
                     "message_code": message_code,
                     "message_text": message_text,
-                },
-                {
-                    "shared_group_id": shared_group_id,
-                    "installments": install.issue,
-                    "state": install.state,
-                    "close_timestamp": install.close_countdown_sec,
-                    "open_timestamp": install.open_countdown_sec,
-                    "pre_installments": install.pre_issue,
-                    "pre_lottery_result": install.pre_result,
-                    "status": source_status,
-                    "last_error": last_error,
-                    "fetched_at": fetched_at_text,
+                    "provider_owner_key": provider_owner_key,
+                    "provider_kind": provider_kind,
+                    "provider_account_name": provider_account_name,
                 },
             ],
             allow_failure=True,
@@ -421,6 +495,9 @@ class SharedMarketContracts:
         *,
         shared_group_id: int,
         last_error: str,
+        provider_owner_key: str,
+        provider_kind: str,
+        provider_account_name: str | None = None,
         install: InstallInfo | None = None,
     ) -> None:
         if install is not None:
@@ -428,6 +505,9 @@ class SharedMarketContracts:
                 shared_group_id=shared_group_id,
                 install=install,
                 source_status="error",
+                provider_owner_key=provider_owner_key,
+                provider_kind=provider_kind,
+                provider_account_name=provider_account_name,
                 last_error=last_error,
                 market_data_state=MARKET_STATE_SHARED_ERROR,
                 message_code=SHARED_ERROR_MESSAGE_CODE,
@@ -453,18 +533,9 @@ class SharedMarketContracts:
                     "market_data_state": MARKET_STATE_SHARED_ERROR,
                     "message_code": SHARED_ERROR_MESSAGE_CODE,
                     "message_text": SHARED_ERROR_MESSAGE_TEXT,
-                },
-                {
-                    "shared_group_id": shared_group_id,
-                    "installments": None,
-                    "state": None,
-                    "close_timestamp": None,
-                    "open_timestamp": None,
-                    "pre_installments": None,
-                    "pre_lottery_result": None,
-                    "status": "error",
-                    "last_error": last_error,
-                    "fetched_at": fetched_at_text,
+                    "provider_owner_key": provider_owner_key,
+                    "provider_kind": provider_kind,
+                    "provider_account_name": provider_account_name,
                 },
             ],
             allow_failure=True,
@@ -692,6 +763,109 @@ class SharedMarketContracts:
             allow_failure=True,
         )
 
+    async def shared_market_group_success_record(
+        self,
+        *,
+        shared_group_id: int,
+        success_at: str | None = None,
+        health_state: str = COLLECTOR_HEALTH_OK,
+    ) -> dict[str, Any] | None:
+        result = await self._invoke_with_variants(
+            "shared_market_group_success_record",
+            [
+                {
+                    "shared_group_id": shared_group_id,
+                    "success_at": success_at,
+                    "health_state": health_state,
+                },
+                {"shared_group_id": shared_group_id},
+            ],
+            allow_failure=True,
+        )
+        return result if isinstance(result, dict) else None
+
+    async def shared_market_group_error_record(
+        self,
+        *,
+        shared_group_id: int,
+        error_class: str,
+        error_text: str | None = None,
+        failed: bool = False,
+        error_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        result = await self._invoke_with_variants(
+            "shared_market_group_error_record",
+            [
+                {
+                    "shared_group_id": shared_group_id,
+                    "error_class": error_class,
+                    "error_text": error_text,
+                    "failed": failed,
+                    "error_at": error_at,
+                },
+                {
+                    "shared_group_id": shared_group_id,
+                    "error_class": error_class,
+                    "last_error": error_text,
+                    "failed": failed,
+                },
+            ],
+            allow_failure=True,
+        )
+        return result if isinstance(result, dict) else None
+
+    async def shared_market_group_mark_market_closed(
+        self,
+        *,
+        shared_group_id: int,
+        checked_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        result = await self._invoke_with_variants(
+            "shared_market_group_mark_market_closed",
+            [
+                {"shared_group_id": shared_group_id, "checked_at": checked_at},
+                {"shared_group_id": shared_group_id},
+            ],
+            allow_failure=True,
+        )
+        return result if isinstance(result, dict) else None
+
+    async def shared_market_alert_dedupe_get(
+        self,
+        *,
+        dedupe_key: str,
+    ) -> dict[str, Any] | None:
+        result = await self._invoke_with_variants(
+            "shared_market_alert_dedupe_get",
+            [{"dedupe_key": dedupe_key}],
+            allow_failure=True,
+        )
+        return result if isinstance(result, dict) else None
+
+    async def shared_market_alert_dedupe_touch(
+        self,
+        *,
+        dedupe_key: str,
+        shared_group_id: int,
+        error_class: str,
+        last_error: str | None = None,
+        alerted_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        result = await self._invoke_with_variants(
+            "shared_market_alert_dedupe_touch",
+            [
+                {
+                    "dedupe_key": dedupe_key,
+                    "shared_group_id": shared_group_id,
+                    "error_class": error_class,
+                    "last_error": last_error,
+                    "alerted_at": alerted_at,
+                },
+            ],
+            allow_failure=True,
+        )
+        return result if isinstance(result, dict) else None
+
     async def _invoke_with_variants(
         self,
         contract_name: str,
@@ -735,6 +909,9 @@ class _CollectorState:
     stop_event: asyncio.Event
     task: asyncio.Task[None]
     cleanup: Callable[[], Awaitable[None]] | None = None
+    provider_kind: str = PROVIDER_KIND_DEDICATED_COLLECTOR
+    provider_account_name: str | None = None
+    preheat_future: asyncio.Future[dict[str, Any]] | None = None
 
 
 @dataclass(slots=True)
@@ -788,14 +965,27 @@ class SharedMarketRuntime:
         self._collector_error_backoff_seconds = max(0.5, float(collector_error_backoff_seconds))
         self._local_fallback_interval_seconds = DEFAULT_LOCAL_FALLBACK_INTERVAL_SECONDS
         self._collectors: dict[int, _CollectorState] = {}
-        self._shared_error_alerted_group_ids: set[int] = set()
+        self._shared_error_alerted_group_ids: set[int | str] = set()
+        self._collector_error_counts: dict[int, int] = {}
+        self._collector_last_success_at: dict[int, str] = {}
+        self._collector_alert_threshold = DEFAULT_SHARED_COLLECTOR_ALERT_THRESHOLD
+        self._collector_alert_cooldown_seconds = DEFAULT_SHARED_COLLECTOR_ALERT_COOLDOWN_SECONDS
         self._last_local_fallback_at: dict[str, datetime] = {}
         self._last_local_fallback_install: dict[str, InstallInfo] = {}
         self._lock = asyncio.Lock()
 
     async def ensure_enabled_collectors(self) -> int:
-        """Start collectors for enabled shared groups with best-effort config."""
-        started = 0
+        """Start enabled shared collectors without blocking for preheat."""
+        result = await self.preheat_enabled_collectors(timeout_seconds=0)
+        return result.started_count
+
+    async def preheat_enabled_collectors(
+        self,
+        timeout_seconds: float | None = None,
+    ) -> SharedCollectorPreheatResult:
+        """Start dedicated collectors and optionally wait for their first health result."""
+        result = SharedCollectorPreheatResult()
+        wait_entries: list[tuple[asyncio.Future[dict[str, Any]], dict[str, Any]]] = []
         groups = await self._contracts.shared_market_group_list(include_disabled=False)
         for group_row in groups:
             shared_group_id = self._safe_dict_id(group_row, keys=("id", "shared_group_id", "group_id"))
@@ -812,6 +1002,13 @@ class SharedMarketRuntime:
                 account_name=full_group.get("collector_account_name"),
                 account_password=full_group.get("collector_password_enc"),
             ):
+                result.add_detail(
+                    {
+                        "shared_group_id": shared_group_id,
+                        "status": "skipped",
+                        "reason": "shared_detector_account",
+                    },
+                )
                 logger.info(
                     "shared_collector_skip group_id=%d reason=shared_detector_account",
                     shared_group_id,
@@ -822,22 +1019,97 @@ class SharedMarketRuntime:
                 shared_group_id=shared_group_id,
                 shared_group=full_group,
             )
+            provider_account_name = _safe_stripped_text(full_group.get("collector_account_name")) or None
             if fetcher is None:
+                result.add_detail(
+                    {
+                        "shared_group_id": shared_group_id,
+                        "status": "skipped",
+                        "reason": "no_fetcher",
+                    },
+                )
                 logger.info(
                     "shared_collector_skip group_id=%d reason=no_fetcher",
                     shared_group_id,
                 )
                 continue
 
-            await self._ensure_collector(
+            ensure_result = await self._ensure_collector(
                 shared_group_id=shared_group_id,
                 owner_key=owner_key,
                 fetch_local_install=fetcher,
                 cleanup=cleanup,
+                provider_account_name=provider_account_name,
             )
-            started += 1
-        logger.info("shared_collectors_started count=%d", started)
-        return started
+            if isinstance(ensure_result, tuple) and len(ensure_result) == 2:
+                state, started = ensure_result
+            else:
+                state, started = None, True
+            detail = {
+                "shared_group_id": shared_group_id,
+                "provider_owner_key": owner_key,
+                "provider_kind": PROVIDER_KIND_DEDICATED_COLLECTOR,
+                "provider_account_name": provider_account_name,
+                "status": "started" if started else "already_running",
+                "collector_started": started,
+                "collector_already_running": not started,
+            }
+            if state is None:
+                detail["status"] = "skipped"
+                detail["reason"] = "provider_validation_failed"
+                result.add_detail(detail)
+                continue
+            preheat_future = state.preheat_future
+            should_wait = timeout_seconds is None or timeout_seconds > 0
+            if should_wait and preheat_future is not None:
+                wait_entries.append((preheat_future, detail))
+            else:
+                result.add_detail(detail)
+
+        if (timeout_seconds is None or timeout_seconds > 0) and wait_entries:
+            futures = [entry[0] for entry in wait_entries]
+            wait_timeout = None if timeout_seconds is None else float(timeout_seconds)
+            done, pending = await asyncio.wait(futures, timeout=wait_timeout)
+            pending_set = set(pending)
+            for future, detail in wait_entries:
+                if future in pending_set:
+                    detail["status"] = "timeout"
+                    detail["error_class"] = "network_timeout"
+                    detail["error_text"] = f"preheat timeout after {timeout_seconds:g}s"
+                    result.add_detail(detail)
+                    await self._record_collector_error(
+                        shared_group_id=_safe_int(detail.get("shared_group_id"), 0),
+                        provider_owner_key=_safe_stripped_text(detail.get("provider_owner_key")),
+                        provider_account_name=_safe_stripped_text(detail.get("provider_account_name")) or None,
+                        error_class="network_timeout",
+                        error_text=detail["error_text"],
+                        force_failed=True,
+                    )
+                    continue
+                if future not in done:
+                    result.add_detail(detail)
+                    continue
+                try:
+                    preheat_detail = future.result()
+                except Exception as exc:
+                    preheat_detail = {
+                        "status": "failed",
+                        "error_class": classify_shared_collector_error(exc),
+                        "error_text": _safe_text(exc)[:500] or type(exc).__name__,
+                    }
+                detail.update(preheat_detail)
+                result.add_detail(detail)
+
+        logger.info(
+            "shared_collectors_preheat started=%d ok=%d market_closed=%d failed=%d timeout=%d skipped=%d",
+            result.started_count,
+            result.ok_count,
+            result.market_closed_count,
+            result.failed_count,
+            result.timeout_count,
+            result.skipped_count,
+        )
+        return result
 
     async def discover_and_bind_uncovered_url(
         self,
@@ -889,12 +1161,6 @@ class SharedMarketRuntime:
                 shared_group_id=discovered_group_id,
                 normalized_url=normalized_url,
             )
-            if install is not None:
-                await self._contracts.snapshot_upsert(
-                    shared_group_id=discovered_group_id,
-                    install=install,
-                    source_status="ok",
-                )
             logger.info(
                 "shared_url_matched platform_type=%s group_id=%d normalized_url=%s",
                 platform_type,
@@ -941,9 +1207,10 @@ class SharedMarketRuntime:
         *,
         market_data_state: str | None = None,
         draw_state: str | None = None,
+        data_source_state: str = "shared",
     ) -> InstallInfo:
         install = snapshot.to_install()
-        return _attach_market_data_state(
+        install = _attach_market_data_state(
             install,
             market_data_state or snapshot.market_data_state,
             draw_state=draw_state or snapshot.draw_state,
@@ -953,6 +1220,9 @@ class SharedMarketRuntime:
             message_code=snapshot.message_code,
             message_text=snapshot.message_text,
         )
+        setattr(install, "data_source_state", data_source_state)
+        setattr(install, "shared_group_id", snapshot.shared_group_id)
+        return install
 
     def _local_fallback_key(self, *, owner_key: str, shared_group_id: int) -> str:
         account_id = self._extract_account_id(owner_key)
@@ -970,6 +1240,20 @@ class SharedMarketRuntime:
             return False
         normalized_market_state = normalize_shared_market_state(market_data_state)
         return normalized_market_state in {MARKET_STATE_SHARED_ERROR, MARKET_STATE_SHARED_STALE}
+
+    def _attach_source_metadata(
+        self,
+        install: InstallInfo,
+        *,
+        data_source_state: str,
+        shared_group_id: int | None = None,
+        fallback_reason: str | None = None,
+    ) -> InstallInfo:
+        setattr(install, "data_source_state", data_source_state)
+        setattr(install, "shared_group_id", shared_group_id)
+        if fallback_reason:
+            setattr(install, "fallback_reason", fallback_reason)
+        return install
 
     def _is_market_closed_install(self, install: InstallInfo) -> bool:
         state = _safe_int(getattr(install, "state", 0), 0)
@@ -994,7 +1278,14 @@ class SharedMarketRuntime:
         normalized_url = normalize_market_url(platform_url)
         if not normalized_url:
             install = await fetch_local_install()
-            return _attach_market_data_state(install, PUBLIC_STATE_LOCAL_FALLBACK)
+            return _attach_market_data_state(
+                self._attach_source_metadata(
+                    install,
+                    data_source_state="local",
+                    fallback_reason="invalid_url",
+                ),
+                PUBLIC_STATE_LOCAL_FALLBACK,
+            )
 
         shared_group_id = await self._contracts.group_resolve_by_url(
             platform_type=platform_type,
@@ -1013,64 +1304,35 @@ class SharedMarketRuntime:
                 account_id=self._extract_account_id(owner_key),
             )
             if discovered_group_id is not None:
-                await self._ensure_collector(
+                if discovered_install is not None:
+                    logger.info(
+                        "shared_url_discovered_detector_install_ignored group_id=%d owner=%s",
+                        discovered_group_id,
+                        owner_key,
+                    )
+                return await self._fallback_local(
                     shared_group_id=discovered_group_id,
                     owner_key=owner_key,
+                    reason="discovered_pending_handoff",
                     fetch_local_install=fetch_local_install,
-                )
-                if discovered_install is not None:
-                    return _attach_market_data_state(discovered_install, MARKET_STATE_SHARED_OK)
-                snapshot = await self._contracts.snapshot_get_latest(
-                    shared_group_id=discovered_group_id,
-                )
-                if snapshot is None:
-                    return await self._fallback_local(
-                        shared_group_id=discovered_group_id,
-                        owner_key=owner_key,
-                        reason="discovered_no_snapshot",
-                        fetch_local_install=fetch_local_install,
-                        market_data_state=MARKET_STATE_SHARED_STALE,
-                    )
-
-                draw_state = normalize_draw_state(snapshot.draw_state)
-                market_data_state = self._effective_snapshot_market_data_state(snapshot)
-                if draw_state in {DRAW_STATE_PENDING, DRAW_STATE_WAIT_RETRY}:
-                    return self._snapshot_install_with_state(
-                        snapshot,
-                        market_data_state=market_data_state,
-                        draw_state=draw_state,
-                    )
-                if self._can_use_local_fallback(
-                    market_data_state=market_data_state,
-                    draw_state=draw_state,
-                ):
-                    return await self._fallback_local(
-                        shared_group_id=discovered_group_id,
-                        owner_key=owner_key,
-                        reason=f"discovered_{market_data_state}",
-                        fetch_local_install=fetch_local_install,
-                        market_data_state=market_data_state,
-                        draw_state=draw_state,
-                        snapshot_fallback=snapshot,
-                    )
-                return self._snapshot_install_with_state(
-                    snapshot,
-                    market_data_state=market_data_state,
-                    draw_state=draw_state,
+                    market_data_state=MARKET_STATE_SHARED_STALE,
+                    data_source_state="shared_pending",
                 )
 
             install = await fetch_local_install()
-            return _attach_market_data_state(install, PUBLIC_STATE_LOCAL_FALLBACK)
+            return _attach_market_data_state(
+                self._attach_source_metadata(
+                    install,
+                    data_source_state="local",
+                    fallback_reason="shared_group_miss",
+                ),
+                PUBLIC_STATE_LOCAL_FALLBACK,
+            )
 
         logger.info(
             "shared_group_hit group_id=%d platform_type=%s",
             shared_group_id,
             platform_type,
-        )
-        await self._ensure_collector(
-            shared_group_id=shared_group_id,
-            owner_key=owner_key,
-            fetch_local_install=fetch_local_install,
         )
 
         snapshot = await self._contracts.snapshot_get_latest(shared_group_id=shared_group_id)
@@ -1128,6 +1390,7 @@ class SharedMarketRuntime:
         market_data_state: str = MARKET_STATE_SHARED_ERROR,
         draw_state: str = DRAW_STATE_NORMAL,
         snapshot_fallback: SharedMarketSnapshot | None = None,
+        data_source_state: str = "shared_error_local_fallback",
     ) -> InstallInfo:
         fallback_key = self._local_fallback_key(
             owner_key=owner_key,
@@ -1141,7 +1404,12 @@ class SharedMarketRuntime:
                 cached_install = self._last_local_fallback_install.get(fallback_key)
                 if cached_install is not None:
                     return _attach_market_data_state(
-                        cached_install,
+                        self._attach_source_metadata(
+                            cached_install,
+                            data_source_state=data_source_state,
+                            shared_group_id=shared_group_id,
+                            fallback_reason=reason,
+                        ),
                         market_data_state,
                         draw_state=draw_state,
                     )
@@ -1150,6 +1418,7 @@ class SharedMarketRuntime:
                         snapshot_fallback,
                         market_data_state=market_data_state,
                         draw_state=draw_state,
+                        data_source_state=data_source_state,
                     )
 
         logger.info(
@@ -1162,7 +1431,12 @@ class SharedMarketRuntime:
         self._last_local_fallback_at[fallback_key] = now
         self._last_local_fallback_install[fallback_key] = install
         return _attach_market_data_state(
-            install,
+            self._attach_source_metadata(
+                install,
+                data_source_state=data_source_state,
+                shared_group_id=shared_group_id,
+                fallback_reason=reason,
+            ),
             market_data_state,
             draw_state=draw_state,
         )
@@ -1325,29 +1599,52 @@ class SharedMarketRuntime:
         owner_key: str,
         fetch_local_install: Callable[[], Awaitable[InstallInfo]],
         cleanup: Callable[[], Awaitable[None]] | None = None,
-    ) -> None:
+        provider_account_name: str | None = None,
+    ) -> tuple[_CollectorState | None, bool]:
+        if not self._is_dedicated_provider(
+            shared_group_id=shared_group_id,
+            provider_owner_key=owner_key,
+            provider_kind=PROVIDER_KIND_DEDICATED_COLLECTOR,
+        ):
+            logger.critical(
+                "shared_snapshot_provider_rejected group_id=%d owner=%s provider_kind=%s",
+                shared_group_id,
+                owner_key,
+                PROVIDER_KIND_DEDICATED_COLLECTOR,
+            )
+            return None, False
+
         async with self._lock:
             existing = self._collectors.get(shared_group_id)
             if existing and not existing.task.done():
-                return
+                return existing, False
 
             stop_event = asyncio.Event()
+            preheat_future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
             task = asyncio.create_task(
                 self._collector_loop(
                     shared_group_id=shared_group_id,
                     owner_key=owner_key,
+                    provider_kind=PROVIDER_KIND_DEDICATED_COLLECTOR,
+                    provider_account_name=provider_account_name,
                     stop_event=stop_event,
                     fetch_local_install=fetch_local_install,
+                    preheat_future=preheat_future,
                 ),
                 name=f"shared-market-collector-{shared_group_id}",
             )
-            self._collectors[shared_group_id] = _CollectorState(
+            state = _CollectorState(
                 shared_group_id=shared_group_id,
                 owner_key=owner_key,
                 stop_event=stop_event,
                 task=task,
                 cleanup=cleanup,
+                provider_kind=PROVIDER_KIND_DEDICATED_COLLECTOR,
+                provider_account_name=provider_account_name,
+                preheat_future=preheat_future,
             )
+            self._collectors[shared_group_id] = state
+            return state, True
 
     async def _stop_collectors(
         self,
@@ -1385,6 +1682,235 @@ class SharedMarketRuntime:
                         state.owner_key,
                     )
 
+    def _is_dedicated_provider(
+        self,
+        *,
+        shared_group_id: int,
+        provider_owner_key: str,
+        provider_kind: str,
+    ) -> bool:
+        if provider_kind != PROVIDER_KIND_DEDICATED_COLLECTOR:
+            return False
+        expected_owner = f"shared-group-{shared_group_id}"
+        return _safe_stripped_text(provider_owner_key) == expected_owner
+
+    async def _call_contract_method(self, method_name: str, **kwargs: Any) -> Any:
+        method = getattr(self._contracts, method_name, None)
+        if not callable(method):
+            return None
+        try:
+            result = method(**kwargs)
+        except TypeError:
+            if isinstance(self._contracts, SharedMarketContracts):
+                raise
+            legacy_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"provider_owner_key", "provider_kind", "provider_account_name"}
+            }
+            if legacy_kwargs == kwargs:
+                raise
+            result = method(**legacy_kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _snapshot_upsert_dedicated(
+        self,
+        *,
+        shared_group_id: int,
+        install: InstallInfo,
+        source_status: str,
+        provider_owner_key: str,
+        provider_kind: str,
+        provider_account_name: str | None = None,
+        last_error: str | None = None,
+        market_data_state: str | None = None,
+        draw_state: str | None = None,
+        next_normal_refresh_at: str | None = None,
+        next_draw_retry_at: str | None = None,
+        snapshot_version: int | None = None,
+        message_code: str | None = None,
+        message_text: str | None = None,
+    ) -> None:
+        if not self._is_dedicated_provider(
+            shared_group_id=shared_group_id,
+            provider_owner_key=provider_owner_key,
+            provider_kind=provider_kind,
+        ):
+            logger.critical(
+                "shared_snapshot_write_rejected group_id=%d owner=%s provider_kind=%s",
+                shared_group_id,
+                provider_owner_key,
+                provider_kind,
+            )
+            raise RuntimeError("shared snapshot provider rejected")
+        if not callable(getattr(self._contracts, "snapshot_upsert", None)):
+            raise RuntimeError("shared snapshot contract missing")
+        await self._call_contract_method(
+            "snapshot_upsert",
+            shared_group_id=shared_group_id,
+            install=install,
+            source_status=source_status,
+            provider_owner_key=provider_owner_key,
+            provider_kind=provider_kind,
+            provider_account_name=provider_account_name,
+            last_error=last_error,
+            market_data_state=market_data_state,
+            draw_state=draw_state,
+            next_normal_refresh_at=next_normal_refresh_at,
+            next_draw_retry_at=next_draw_retry_at,
+            snapshot_version=snapshot_version,
+            message_code=message_code,
+            message_text=message_text,
+        )
+
+    async def _snapshot_mark_error_dedicated(
+        self,
+        *,
+        shared_group_id: int,
+        last_error: str,
+        provider_owner_key: str,
+        provider_kind: str,
+        provider_account_name: str | None = None,
+        install: InstallInfo | None = None,
+    ) -> None:
+        if not self._is_dedicated_provider(
+            shared_group_id=shared_group_id,
+            provider_owner_key=provider_owner_key,
+            provider_kind=provider_kind,
+        ):
+            logger.critical(
+                "shared_snapshot_error_write_rejected group_id=%d owner=%s provider_kind=%s",
+                shared_group_id,
+                provider_owner_key,
+                provider_kind,
+            )
+            return
+        if not callable(getattr(self._contracts, "snapshot_mark_error", None)):
+            return
+        await self._call_contract_method(
+            "snapshot_mark_error",
+            shared_group_id=shared_group_id,
+            last_error=last_error,
+            provider_owner_key=provider_owner_key,
+            provider_kind=provider_kind,
+            provider_account_name=provider_account_name,
+            install=install,
+        )
+
+    def _complete_preheat(
+        self,
+        preheat_future: asyncio.Future[dict[str, Any]] | None,
+        *,
+        status: str,
+        error_class: str | None = None,
+        error_text: str | None = None,
+        consecutive_count: int | None = None,
+    ) -> None:
+        if preheat_future is None or preheat_future.done():
+            return
+        detail: dict[str, Any] = {"status": status}
+        if error_class:
+            detail["error_class"] = error_class
+        if error_text:
+            detail["error_text"] = error_text
+        if consecutive_count is not None:
+            detail["consecutive_count"] = consecutive_count
+        preheat_future.set_result(detail)
+
+    async def _record_collector_success(
+        self,
+        *,
+        shared_group_id: int,
+        health_state: str = COLLECTOR_HEALTH_OK,
+    ) -> None:
+        at = _now_text()
+        self._collector_error_counts.pop(shared_group_id, None)
+        self._collector_last_success_at[shared_group_id] = at
+        alert_prefix = f"shared_collector:{shared_group_id}:"
+        self._shared_error_alerted_group_ids = {
+            key
+            for key in self._shared_error_alerted_group_ids
+            if key != shared_group_id and not (_safe_text(key).startswith(alert_prefix))
+        }
+        await self._call_contract_method(
+            "shared_market_group_success_record",
+            shared_group_id=shared_group_id,
+            success_at=at,
+            health_state=health_state,
+        )
+
+    async def _record_collector_market_closed(self, *, shared_group_id: int) -> None:
+        at = _now_text()
+        self._collector_error_counts.pop(shared_group_id, None)
+        self._collector_last_success_at[shared_group_id] = at
+        alert_prefix = f"shared_collector:{shared_group_id}:"
+        self._shared_error_alerted_group_ids = {
+            key
+            for key in self._shared_error_alerted_group_ids
+            if key != shared_group_id and not (_safe_text(key).startswith(alert_prefix))
+        }
+        await self._call_contract_method(
+            "shared_market_group_mark_market_closed",
+            shared_group_id=shared_group_id,
+            checked_at=at,
+        )
+
+    async def _record_collector_error(
+        self,
+        *,
+        shared_group_id: int,
+        provider_owner_key: str,
+        provider_account_name: str | None,
+        error_class: str,
+        error_text: str,
+        force_failed: bool = False,
+    ) -> tuple[bool, int]:
+        current_count = self._collector_error_counts.get(shared_group_id, 0)
+        group_row = await self._call_contract_method(
+            "shared_market_group_get",
+            shared_group_id=shared_group_id,
+        )
+        if isinstance(group_row, dict):
+            current_count = max(
+                current_count,
+                _safe_int(group_row.get("collector_consecutive_error_count"), 0),
+            )
+        consecutive_count = current_count + 1
+        self._collector_error_counts[shared_group_id] = consecutive_count
+        failed = force_failed or consecutive_count >= self._collector_alert_threshold
+        updated_row = await self._call_contract_method(
+            "shared_market_group_error_record",
+            shared_group_id=shared_group_id,
+            error_class=error_class,
+            error_text=error_text,
+            failed=failed,
+            error_at=_now_text(),
+        )
+        if isinstance(updated_row, dict):
+            consecutive_count = max(
+                consecutive_count,
+                _safe_int(updated_row.get("collector_consecutive_error_count"), consecutive_count),
+            )
+        if failed and _is_alertable_collector_error(error_class):
+            last_success_at = self._collector_last_success_at.get(shared_group_id)
+            if isinstance(updated_row, dict):
+                last_success_at = (
+                    _safe_stripped_text(updated_row.get("collector_last_success_at"))
+                    or last_success_at
+                )
+            await self._notify_admin_shared_error(
+                shared_group_id=shared_group_id,
+                owner_key=provider_owner_key,
+                provider_account_name=provider_account_name,
+                error_class=error_class,
+                error_text=error_text,
+                consecutive_count=consecutive_count,
+                last_success_at=last_success_at,
+            )
+        return failed, consecutive_count
+
     async def _collector_loop(
         self,
         *,
@@ -1392,7 +1918,29 @@ class SharedMarketRuntime:
         owner_key: str,
         stop_event: asyncio.Event,
         fetch_local_install: Callable[[], Awaitable[InstallInfo]],
+        provider_kind: str = PROVIDER_KIND_DEDICATED_COLLECTOR,
+        provider_account_name: str | None = None,
+        preheat_future: asyncio.Future[dict[str, Any]] | None = None,
     ) -> None:
+        if not self._is_dedicated_provider(
+            shared_group_id=shared_group_id,
+            provider_owner_key=owner_key,
+            provider_kind=provider_kind,
+        ):
+            logger.critical(
+                "shared_collector_provider_rejected group_id=%d owner=%s provider_kind=%s",
+                shared_group_id,
+                owner_key,
+                provider_kind,
+            )
+            self._complete_preheat(
+                preheat_future,
+                status="failed",
+                error_class="provider_rejected",
+                error_text="shared snapshot provider rejected",
+            )
+            return
+
         last_install: Optional[InstallInfo] = None
         draw_refresh = _DrawRefreshState()
         while not stop_event.is_set():
@@ -1439,36 +1987,79 @@ class SharedMarketRuntime:
                         )
                         next_normal_refresh_at = now + timedelta(seconds=sleep_seconds)
 
-                await self._contracts.snapshot_upsert(
+                await self._snapshot_upsert_dedicated(
                     shared_group_id=shared_group_id,
                     install=install,
                     source_status="ok",
+                    provider_owner_key=owner_key,
+                    provider_kind=provider_kind,
+                    provider_account_name=provider_account_name,
                     market_data_state=market_data_state,
                     draw_state=draw_state,
                     next_normal_refresh_at=_format_refresh_at(next_normal_refresh_at),
                     next_draw_retry_at=_format_refresh_at(next_draw_retry_at),
                 )
-                self._shared_error_alerted_group_ids.discard(shared_group_id)
+                if market_data_state == MARKET_STATE_MARKET_CLOSED:
+                    await self._record_collector_market_closed(
+                        shared_group_id=shared_group_id,
+                    )
+                    self._complete_preheat(preheat_future, status="market_closed")
+                else:
+                    await self._record_collector_success(
+                        shared_group_id=shared_group_id,
+                    )
+                    self._complete_preheat(preheat_future, status="ok")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 error_text = _safe_text(exc)[:500] or type(exc).__name__
+                error_class = classify_shared_collector_error(exc)
                 logger.exception(
-                    "shared_collector_error group_id=%d owner=%s",
+                    "shared_collector_error group_id=%d owner=%s class=%s",
                     shared_group_id,
                     owner_key,
+                    error_class,
                 )
                 draw_refresh.reset()
-                await self._contracts.snapshot_mark_error(
-                    shared_group_id=shared_group_id,
-                    install=last_install,
-                    last_error=error_text,
-                )
-                await self._notify_admin_shared_error(
-                    shared_group_id=shared_group_id,
-                    owner_key=owner_key,
-                    error_text=error_text,
-                )
+                if error_class == COLLECTOR_ERROR_MARKET_CLOSED:
+                    await self._record_collector_market_closed(
+                        shared_group_id=shared_group_id,
+                    )
+                    self._complete_preheat(preheat_future, status="market_closed")
+                elif error_class == COLLECTOR_ERROR_NO_NEW_DRAW:
+                    await self._record_collector_success(
+                        shared_group_id=shared_group_id,
+                        health_state=COLLECTOR_HEALTH_OK,
+                    )
+                    self._complete_preheat(
+                        preheat_future,
+                        status="ok",
+                        error_class=error_class,
+                        error_text=error_text,
+                    )
+                else:
+                    await self._snapshot_mark_error_dedicated(
+                        shared_group_id=shared_group_id,
+                        install=last_install,
+                        last_error=error_text,
+                        provider_owner_key=owner_key,
+                        provider_kind=provider_kind,
+                        provider_account_name=provider_account_name,
+                    )
+                    failed, consecutive_count = await self._record_collector_error(
+                        shared_group_id=shared_group_id,
+                        provider_owner_key=owner_key,
+                        provider_account_name=provider_account_name,
+                        error_class=error_class,
+                        error_text=error_text,
+                    )
+                    self._complete_preheat(
+                        preheat_future,
+                        status="failed" if failed else "degraded",
+                        error_class=error_class,
+                        error_text=error_text,
+                        consecutive_count=consecutive_count,
+                    )
                 sleep_seconds = self._collector_error_backoff_seconds
 
             try:
@@ -1482,16 +2073,59 @@ class SharedMarketRuntime:
         shared_group_id: int,
         owner_key: str,
         error_text: str,
+        provider_account_name: str | None = None,
+        error_class: str = "api_error",
+        consecutive_count: int = 1,
+        last_success_at: str | None = None,
     ) -> None:
-        if shared_group_id in self._shared_error_alerted_group_ids:
+        dedupe_key = f"shared_collector:{shared_group_id}:{error_class}"
+        dedupe_row = await self._call_contract_method(
+            "shared_market_alert_dedupe_get",
+            dedupe_key=dedupe_key,
+        )
+        if isinstance(dedupe_row, dict):
+            last_alert_at = _parse_fetched_at(dedupe_row.get("last_alert_at"))
+            if last_alert_at is not None:
+                now = datetime.now(last_alert_at.tzinfo) if last_alert_at.tzinfo else datetime.now()
+                if (now - last_alert_at).total_seconds() < self._collector_alert_cooldown_seconds:
+                    logger.info(
+                        "shared_collector_admin_alert_deduped group_id=%d error_class=%s",
+                        shared_group_id,
+                        error_class,
+                    )
+                    return
+        elif (
+            dedupe_key in self._shared_error_alerted_group_ids
+            and shared_group_id in self._shared_error_alerted_group_ids
+        ):
             return
+        self._shared_error_alerted_group_ids.add(dedupe_key)
         self._shared_error_alerted_group_ids.add(shared_group_id)
 
         logger.warning(
-            "shared_collector_admin_alert_triggered group_id=%d owner=%s error=%s",
+            "shared_collector_admin_alert_triggered group_id=%d owner=%s class=%s count=%d error=%s",
             shared_group_id,
             owner_key,
+            error_class,
+            consecutive_count,
             error_text,
+        )
+        await self._call_contract_method(
+            "shared_market_alert_dedupe_touch",
+            dedupe_key=dedupe_key,
+            shared_group_id=shared_group_id,
+            error_class=error_class,
+            last_error=error_text,
+            alerted_at=_now_text(),
+        )
+        detail = (
+            f"shared_group_id={shared_group_id}\n"
+            f"provider_owner_key={owner_key}\n"
+            f"provider_account_name={provider_account_name or ''}\n"
+            f"error_class={error_class}\n"
+            f"consecutive_count={consecutive_count}\n"
+            f"last_success_at={last_success_at or ''}\n"
+            f"last_error={error_text}"
         )
         try:
             admin_ids = await self._contracts.active_admin_operator_ids()
@@ -1499,7 +2133,7 @@ class SharedMarketRuntime:
                 await self._contracts.admin_alert_create(
                     operator_id=operator_id,
                     title=SHARED_ERROR_MESSAGE_TEXT,
-                    detail="",
+                    detail=detail,
                 )
         except Exception:
             logger.exception(
@@ -1524,7 +2158,15 @@ class SharedMarketRuntime:
         )
         account_name = _safe_stripped_text(shared_group.get("collector_account_name"))
         account_password = _safe_stripped_text(shared_group.get("collector_password_enc"))
-        owner_key = _safe_stripped_text(shared_group.get("owner_key")) or f"shared-group-{shared_group_id}"
+        configured_owner_key = _safe_stripped_text(shared_group.get("owner_key"))
+        owner_key = f"shared-group-{shared_group_id}"
+        if configured_owner_key and configured_owner_key != owner_key:
+            logger.warning(
+                "shared_collector_owner_normalized group_id=%d configured_owner=%s provider_owner=%s",
+                shared_group_id,
+                configured_owner_key,
+                owner_key,
+            )
 
         from app.engine.adapters.factory import create_platform_adapter
 

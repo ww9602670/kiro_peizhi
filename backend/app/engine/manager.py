@@ -304,6 +304,9 @@ class EngineManager:
             shared_market_owner_key=shared_owner_key,
             shared_market_platform_type=runtime_key[1],
             shared_market_platform_url=platform_url or getattr(adapter, "base_url", None),
+            db=self.db,
+            operator_id=operator_id,
+            account_id=account_id,
         )
         risk = RiskController(
             db=self.db,
@@ -583,6 +586,9 @@ class EngineManager:
         poller = getattr(worker, "poller", None)
         owner_key = str(getattr(poller, "shared_market_owner_key", "") or "")
         if not owner_key:
+            return
+        if owner_key.startswith("shared-group-"):
+            logger.info("skip shared collector release owner=%s", owner_key)
             return
         try:
             await self.shared_market_runtime.release_owner(owner_key)

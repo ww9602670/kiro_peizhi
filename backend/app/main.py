@@ -1,6 +1,7 @@
 """FastAPI app entrypoint."""
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -35,6 +36,19 @@ from app.utils.auth import restore_sessions
 from app.utils.captcha import shutdown_shared_captcha_service
 from app.utils.response import register_exception_handlers
 
+DEFAULT_SHARED_COLLECTOR_PREHEAT_TIMEOUT_SECONDS = 30.0
+
+
+def _shared_collector_preheat_timeout_seconds() -> float:
+    raw_value = os.environ.get("BOCAI_SHARED_COLLECTOR_PREHEAT_TIMEOUT_SEC")
+    if raw_value is None:
+        return DEFAULT_SHARED_COLLECTOR_PREHEAT_TIMEOUT_SECONDS
+    try:
+        return max(0.0, float(raw_value))
+    except (TypeError, ValueError):
+        return DEFAULT_SHARED_COLLECTOR_PREHEAT_TIMEOUT_SECONDS
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -60,21 +74,34 @@ async def lifespan(app: FastAPI):
         bocai_db_path=BOCAI_DB_PATH,
     )
 
-    logger.info("restoring workers")
+    logger.info("preparing worker restore")
     await account_platform_session_clear_locks(db)
     logger.info("cleared stale worker locks")
+
+    try:
+        shared_runtime = engine.shared_market_runtime
+        preheat_enabled_collectors = getattr(
+            shared_runtime,
+            "preheat_enabled_collectors",
+            None,
+        )
+        if callable(preheat_enabled_collectors):
+            preheat_result = await preheat_enabled_collectors(
+                timeout_seconds=_shared_collector_preheat_timeout_seconds(),
+            )
+            started_collectors = getattr(preheat_result, "started_count", preheat_result)
+            logger.info("shared_collectors_preheated=%s", preheat_result)
+        else:
+            started_collectors = await shared_runtime.ensure_enabled_collectors()
+        logger.info("shared_collectors_started=%d", int(started_collectors or 0))
+    except Exception:
+        logger.exception("preheat shared collectors failed")
 
     if BOCAI_RESTORE_WORKERS_ON_STARTUP:
         restored = await engine.restore_workers_on_startup()
         logger.info("restored_workers=%d", restored)
     else:
         logger.info("worker restore on startup is disabled")
-
-    try:
-        started_collectors = await engine.shared_market_runtime.ensure_enabled_collectors()
-        logger.info("shared_collectors_started=%d", started_collectors)
-    except Exception:
-        logger.exception("restore shared collectors failed")
 
     await engine.start_health_check(admin_operator_id=1)
     logger.info("backend ready")

@@ -15,6 +15,7 @@ import {
   updateOperatorStrategyPermissions,
   listSharedMarketUncoveredUrls,
   listSharedMarketGroups,
+  listSharedMarketRoutes,
   ignoreSharedMarketUncoveredUrl,
   recheckSharedMarketUncoveredUrl,
   joinSharedMarketUncoveredUrlGroup,
@@ -24,6 +25,7 @@ import type { OperatorInfo } from '@/types/api/operator';
 import type {
   OperatorStrategyPermissionInfo,
   SharedMarketGroupInfo,
+  SharedMarketRouteInfo,
   SharedMarketUncoveredUrlInfo,
   StrategyPermissionType,
 } from '@/types/api/strategy';
@@ -67,13 +69,19 @@ export default function Operators() {
 
   // 共享网址待审核
   const [sharedReviewLoading, setSharedReviewLoading] = useState(false);
+  const [sharedGroupError, setSharedGroupError] = useState('');
   const [sharedReviewError, setSharedReviewError] = useState('');
   const [sharedMarketUncoveredRows, setSharedMarketUncoveredRows] = useState<SharedMarketUncoveredUrlInfo[]>([]);
   const [sharedMarketGroups, setSharedMarketGroups] = useState<SharedMarketGroupInfo[]>([]);
+  const [sharedMarketRoutes, setSharedMarketRoutes] = useState<SharedMarketRouteInfo[]>([]);
+  const [sharedRouteError, setSharedRouteError] = useState('');
   const [sharedReviewActionLoadingId, setSharedReviewActionLoadingId] = useState<number | null>(null);
   const [sharedReviewPage, setSharedReviewPage] = useState(1);
   const [sharedReviewTotal, setSharedReviewTotal] = useState(0);
   const [sharedReviewPageSize] = useState(10);
+  const [sharedRoutePage, setSharedRoutePage] = useState(1);
+  const [sharedRouteTotal, setSharedRouteTotal] = useState(0);
+  const [sharedRoutePageSize] = useState(10);
   const [sharedJoinSelection, setSharedJoinSelection] = useState<Record<number, string>>({});
 
   const load = useCallback(async () => {
@@ -118,16 +126,18 @@ export default function Operators() {
 
   const loadSharedMarketReview = useCallback(async () => {
     setSharedReviewLoading(true);
+    setSharedGroupError('');
     setSharedReviewError('');
+    setSharedRouteError('');
 
     try {
       const groupRes = await listSharedMarketGroups();
       setSharedMarketGroups(groupRes.data ?? []);
     } catch (err) {
       if (isApiError(err)) {
-        showToast(`加载共享组失败：${err.message}`);
+        setSharedGroupError(err.message);
       } else {
-        showToast('加载共享组失败');
+        setSharedGroupError('加载共享采集账号失败');
       }
       setSharedMarketGroups([]);
     }
@@ -136,7 +146,6 @@ export default function Operators() {
       const res = await listSharedMarketUncoveredUrls({
         page: sharedReviewPage,
         page_size: sharedReviewPageSize,
-        status: 'pending',
       });
       if (res.data) {
         setSharedMarketUncoveredRows(res.data.items);
@@ -150,10 +159,29 @@ export default function Operators() {
       }
       setSharedMarketUncoveredRows([]);
       setSharedReviewTotal(0);
+    }
+
+    try {
+      const routeRes = await listSharedMarketRoutes({
+        page: sharedRoutePage,
+        page_size: sharedRoutePageSize,
+      });
+      if (routeRes.data) {
+        setSharedMarketRoutes(routeRes.data.items);
+        setSharedRouteTotal(routeRes.data.total);
+      }
+    } catch (err) {
+      if (isApiError(err)) {
+        setSharedRouteError(err.message);
+      } else {
+        setSharedRouteError('加载 worker 数据来源失败');
+      }
+      setSharedMarketRoutes([]);
+      setSharedRouteTotal(0);
     } finally {
       setSharedReviewLoading(false);
     }
-  }, [sharedReviewPage, sharedReviewPageSize, showToast]);
+  }, [sharedReviewPage, sharedReviewPageSize, sharedRoutePage, sharedRoutePageSize]);
 
   useEffect(() => {
     void loadSharedMarketReview();
@@ -212,11 +240,13 @@ export default function Operators() {
 
   const updateSharedReviewRow = (nextRow: SharedMarketUncoveredUrlInfo | null | undefined) => {
     if (!nextRow) return;
-    setSharedMarketUncoveredRows((previous) =>
-      nextRow.status === 'pending'
-        ? previous.map((row) => (row.id === nextRow.id ? nextRow : row))
-        : previous.filter((row) => row.id !== nextRow.id),
-    );
+    setSharedMarketUncoveredRows((previous) => {
+      const exists = previous.some((row) => row.id === nextRow.id);
+      if (exists) {
+        return previous.map((row) => (row.id === nextRow.id ? nextRow : row));
+      }
+      return [nextRow, ...previous].slice(0, sharedReviewPageSize);
+    });
   };
 
   const handleIgnoreSharedReview = async (recordId: number) => {
@@ -225,6 +255,7 @@ export default function Operators() {
       const res = await ignoreSharedMarketUncoveredUrl(recordId);
       updateSharedReviewRow(res.data);
       showToast('已设置为忽略');
+      void loadSharedMarketReview();
     } catch (err) {
       if (isApiError(err)) showToast(err.message);
       else showToast('操作失败');
@@ -239,6 +270,7 @@ export default function Operators() {
       const res = await recheckSharedMarketUncoveredUrl(recordId);
       updateSharedReviewRow(res.data);
       showToast('已标记为重新检测');
+      void loadSharedMarketReview();
     } catch (err) {
       if (isApiError(err)) showToast(err.message);
       else showToast('操作失败');
@@ -263,6 +295,7 @@ export default function Operators() {
       const res = await joinSharedMarketUncoveredUrlGroup(recordId, sharedGroupId);
       updateSharedReviewRow(res.data);
       showToast('已加入共享组，待共享运行中重检');
+      void loadSharedMarketReview();
     } catch (err) {
       if (isApiError(err)) showToast(err.message);
       else showToast('操作失败');
@@ -272,8 +305,17 @@ export default function Operators() {
   };
 
   const sharedReviewPages = Math.ceil(sharedReviewTotal / sharedReviewPageSize) || 0;
+  const sharedRoutePages = Math.ceil(sharedRouteTotal / sharedRoutePageSize) || 0;
+  const displayValue = (value: string | number | null | undefined): string => {
+    if (value === null || value === undefined || value === '') return '-';
+    return String(value);
+  };
+  const statusClassName = (base: string, status: string | null | undefined): string =>
+    `${base} ${base}-${(status || 'unknown').replace(/_/g, '-')}`;
   const sharedReviewLabel = (status: string | undefined | null): string => {
     switch (status) {
+      case 'untested':
+        return '未检测';
       case 'pending':
         return '待检测';
       case 'review_required':
@@ -284,6 +326,40 @@ export default function Operators() {
         return '已忽略';
       case 'detecting':
         return '检测中';
+      case 'success':
+        return '检测成功';
+      case 'failed':
+        return '检测失败';
+      default:
+        return status || '未知';
+    }
+  };
+  const collectorHealthLabel = (status: string | undefined | null): string => {
+    switch (status) {
+      case 'warming':
+        return '预热中';
+      case 'ok':
+        return '在线 / 健康';
+      case 'degraded':
+        return '在线 / 降级';
+      case 'failed':
+        return '异常';
+      case 'market_closed':
+        return '休市';
+      default:
+        return status || '未知';
+    }
+  };
+  const dataSourceLabel = (status: string | undefined | null): string => {
+    switch (status) {
+      case 'local':
+        return '本地';
+      case 'shared_pending':
+        return '共享待切换';
+      case 'shared':
+        return '共享';
+      case 'shared_error_local_fallback':
+        return '异常回退本地';
       default:
         return status || '未知';
     }
@@ -302,94 +378,168 @@ export default function Operators() {
         </button>
       </div>
 
+      <section className="shared-review-panel" aria-label="共享采集账号状态">
+        <h2 className="shared-review-title">共享采集账号状态</h2>
+        {sharedReviewLoading && sharedMarketGroups.length === 0 ? (
+          <p className="loading-text">加载中...</p>
+        ) : sharedGroupError ? (
+          <p className="operators-error">{sharedGroupError}</p>
+        ) : sharedMarketGroups.length === 0 ? (
+          <p className="empty-text">暂无共享采集账号</p>
+        ) : (
+          <div className="shared-review-table-wrap">
+            <table className="shared-review-table shared-health-table">
+              <thead>
+                <tr>
+                  <th>共享组</th>
+                  <th>专用账号</th>
+                  <th>在线/健康</th>
+                  <th>最后成功快照</th>
+                  <th>连续异常</th>
+                  <th>异常类型</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sharedMarketGroups.map((item) => {
+                  const healthStatus = item.collector_health_state || item.source_status;
+                  const lastSnapshotAt =
+                    item.collector_last_success_at || item.snapshot_fetched_at || item.snapshot_updated_at;
+                  return (
+                    <tr key={item.id}>
+                      <td data-label="共享组">
+                        <div className="shared-cell-main">{item.group_key}</div>
+                        <div className="shared-cell-sub">{displayValue(item.primary_url)}</div>
+                      </td>
+                      <td data-label="专用账号">
+                        <div className="shared-cell-main">{displayValue(item.collector_account_name)}</div>
+                        <div className="shared-cell-sub">{displayValue(item.collector_platform_type)}</div>
+                      </td>
+                      <td data-label="在线/健康">
+                        <span className={statusClassName('shared-status-pill', healthStatus)}>
+                          {collectorHealthLabel(healthStatus)}
+                        </span>
+                      </td>
+                      <td data-label="最后成功快照">{displayValue(lastSnapshotAt)}</td>
+                      <td data-label="连续异常">{displayValue(item.collector_consecutive_error_count ?? 0)}</td>
+                      <td data-label="异常类型">
+                        <div className="shared-cell-main">{displayValue(item.collector_last_error_class)}</div>
+                        <div className="shared-cell-sub">
+                          {displayValue(item.collector_last_error || item.last_error)}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       <section className="shared-review-panel" aria-label="共享网址审核">
         <h2 className="shared-review-title">共享网址审核</h2>
-        {sharedReviewLoading ? (
+        {sharedReviewLoading && sharedMarketUncoveredRows.length === 0 ? (
           <p className="loading-text">加载中...</p>
         ) : sharedReviewError ? (
           <p className="operators-error">{sharedReviewError}</p>
         ) : sharedMarketUncoveredRows.length === 0 ? (
-          <p className="empty-text">暂无待审核共享网址</p>
+          <p className="empty-text">暂无共享网址检测记录</p>
         ) : (
           <>
             <div className="shared-review-table-wrap">
               <table className="shared-review-table">
                 <thead>
                   <tr>
-                    <th>网址</th>
+                    <th>未命中 URL</th>
                     <th>平台类型</th>
-                    <th>命中次数</th>
                     <th>检测状态</th>
-                    <th>失败原因</th>
-                    <th>最后发现时间</th>
+                    <th>检测次数</th>
+                    <th>失败/错误</th>
+                    <th>检查时间</th>
                     <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {sharedMarketUncoveredRows.map((item) => (
-                    <tr key={item.id}>
-                      <td data-label="网址" className="mono-url">
-                        <span className="shared-review-url">{item.normalized_url}</span>
-                      </td>
-                      <td data-label="平台类型">{item.last_platform_type || '-'}</td>
-                      <td data-label="命中次数">{item.hit_count}</td>
-                      <td data-label="检测状态">{sharedReviewLabel(item.detection_status || item.status)}</td>
-                      <td data-label="失败原因">{item.failure_reason || '-'}</td>
-                      <td data-label="最后发现时间">{item.last_seen_at}</td>
-                      <td data-label="操作">
-                        <div className="shared-review-actions">
-                          <button
-                            type="button"
-                            className="shared-review-btn shared-review-recheck"
-                            onClick={() => handleRecheckSharedReview(item.id)}
-                            disabled={sharedReviewActionLoadingId === item.id}
-                          >
-                            {sharedReviewActionLoadingId === item.id ? '处理中...' : '重新检测'}
-                          </button>
-                          <button
-                            type="button"
-                            className="shared-review-btn shared-review-ignore"
-                            onClick={() => handleIgnoreSharedReview(item.id)}
-                            disabled={sharedReviewActionLoadingId === item.id}
-                          >
-                            {sharedReviewActionLoadingId === item.id ? '处理中...' : '忽略'}
-                          </button>
-                          {sharedMarketGroups.length > 0 ? (
-                            <div className="shared-review-join">
-                              <select
-                                value={sharedJoinSelection[item.id] ?? ''}
-                                onChange={(e) => {
-                                  setSharedJoinSelection((previous) => ({
-                                    ...previous,
-                                    [item.id]: e.target.value,
-                                  }));
-                                }}
-                                disabled={sharedReviewActionLoadingId === item.id}
-                                aria-label="选择共享组"
-                              >
-                                <option value="">选择共享组</option>
-                                {sharedMarketGroups.map((group) => (
-                                  <option key={group.id} value={group.id}>
-                                    {group.group_key}
-                                  </option>
-                                ))}
-                              </select>
-                              <button
-                                type="button"
-                                className="shared-review-btn shared-review-join-btn"
-                                onClick={() => handleJoinSharedGroup(item.id)}
-                                disabled={sharedReviewActionLoadingId === item.id || !sharedJoinSelection[item.id]}
-                              >
-                                {sharedReviewActionLoadingId === item.id ? '处理中...' : '加入共享组'}
-                              </button>
-                            </div>
-                          ) : (
-                            <span className="shared-review-no-group">暂无可用共享组</span>
+                  {sharedMarketUncoveredRows.map((item) => {
+                    const detectionStatus = item.detection_status || item.status;
+                    return (
+                      <tr key={item.id}>
+                        <td data-label="未命中 URL" className="mono-url">
+                          <span className="shared-review-url">{item.normalized_url}</span>
+                          {item.sample_raw_url && item.sample_raw_url !== item.normalized_url && (
+                            <span className="shared-cell-sub">{item.sample_raw_url}</span>
                           )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td data-label="平台类型">{displayValue(item.last_platform_type)}</td>
+                        <td data-label="检测状态">
+                          <span className={statusClassName('shared-status-pill', detectionStatus)}>
+                            {sharedReviewLabel(detectionStatus)}
+                          </span>
+                        </td>
+                        <td data-label="检测次数">{displayValue(item.detection_attempts)}</td>
+                        <td data-label="失败/错误">
+                          <div className="shared-cell-main">{displayValue(item.failure_reason)}</div>
+                          <div className="shared-cell-sub">{displayValue(item.detection_error)}</div>
+                        </td>
+                        <td data-label="检查时间">
+                          <div className="shared-cell-main">{displayValue(item.last_checked_at || item.last_seen_at)}</div>
+                          <div className="shared-cell-sub">下次：{displayValue(item.next_detect_at)}</div>
+                        </td>
+                        <td data-label="操作">
+                          <div className="shared-review-actions">
+                            <button
+                              type="button"
+                              className="shared-review-btn shared-review-recheck"
+                              onClick={() => handleRecheckSharedReview(item.id)}
+                              disabled={sharedReviewActionLoadingId === item.id}
+                            >
+                              {sharedReviewActionLoadingId === item.id ? '处理中...' : '重新检测'}
+                            </button>
+                            <button
+                              type="button"
+                              className="shared-review-btn shared-review-ignore"
+                              onClick={() => handleIgnoreSharedReview(item.id)}
+                              disabled={sharedReviewActionLoadingId === item.id}
+                            >
+                              {sharedReviewActionLoadingId === item.id ? '处理中...' : '忽略'}
+                            </button>
+                            {sharedMarketGroups.length > 0 ? (
+                              <div className="shared-review-join">
+                                <select
+                                  value={sharedJoinSelection[item.id] ?? ''}
+                                  onChange={(e) => {
+                                    setSharedJoinSelection((previous) => ({
+                                      ...previous,
+                                      [item.id]: e.target.value,
+                                    }));
+                                  }}
+                                  disabled={sharedReviewActionLoadingId === item.id}
+                                  aria-label="选择共享组"
+                                >
+                                  <option value="">选择共享组</option>
+                                  {sharedMarketGroups.map((group) => (
+                                    <option key={group.id} value={group.id}>
+                                      {group.group_key}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  className="shared-review-btn shared-review-join-btn"
+                                  onClick={() => handleJoinSharedGroup(item.id)}
+                                  disabled={sharedReviewActionLoadingId === item.id || !sharedJoinSelection[item.id]}
+                                >
+                                  {sharedReviewActionLoadingId === item.id ? '处理中...' : '加入共享组'}
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="shared-review-no-group">暂无可用共享组</span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -411,6 +561,89 @@ export default function Operators() {
                   className="page-btn"
                   disabled={sharedReviewPage >= sharedReviewPages}
                   onClick={() => setSharedReviewPage((pageNum) => pageNum + 1)}
+                >
+                  下一页
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </section>
+
+      <section className="shared-review-panel" aria-label="worker 数据来源">
+        <h2 className="shared-review-title">Worker 数据来源</h2>
+        {sharedReviewLoading && sharedMarketRoutes.length === 0 ? (
+          <p className="loading-text">加载中...</p>
+        ) : sharedRouteError ? (
+          <p className="operators-error">{sharedRouteError}</p>
+        ) : sharedMarketRoutes.length === 0 ? (
+          <p className="empty-text">暂无 worker 数据来源记录</p>
+        ) : (
+          <>
+            <div className="shared-review-table-wrap">
+              <table className="shared-review-table shared-route-table">
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>URL</th>
+                    <th>当前状态</th>
+                    <th>共享组</th>
+                    <th>切换/回退</th>
+                    <th>更新时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sharedMarketRoutes.map((route) => (
+                    <tr key={`${route.account_id}-${route.normalized_url || route.platform_type}`}>
+                      <td data-label="账号">
+                        <div className="shared-cell-main">{displayValue(route.account_name)}</div>
+                        <div className="shared-cell-sub">
+                          {displayValue(route.operator_name)} / #{route.account_id}
+                        </div>
+                      </td>
+                      <td data-label="URL" className="mono-url">
+                        <span className="shared-review-url">{displayValue(route.normalized_url)}</span>
+                      </td>
+                      <td data-label="当前状态">
+                        <span className={statusClassName('shared-status-pill', route.data_source_state)}>
+                          {dataSourceLabel(route.data_source_state)}
+                        </span>
+                      </td>
+                      <td data-label="共享组">
+                        <div className="shared-cell-main">{displayValue(route.shared_group_key)}</div>
+                        <div className="shared-cell-sub">待切换：{displayValue(route.pending_shared_group_id)}</div>
+                      </td>
+                      <td data-label="切换/回退">
+                        <div className="shared-cell-main">确认期号：{displayValue(route.handoff_confirmed_issue)}</div>
+                        <div className="shared-cell-sub">回退：{displayValue(route.fallback_reason)}</div>
+                      </td>
+                      <td data-label="更新时间">
+                        <div className="shared-cell-main">{displayValue(route.updated_at)}</div>
+                        <div className="shared-cell-sub">切换：{displayValue(route.last_switch_at)}</div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {sharedRoutePages > 1 && (
+              <div className="operators-pagination">
+                <button
+                  type="button"
+                  className="page-btn"
+                  disabled={sharedRoutePage <= 1}
+                  onClick={() => setSharedRoutePage((pageNum) => pageNum - 1)}
+                >
+                  上一页
+                </button>
+                <span className="page-info">
+                  {sharedRoutePage} / {sharedRoutePages}
+                </span>
+                <button
+                  type="button"
+                  className="page-btn"
+                  disabled={sharedRoutePage >= sharedRoutePages}
+                  onClick={() => setSharedRoutePage((pageNum) => pageNum + 1)}
                 >
                   下一页
                 </button>

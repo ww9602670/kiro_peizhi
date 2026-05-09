@@ -341,11 +341,21 @@ DDL_STATEMENTS = [
         collector_account_name  TEXT NOT NULL,
         collector_password_enc  TEXT NOT NULL,
         freshness_threshold_sec INTEGER NOT NULL DEFAULT 30,
+        collector_owner_key     TEXT,
+        collector_health_state  TEXT NOT NULL DEFAULT 'warming',
+        collector_last_success_at TEXT,
+        collector_last_error_at TEXT,
+        collector_last_error_class TEXT,
+        collector_last_error    TEXT,
+        collector_consecutive_error_count INTEGER NOT NULL DEFAULT 0,
+        collector_preheated_at  TEXT,
+        collector_alerted_at    TEXT,
         created_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
         updated_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_shared_market_groups_enabled ON shared_market_groups(enabled, id);",
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_groups_health ON shared_market_groups(enabled, collector_health_state);",
 
     # 13. shared_market_group_urls
     """
@@ -378,6 +388,9 @@ DDL_STATEMENTS = [
         next_draw_retry_at  TEXT,
         source_status       TEXT NOT NULL DEFAULT 'online',
         last_error          TEXT,
+        provider_owner_key  TEXT,
+        provider_kind       TEXT,
+        provider_account_name TEXT,
         message_code        TEXT,
         message_text        TEXT,
         created_at          TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
@@ -397,7 +410,7 @@ DDL_STATEMENTS = [
         sample_raw_url          TEXT,
         last_account_id         INTEGER,
         last_platform_type      TEXT,
-        detection_status        TEXT NOT NULL DEFAULT 'pending',
+        detection_status        TEXT NOT NULL DEFAULT 'untested',
         review_status           TEXT,
         detection_error         TEXT,
         matched_shared_group_id  INTEGER REFERENCES shared_market_groups(id),
@@ -405,13 +418,61 @@ DDL_STATEMENTS = [
         shared_group_id         INTEGER REFERENCES shared_market_groups(id),
         status                  TEXT NOT NULL DEFAULT 'pending',
         failure_reason          TEXT,
-        reviewed_at             TEXT
+        reviewed_at             TEXT,
+        detection_attempts      INTEGER NOT NULL DEFAULT 0,
+        next_detect_at          TEXT,
+        detecting_started_at    TEXT,
+        detecting_owner         TEXT,
+        last_success_at         TEXT,
+        last_failure_at         TEXT
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_shared_market_uncovered_last_seen ON shared_market_uncovered_urls(last_seen_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_shared_market_uncovered_detection_status ON shared_market_uncovered_urls(detection_status, last_checked_at);",
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_uncovered_next_detect ON shared_market_uncovered_urls(detection_status, next_detect_at);",
 
-    # 16. simulation_bet_orders
+    # 16. account_shared_market_routes
+    """
+    CREATE TABLE IF NOT EXISTS account_shared_market_routes (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id              INTEGER NOT NULL REFERENCES gambling_accounts(id) ON DELETE CASCADE,
+        operator_id             INTEGER REFERENCES operators(id),
+        platform_type           TEXT NOT NULL DEFAULT 'JND28WEB',
+        normalized_url          TEXT,
+        data_source_state       TEXT NOT NULL DEFAULT 'local',
+        shared_group_id         INTEGER REFERENCES shared_market_groups(id),
+        pending_shared_group_id INTEGER REFERENCES shared_market_groups(id),
+        handoff_after_issue     TEXT,
+        handoff_confirmed_issue TEXT,
+        fallback_reason         TEXT,
+        last_switch_at          TEXT,
+        last_checked_at         TEXT,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        UNIQUE(account_id, platform_type)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_account_shared_routes_state ON account_shared_market_routes(data_source_state, updated_at);",
+    "CREATE INDEX IF NOT EXISTS idx_account_shared_routes_group ON account_shared_market_routes(shared_group_id, data_source_state);",
+    "CREATE INDEX IF NOT EXISTS idx_account_shared_routes_pending_group ON account_shared_market_routes(pending_shared_group_id, data_source_state);",
+
+    # 17. shared_market_alert_dedupe
+    """
+    CREATE TABLE IF NOT EXISTS shared_market_alert_dedupe (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedupe_key      TEXT NOT NULL UNIQUE,
+        shared_group_id INTEGER REFERENCES shared_market_groups(id),
+        error_class     TEXT NOT NULL,
+        last_alert_at   TEXT NOT NULL,
+        last_error      TEXT,
+        alert_count     INTEGER NOT NULL DEFAULT 1,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_shared_market_alert_dedupe_group ON shared_market_alert_dedupe(shared_group_id, error_class);",
+
+    # 18. simulation_bet_orders
     """
     CREATE TABLE IF NOT EXISTS simulation_bet_orders (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,

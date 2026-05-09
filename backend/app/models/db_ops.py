@@ -35,6 +35,34 @@ def _now() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _normalize_platform_type(platform_type: str | None) -> str:
+    return (platform_type or "JND28WEB").strip().upper() or "JND28WEB"
+
+
+def _normalize_route_state(state: str | None) -> str:
+    normalized = (state or "local").strip().lower()
+    allowed = {"local", "shared_pending", "shared", "shared_error_local_fallback"}
+    return normalized if normalized in allowed else "local"
+
+
+def _normalize_detection_status(status: str | None) -> str:
+    normalized = (status or "untested").strip().lower()
+    aliases = {
+        "pending": "untested",
+        "matched": "success",
+        "review_required": "failed",
+    }
+    normalized = aliases.get(normalized, normalized)
+    allowed = {"untested", "detecting", "success", "failed", "ignored"}
+    return normalized if normalized in allowed else "untested"
+
+
+def _normalize_collector_health_state(state: str | None) -> str:
+    normalized = (state or "warming").strip().lower()
+    allowed = {"warming", "ok", "degraded", "failed", "market_closed"}
+    return normalized if normalized in allowed else "warming"
+
+
 def _now_minus_minutes(minutes: int) -> str:
     from datetime import timezone, timedelta
 
@@ -1873,6 +1901,9 @@ async def shared_market_snapshot_upsert(
     snapshot_version: int | None = None,
     message_code: str | None = None,
     message_text: str | None = None,
+    provider_owner_key: str | None = None,
+    provider_kind: str | None = None,
+    provider_account_name: str | None = None,
 ) -> dict[str, Any]:
     now = _now()
     resolved_fetched_at = fetched_at or now
@@ -1907,8 +1938,9 @@ async def shared_market_snapshot_upsert(
            (shared_group_id, issue, state, snapshot_version, market_data_state, draw_state,
             close_countdown_sec, open_countdown_sec, pre_issue, open_result, fetched_at,
             next_normal_refresh_at, next_draw_retry_at, source_status, last_error,
+            provider_owner_key, provider_kind, provider_account_name,
             message_code, message_text, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(shared_group_id) DO UPDATE SET
                issue=excluded.issue,
                state=excluded.state,
@@ -1924,6 +1956,9 @@ async def shared_market_snapshot_upsert(
                next_draw_retry_at=excluded.next_draw_retry_at,
                source_status=excluded.source_status,
                last_error=excluded.last_error,
+               provider_owner_key=excluded.provider_owner_key,
+               provider_kind=excluded.provider_kind,
+               provider_account_name=excluded.provider_account_name,
                message_code=excluded.message_code,
                message_text=excluded.message_text,
                updated_at=excluded.updated_at
@@ -1948,6 +1983,9 @@ async def shared_market_snapshot_upsert(
             next_draw_retry_at,
             resolved_source_status,
             last_error,
+            provider_owner_key,
+            provider_kind,
+            provider_account_name,
             message_code,
             message_text,
             now,
@@ -2030,7 +2068,7 @@ async def shared_market_uncovered_url_touch(
         """INSERT INTO shared_market_uncovered_urls
            (normalized_url, first_seen_at, last_seen_at, hit_count, sample_raw_url,
             last_account_id, last_platform_type, detection_status, status, detection_error, failure_reason)
-           VALUES (?, ?, ?, 1, ?, ?, ?, 'pending', 'pending', ?, ?)
+           VALUES (?, ?, ?, 1, ?, ?, ?, 'untested', 'pending', ?, ?)
             ON CONFLICT(normalized_url) DO UPDATE SET
                 last_seen_at=excluded.last_seen_at,
                 hit_count=shared_market_uncovered_urls.hit_count + 1,
@@ -2040,7 +2078,11 @@ async def shared_market_uncovered_url_touch(
                 detection_error=COALESCE(excluded.detection_error, shared_market_uncovered_urls.detection_error),
                 failure_reason=COALESCE(excluded.failure_reason, shared_market_uncovered_urls.failure_reason),
                 status='pending',
-                detection_status='pending'""",
+                detection_status=CASE
+                    WHEN shared_market_uncovered_urls.detection_status IN ('detecting', 'success', 'failed', 'ignored')
+                    THEN shared_market_uncovered_urls.detection_status
+                    ELSE 'untested'
+                END""",
         (
             normalized_url,
             at,
@@ -2130,6 +2172,7 @@ async def shared_market_uncovered_url_set_status(
     reviewed_at: str | None = None,
 ) -> dict[str, Any] | None:
     at = _now() if reviewed_at is None else reviewed_at
+    detection_status = _normalize_detection_status(status)
     await db.execute(
         """UPDATE shared_market_uncovered_urls
            SET status=?, detection_status=?, review_status=?,
@@ -2138,7 +2181,7 @@ async def shared_market_uncovered_url_set_status(
           WHERE id=?""",
         (
             status,
-            status,
+            detection_status,
             status,
             failure_reason,
             failure_reason,
@@ -2156,16 +2199,20 @@ async def shared_market_uncovered_url_mark_detecting(
     *,
     row_id: int,
     checked_at: str | None = None,
+    detecting_owner: str | None = None,
 ) -> dict[str, Any] | None:
     at = checked_at or _now()
     await db.execute(
         """UPDATE shared_market_uncovered_urls
            SET detection_status='detecting',
                status='detecting',
+               detection_attempts=COALESCE(detection_attempts, 0) + 1,
+               detecting_started_at=?,
+               detecting_owner=?,
                reviewed_at=?,
                last_checked_at=?
          WHERE id=?""",
-        (at, at, row_id),
+        (at, detecting_owner, at, at, row_id),
     )
     await db.commit()
     return await shared_market_uncovered_url_get(db, row_id=row_id)
@@ -2185,17 +2232,18 @@ async def shared_market_uncovered_url_mark_matched(
 
     await db.execute(
         """UPDATE shared_market_uncovered_urls
-           SET detection_status='matched',
+           SET detection_status='success',
                status='matched',
                review_status='matched',
                matched_shared_group_id=?,
                shared_group_id=?,
                reviewed_at=?,
                last_checked_at=?,
+               last_success_at=?,
                detection_error=NULL,
                failure_reason=NULL
          WHERE id=?""",
-        (shared_group_id, shared_group_id, at, at, row_id),
+        (shared_group_id, shared_group_id, at, at, at, row_id),
     )
     await db.commit()
     normalized_url = row.get("normalized_url")
@@ -2219,15 +2267,16 @@ async def shared_market_uncovered_url_mark_review_required(
     at = checked_at or _now()
     await db.execute(
         """UPDATE shared_market_uncovered_urls
-           SET detection_status='review_required',
+           SET detection_status='failed',
                status='review_required',
                review_status=?,
                detection_error=?,
                failure_reason=?,
                reviewed_at=?,
-               last_checked_at=?
+               last_checked_at=?,
+               last_failure_at=?
          WHERE id=?""",
-        (review_status, failure_reason, failure_reason, at, at, row_id),
+        (review_status, failure_reason, failure_reason, at, at, at, row_id),
     )
     await db.commit()
     return await shared_market_uncovered_url_get(db, row_id=row_id)
@@ -2246,14 +2295,15 @@ async def shared_market_uncovered_url_bind_group(
            SET shared_group_id=?,
                matched_shared_group_id=?,
                status='matched',
-               detection_status='matched',
+               detection_status='success',
                review_status='matched',
                detection_error=NULL,
                failure_reason=?,
                reviewed_at=?,
-               last_checked_at=?
+               last_checked_at=?,
+               last_success_at=?
           WHERE id=?""",
-        (shared_group_id, shared_group_id, failure_reason, at, at, row_id),
+        (shared_group_id, shared_group_id, failure_reason, at, at, at, row_id),
     )
     await db.commit()
     if shared_group_id is not None:
@@ -2269,6 +2319,438 @@ async def shared_market_uncovered_url_bind_group(
     return await shared_market_uncovered_url_get(db, row_id=row_id)
 
 
+async def shared_market_uncovered_url_mark_success(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+    shared_group_id: int,
+    checked_at: str | None = None,
+) -> dict[str, Any] | None:
+    return await shared_market_uncovered_url_mark_matched(
+        db,
+        row_id=row_id,
+        shared_group_id=shared_group_id,
+        reviewed_at=checked_at,
+    )
+
+
+async def shared_market_uncovered_url_mark_failed(
+    db: aiosqlite.Connection,
+    *,
+    row_id: int,
+    failure_reason: str | None = None,
+    checked_at: str | None = None,
+) -> dict[str, Any] | None:
+    return await shared_market_uncovered_url_mark_review_required(
+        db,
+        row_id=row_id,
+        review_status="review_required",
+        failure_reason=failure_reason,
+        checked_at=checked_at,
+    )
+
+
+async def account_shared_route_get(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str = "JND28WEB",
+) -> dict[str, Any] | None:
+    row = await (await db.execute(
+        """SELECT r.*, g.group_key AS shared_group_key,
+                  pg.group_key AS pending_shared_group_key
+             FROM account_shared_market_routes r
+             LEFT JOIN shared_market_groups g ON g.id=r.shared_group_id
+             LEFT JOIN shared_market_groups pg ON pg.id=r.pending_shared_group_id
+            WHERE r.account_id=? AND r.platform_type=?""",
+        (account_id, _normalize_platform_type(platform_type)),
+    )).fetchone()
+    return _row_to_dict(row)
+
+
+async def account_shared_route_upsert(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    operator_id: int | None = None,
+    platform_type: str = "JND28WEB",
+    normalized_url: str | None = None,
+    data_source_state: str = "local",
+    shared_group_id: int | None = None,
+    pending_shared_group_id: int | None = None,
+    handoff_after_issue: str | None = None,
+    handoff_confirmed_issue: str | None = None,
+    fallback_reason: str | None = None,
+    last_switch_at: str | None = None,
+    last_checked_at: str | None = None,
+) -> dict[str, Any]:
+    now = _now()
+    normalized_platform_type = _normalize_platform_type(platform_type)
+    normalized_state = _normalize_route_state(data_source_state)
+    checked_at = last_checked_at or now
+    await db.execute(
+        """INSERT INTO account_shared_market_routes
+           (account_id, operator_id, platform_type, normalized_url, data_source_state,
+            shared_group_id, pending_shared_group_id, handoff_after_issue,
+            handoff_confirmed_issue, fallback_reason, last_switch_at,
+            last_checked_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(account_id, platform_type) DO UPDATE SET
+               operator_id=COALESCE(excluded.operator_id, account_shared_market_routes.operator_id),
+               normalized_url=COALESCE(excluded.normalized_url, account_shared_market_routes.normalized_url),
+               data_source_state=excluded.data_source_state,
+               shared_group_id=excluded.shared_group_id,
+               pending_shared_group_id=excluded.pending_shared_group_id,
+               handoff_after_issue=excluded.handoff_after_issue,
+               handoff_confirmed_issue=excluded.handoff_confirmed_issue,
+               fallback_reason=excluded.fallback_reason,
+               last_switch_at=excluded.last_switch_at,
+               last_checked_at=excluded.last_checked_at,
+               updated_at=excluded.updated_at""",
+        (
+            account_id,
+            operator_id,
+            normalized_platform_type,
+            normalized_url,
+            normalized_state,
+            shared_group_id,
+            pending_shared_group_id,
+            handoff_after_issue,
+            handoff_confirmed_issue,
+            fallback_reason,
+            last_switch_at,
+            checked_at,
+            now,
+            now,
+        ),
+    )
+    await db.commit()
+    row = await account_shared_route_get(
+        db,
+        account_id=account_id,
+        platform_type=normalized_platform_type,
+    )
+    return row or {}
+
+
+async def account_shared_route_set_state(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str = "JND28WEB",
+    data_source_state: str,
+    shared_group_id: int | None = None,
+    pending_shared_group_id: int | None = None,
+    handoff_after_issue: str | None = None,
+    handoff_confirmed_issue: str | None = None,
+    fallback_reason: str | None = None,
+) -> dict[str, Any] | None:
+    existing = await account_shared_route_get(
+        db,
+        account_id=account_id,
+        platform_type=platform_type,
+    )
+    if existing is None:
+        return await account_shared_route_upsert(
+            db,
+            account_id=account_id,
+            platform_type=platform_type,
+            data_source_state=data_source_state,
+            shared_group_id=shared_group_id,
+            pending_shared_group_id=pending_shared_group_id,
+            handoff_after_issue=handoff_after_issue,
+            handoff_confirmed_issue=handoff_confirmed_issue,
+            fallback_reason=fallback_reason,
+            last_switch_at=_now(),
+        )
+
+    now = _now()
+    await db.execute(
+        """UPDATE account_shared_market_routes
+              SET data_source_state=?,
+                  shared_group_id=?,
+                  pending_shared_group_id=?,
+                  handoff_after_issue=?,
+                  handoff_confirmed_issue=?,
+                  fallback_reason=?,
+                  last_switch_at=?,
+                  last_checked_at=?,
+                  updated_at=?
+            WHERE account_id=? AND platform_type=?""",
+        (
+            _normalize_route_state(data_source_state),
+            shared_group_id,
+            pending_shared_group_id,
+            handoff_after_issue,
+            handoff_confirmed_issue,
+            fallback_reason,
+            now,
+            now,
+            now,
+            account_id,
+            _normalize_platform_type(platform_type),
+        ),
+    )
+    await db.commit()
+    return await account_shared_route_get(
+        db,
+        account_id=account_id,
+        platform_type=platform_type,
+    )
+
+
+async def account_shared_route_mark_pending(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str = "JND28WEB",
+    pending_shared_group_id: int,
+    handoff_after_issue: str | None = None,
+    normalized_url: str | None = None,
+    operator_id: int | None = None,
+) -> dict[str, Any]:
+    return await account_shared_route_upsert(
+        db,
+        account_id=account_id,
+        operator_id=operator_id,
+        platform_type=platform_type,
+        normalized_url=normalized_url,
+        data_source_state="shared_pending",
+        shared_group_id=None,
+        pending_shared_group_id=pending_shared_group_id,
+        handoff_after_issue=handoff_after_issue,
+    )
+
+
+async def account_shared_route_complete_handoff(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str = "JND28WEB",
+    shared_group_id: int,
+    confirmed_issue: str | None = None,
+) -> dict[str, Any] | None:
+    return await account_shared_route_set_state(
+        db,
+        account_id=account_id,
+        platform_type=platform_type,
+        data_source_state="shared",
+        shared_group_id=shared_group_id,
+        pending_shared_group_id=None,
+        handoff_after_issue=None,
+        handoff_confirmed_issue=confirmed_issue,
+        fallback_reason=None,
+    )
+
+
+async def account_shared_route_mark_fallback(
+    db: aiosqlite.Connection,
+    *,
+    account_id: int,
+    platform_type: str = "JND28WEB",
+    shared_group_id: int | None = None,
+    fallback_reason: str | None = None,
+) -> dict[str, Any] | None:
+    return await account_shared_route_set_state(
+        db,
+        account_id=account_id,
+        platform_type=platform_type,
+        data_source_state="shared_error_local_fallback",
+        shared_group_id=shared_group_id,
+        pending_shared_group_id=None,
+        fallback_reason=fallback_reason,
+    )
+
+
+async def account_shared_route_list_for_admin(
+    db: aiosqlite.Connection,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+    state: str | None = None,
+    operator_id: int | None = None,
+    account_id: int | None = None,
+    shared_group_id: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    where: list[str] = []
+    params: list[Any] = []
+    if state:
+        where.append("r.data_source_state=?")
+        params.append(_normalize_route_state(state))
+    if operator_id is not None:
+        where.append("r.operator_id=?")
+        params.append(operator_id)
+    if account_id is not None:
+        where.append("r.account_id=?")
+        params.append(account_id)
+    if shared_group_id is not None:
+        where.append("(r.shared_group_id=? OR r.pending_shared_group_id=?)")
+        params.extend([shared_group_id, shared_group_id])
+    where_clause = "WHERE " + " AND ".join(where) if where else ""
+    count_row = await (await db.execute(
+        f"SELECT COUNT(*) AS cnt FROM account_shared_market_routes r {where_clause}",
+        tuple(params),
+    )).fetchone()
+    total = int(count_row["cnt"] or 0) if count_row else 0
+    offset = (page - 1) * page_size
+    rows = await (await db.execute(
+        f"""
+        SELECT r.*, o.username AS operator_name, a.account_name,
+               g.group_key AS shared_group_key,
+               pg.group_key AS pending_shared_group_key
+          FROM account_shared_market_routes r
+          LEFT JOIN operators o ON o.id=r.operator_id
+          LEFT JOIN gambling_accounts a ON a.id=r.account_id
+          LEFT JOIN shared_market_groups g ON g.id=r.shared_group_id
+          LEFT JOIN shared_market_groups pg ON pg.id=r.pending_shared_group_id
+          {where_clause}
+         ORDER BY r.updated_at DESC
+         LIMIT ? OFFSET ?
+        """,
+        (*params, page_size, offset),
+    )).fetchall()
+    return _rows_to_list(rows), total
+
+
+async def shared_market_group_health_update(
+    db: aiosqlite.Connection,
+    *,
+    shared_group_id: int,
+    collector_health_state: str,
+    collector_last_success_at: str | None = None,
+    collector_last_error_at: str | None = None,
+    collector_last_error_class: str | None = None,
+    collector_last_error: str | None = None,
+    collector_consecutive_error_count: int | None = None,
+    collector_preheated_at: str | None = None,
+    collector_alerted_at: str | None = None,
+) -> dict[str, Any] | None:
+    now = _now()
+    await db.execute(
+        """UPDATE shared_market_groups
+              SET collector_health_state=?,
+                  collector_last_success_at=COALESCE(?, collector_last_success_at),
+                  collector_last_error_at=COALESCE(?, collector_last_error_at),
+                  collector_last_error_class=COALESCE(?, collector_last_error_class),
+                  collector_last_error=COALESCE(?, collector_last_error),
+                  collector_consecutive_error_count=COALESCE(?, collector_consecutive_error_count),
+                  collector_preheated_at=COALESCE(?, collector_preheated_at),
+                  collector_alerted_at=COALESCE(?, collector_alerted_at),
+                  updated_at=?
+            WHERE id=?""",
+        (
+            _normalize_collector_health_state(collector_health_state),
+            collector_last_success_at,
+            collector_last_error_at,
+            collector_last_error_class,
+            collector_last_error,
+            collector_consecutive_error_count,
+            collector_preheated_at,
+            collector_alerted_at,
+            now,
+            shared_group_id,
+        ),
+    )
+    await db.commit()
+    return await shared_market_group_get(db, shared_group_id=shared_group_id)
+
+
+async def shared_market_group_success_record(
+    db: aiosqlite.Connection,
+    *,
+    shared_group_id: int,
+    success_at: str | None = None,
+    health_state: str = "ok",
+) -> dict[str, Any] | None:
+    at = success_at or _now()
+    return await shared_market_group_health_update(
+        db,
+        shared_group_id=shared_group_id,
+        collector_health_state=health_state,
+        collector_last_success_at=at,
+        collector_consecutive_error_count=0,
+        collector_preheated_at=at,
+    )
+
+
+async def shared_market_group_error_record(
+    db: aiosqlite.Connection,
+    *,
+    shared_group_id: int,
+    error_class: str,
+    error_text: str | None = None,
+    failed: bool = False,
+    error_at: str | None = None,
+) -> dict[str, Any] | None:
+    at = error_at or _now()
+    row = await shared_market_group_get(db, shared_group_id=shared_group_id)
+    current_count = int((row or {}).get("collector_consecutive_error_count") or 0)
+    return await shared_market_group_health_update(
+        db,
+        shared_group_id=shared_group_id,
+        collector_health_state="failed" if failed else "degraded",
+        collector_last_error_at=at,
+        collector_last_error_class=error_class,
+        collector_last_error=error_text,
+        collector_consecutive_error_count=current_count + 1,
+    )
+
+
+async def shared_market_group_mark_market_closed(
+    db: aiosqlite.Connection,
+    *,
+    shared_group_id: int,
+    checked_at: str | None = None,
+) -> dict[str, Any] | None:
+    return await shared_market_group_success_record(
+        db,
+        shared_group_id=shared_group_id,
+        success_at=checked_at,
+        health_state="market_closed",
+    )
+
+
+async def shared_market_alert_dedupe_get(
+    db: aiosqlite.Connection,
+    *,
+    dedupe_key: str,
+) -> dict[str, Any] | None:
+    row = await (await db.execute(
+        "SELECT * FROM shared_market_alert_dedupe WHERE dedupe_key=?",
+        (dedupe_key,),
+    )).fetchone()
+    return _row_to_dict(row)
+
+
+async def shared_market_alert_dedupe_touch(
+    db: aiosqlite.Connection,
+    *,
+    dedupe_key: str,
+    shared_group_id: int | None = None,
+    error_class: str,
+    last_error: str | None = None,
+    alerted_at: str | None = None,
+) -> dict[str, Any]:
+    at = alerted_at or _now()
+    await db.execute(
+        """INSERT INTO shared_market_alert_dedupe
+           (dedupe_key, shared_group_id, error_class, last_alert_at, last_error,
+            alert_count, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+           ON CONFLICT(dedupe_key) DO UPDATE SET
+               shared_group_id=excluded.shared_group_id,
+               error_class=excluded.error_class,
+               last_alert_at=excluded.last_alert_at,
+               last_error=excluded.last_error,
+               alert_count=shared_market_alert_dedupe.alert_count + 1,
+               updated_at=excluded.updated_at""",
+        (dedupe_key, shared_group_id, error_class, at, last_error, at, at),
+    )
+    await db.commit()
+    row = await shared_market_alert_dedupe_get(db, dedupe_key=dedupe_key)
+    return row or {}
+
+
 async def shared_market_group_list(
     db: aiosqlite.Connection,
     *,
@@ -2277,10 +2759,15 @@ async def shared_market_group_list(
     sql = (
         "SELECT g.id, g.group_key, g.enabled, g.collector_platform_type, "
         "g.collector_account_name, g.collector_password_enc, "
-        "g.freshness_threshold_sec, "
+        "g.freshness_threshold_sec, g.collector_owner_key, "
+        "g.collector_health_state, g.collector_last_success_at, "
+        "g.collector_last_error_at, g.collector_last_error_class, "
+        "g.collector_last_error, g.collector_consecutive_error_count, "
+        "g.collector_preheated_at, g.collector_alerted_at, "
         "s.issue AS snapshot_issue, s.pre_issue AS snapshot_pre_issue, "
         "s.open_result AS snapshot_open_result, s.source_status, "
         "s.last_error, s.fetched_at AS snapshot_fetched_at, "
+        "s.provider_owner_key, s.provider_kind, s.provider_account_name, "
         "s.updated_at AS snapshot_updated_at, "
         "(SELECT u.normalized_url FROM shared_market_group_urls u "
         " WHERE u.shared_group_id=g.id ORDER BY u.id LIMIT 1) AS primary_url "
