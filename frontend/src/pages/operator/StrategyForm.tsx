@@ -118,6 +118,7 @@ const STRATEGY_TYPE_OPTIONS: Array<{
   { type: AI_RANDOM_MARTIN_TYPE, permission: AI_RANDOM_MARTIN_TYPE, label: 'AI推荐马丁', jndOnly: true },
   { type: RED_WAVE_DOUBLE_TYPE, permission: RED_WAVE_DOUBLE_TYPE, label: '红波追双', jndOnly: true },
   { type: GREEN_WAVE_SINGLE_TYPE, permission: GREEN_WAVE_SINGLE_TYPE, label: '绿波追单', jndOnly: true },
+  { type: 'random_martin', permission: 'random_martin', label: 'AI马丁', jndOnly: true },
 ];
 const DW3_STRATEGY_TYPE_OPTIONS: Array<{
   type: StrategyType;
