@@ -21,12 +21,30 @@ export type StrategyType =
   | 'ai_random_flat'
   | 'ai_random_martin'
   | 'ai_same_random_flat'
-  | 'ai_same_random_martin';
+  | 'ai_same_random_martin'
+  | 'random_martin';
 
 export type StrategyPermissionType =
   | StrategyType
   | 'dw3_flat'
   | 'dw3_martin';
+
+export interface BustEvent {
+  group_id: number;
+  bust_count: number;
+}
+
+export interface RandomMartinConfig {
+  plan_set_id: number;
+  group_ids: number[];
+  N: number;
+  M: number;
+  K: number;
+  martin_multiplier: number;
+  runtime_state?: {
+    groups: Array<{ chase_step: number; martin_level: number; bust_count: number }>;
+  };
+}
 
 export interface StrategyCreate {
   account_id: number;
@@ -67,7 +85,7 @@ export interface StrategyInfo {
   play_code_name?: string;
   base_amount: number;
   martin_sequence: number[] | null;
-  strategy_config?: OmissionRandomStrategyConfig | null;
+  strategy_config?: OmissionRandomStrategyConfig | RandomMartinConfig | null;
   bet_timing: number;
   simulation: boolean;
   status: string;
@@ -79,6 +97,7 @@ export interface StrategyInfo {
   account_name?: string;
   platform_type?: StrategyPlatformType | string;
   gate_window_issues?: number | null;
+  bust_events?: BustEvent[];
 }
 
 export interface OperatorStrategyPermissionInfo {

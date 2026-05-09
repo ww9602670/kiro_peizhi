@@ -6,11 +6,13 @@ import { type FormEvent, useCallback, useEffect, useState } from 'react';
 import { isApiError } from '@/api/request';
 import { createStrategy, updateStrategy } from '@/api/strategies';
 import { listAccounts } from '@/api/accounts';
+import type { RandomMartinConfig } from '@/types/api/strategy';
 import PlayCodeMultiSelect from '@/components/PlayCodeMultiSelect';
 import PlayCodeSelect from '@/components/PlayCodeSelect';
 import type {
   OmissionRandomCategory,
   OmissionRandomPickCount,
+  OmissionRandomStrategyConfig,
   StrategyCreate,
   StrategyInfo,
   StrategyPermissionType,
@@ -47,6 +49,7 @@ interface StrategyFormProps {
   strategy: StrategyInfo | null;
   initialAccountId?: number;
   existingStrategies?: StrategyInfo[];
+  randomMartinConfig?: RandomMartinConfig | null;
   onDone: () => void;
   onCancel: () => void;
 }
@@ -371,9 +374,11 @@ export default function StrategyForm({
   strategy,
   initialAccountId,
   existingStrategies = [],
+  randomMartinConfig,
   onDone,
   onCancel,
 }: StrategyFormProps) {
+  const isRandomMartinMode = Boolean(randomMartinConfig && !strategy);
   const isEdit = !!strategy;
 
   const initialStrategyPlatformType = parsePlatformType(strategy?.platform_type) ?? '';
@@ -385,7 +390,9 @@ export default function StrategyForm({
 
   const [accountId, setAccountId] = useState<number>(strategy?.account_id ?? initialAccountId ?? 0);
   const [name, setName] = useState(strategy?.name ?? '');
-  const [type, setType] = useState<StrategyTypeValue>((strategy?.type as StrategyType) ?? 'flat');
+  const [type, setType] = useState<StrategyTypeValue>(
+    isRandomMartinMode ? 'random_martin' : ((strategy?.type as StrategyType) ?? 'flat')
+  );
   const [playCode, setPlayCode] = useState<string[]>(
     strategy?.play_code && initialStrategyPlatformType !== LUCKYSB_PLATFORM_TYPE && !initialDw3Mode
       ? strategy.play_code.split(',')
@@ -693,6 +700,36 @@ export default function StrategyForm({
       return;
     }
 
+    // random_martin has its own submit path
+    if (isRandomMartinMode && randomMartinConfig) {
+      if (!name.trim()) { setFormError('请输入策略名称'); return; }
+      if (!baseAmount || Number(baseAmount) <= 0) { setFormError('基础金额必须大于 0'); return; }
+      setSubmitting(true);
+      try {
+        await createStrategy({
+          account_id: accountId,
+          name: name.trim(),
+          type: 'random_martin',
+          play_code: '',
+          base_amount: Number(baseAmount),
+          martin_sequence: null,
+          strategy_config: randomMartinConfig as unknown as OmissionRandomStrategyConfig,
+          bet_timing: Number(betTiming) || DEFAULT_BET_TIMING,
+          simulation,
+          stop_loss: stopLoss ? Number(stopLoss) : null,
+          take_profit: takeProfit ? Number(takeProfit) : null,
+          platform_type: submitPlatformType,
+        });
+        onDone();
+      } catch (err) {
+        if (isApiError(err)) setFormError(err.message);
+        else setFormError('提交失败，请稍后重试');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
     if (!name.trim()) {
       setFormError('请输入策略名称');
       return;
@@ -856,6 +893,15 @@ export default function StrategyForm({
           <h2 className="strategy-form-title">{isEdit ? '编辑策略' : '创建策略'}</h2>
         </div>
 
+        {isRandomMartinMode && randomMartinConfig && (
+          <div className="form-hint" style={{ marginBottom: 12, padding: '10px 14px', background: '#0f172a', borderRadius: 6 }}>
+            <strong>随机马丁配置（只读）</strong><br />
+            方案集 ID：{randomMartinConfig.plan_set_id} &nbsp;·&nbsp;
+            已选组数：{randomMartinConfig.group_ids.length} 组 &nbsp;·&nbsp;
+            N={randomMartinConfig.N} &nbsp;K={randomMartinConfig.K} &nbsp;M={randomMartinConfig.M} &nbsp;倍数={randomMartinConfig.martin_multiplier}
+          </div>
+        )}
+
         {formError && <div role="alert" className="form-error">{formError}</div>}
         {resetNotice && <div role="status" className="form-hint form-hint-warn">{resetNotice}</div>}
         {verificationGateError && <div role="status" className="form-hint form-hint-warn">{verificationGateError}</div>}
@@ -904,7 +950,7 @@ export default function StrategyForm({
           />
         </div>
 
-        {!isEdit && canUseDw3 && (
+        {!isEdit && !isRandomMartinMode && canUseDw3 && (
           <div className="form-field">
             <span className="form-label">{DW3_DISPLAY_NAME}模式</span>
             <div className="type-toggle">
@@ -928,7 +974,7 @@ export default function StrategyForm({
           </div>
         )}
 
-        {!isEdit && (
+        {!isEdit && !isRandomMartinMode && (
           <div className="form-field">
             <span className="form-label">策略类型</span>
             {strategyPermissionError && (
@@ -1180,7 +1226,7 @@ export default function StrategyForm({
           </>
         )}
 
-        {!isEdit && isLuckySb && !dw3Mode && (
+        {!isEdit && !isRandomMartinMode && isLuckySb && !dw3Mode && (
           <div className="form-field">
             <label className="form-label">极速飞艇玩法</label>
             <PlayCodeSelect
@@ -1192,7 +1238,7 @@ export default function StrategyForm({
           </div>
         )}
 
-        {!isEdit && !isLuckySb && !isWaveStrategy && !isRandomPickStrategy && !dw3Mode && (
+        {!isEdit && !isRandomMartinMode && !isLuckySb && !isWaveStrategy && !isRandomPickStrategy && !dw3Mode && (
           <div className="form-field">
             <label className="form-label">玩法</label>
             <PlayCodeMultiSelect

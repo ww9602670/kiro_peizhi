@@ -18,6 +18,7 @@ from app.engine.strategies.omission_random import (
     OmissionRandomFlatStrategy,
     OmissionRandomMartinStrategy,
 )
+from app.engine.strategies.random_martin import RandomMartinStrategy
 
 __all__ = [
     "FlatStrategyImpl",
@@ -30,4 +31,5 @@ __all__ = [
     "AiSameRandomMartinStrategy",
     "OmissionRandomFlatStrategy",
     "OmissionRandomMartinStrategy",
+    "RandomMartinStrategy",
 ]

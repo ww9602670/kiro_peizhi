@@ -283,3 +283,8 @@
     width: 100%;
   }
 }
+
+/* bust events */
+.bust-events { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+.bust-event-tag { background: #7f1d1d; color: #fca5a5; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+

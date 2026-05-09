@@ -26,14 +26,14 @@ class _WriteOp:
     """"""
     sql: str
     params: tuple[Any, ...] = ()
-    future: asyncio.Future = field(default_factory=lambda: asyncio.get_event_loop().create_future())
+    future: asyncio.Future | None = field(default=None)
 
 
 @dataclass
 class _BatchWriteOp:
     """"""
     statements: list[tuple[str, tuple[Any, ...]]]
-    future: asyncio.Future = field(default_factory=lambda: asyncio.get_event_loop().create_future())
+    future: asyncio.Future | None = field(default=None)
 
 
 class WriteQueue:
@@ -86,7 +86,7 @@ class WriteQueue:
                 break
             if op is None:
                 continue
-            if hasattr(op, "future") and not op.future.done():
+            if hasattr(op, "future") and op.future is not None and not op.future.done():
                 op.future.set_exception(RuntimeError("WriteQueue "))
 
     def _check_running(self) -> None:
@@ -163,11 +163,11 @@ class WriteQueue:
         try:
             await self._db.execute(op.sql, op.params)
             await self._db.commit()
-            if not op.future.done():
+            if op.future is not None and not op.future.done():
                 op.future.set_result(None)
         except Exception as exc:
             await self._safe_rollback()
-            if not op.future.done():
+            if op.future is not None and not op.future.done():
                 op.future.set_exception(exc)
 
     async def _exec_batch(self, op: _BatchWriteOp) -> None:
@@ -177,11 +177,11 @@ class WriteQueue:
             for sql, params in op.statements:
                 await self._db.execute(sql, params)
             await self._db.execute("COMMIT")
-            if not op.future.done():
+            if op.future is not None and not op.future.done():
                 op.future.set_result(None)
         except Exception as exc:
             await self._safe_rollback()
-            if not op.future.done():
+            if op.future is not None and not op.future.done():
                 op.future.set_exception(exc)
 
     async def _safe_rollback(self) -> None:

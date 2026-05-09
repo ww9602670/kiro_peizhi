@@ -42,7 +42,11 @@ from app.engine.session_runtime import AccountSessionRuntime
 from app.engine.settlement import SettlementProcessor
 from app.engine.strategies.base import StrategyStopRequest
 from app.engine.strategy_runner import BetSignal, StrategyRunner
-from app.models.db_ops import account_platform_session_upsert, strategy_update_status
+from app.models.db_ops import (
+    account_platform_session_upsert,
+    strategy_update,
+    strategy_update_status,
+)
 from app.utils.strategy_timing import (
     BET_TIMING_MAX,
     BET_TIMING_MIN,
@@ -1984,9 +1988,16 @@ class AccountWorker:
 
     async def _stop_strategy_runner(self, strategy_id: int, reason: str) -> None:
         """Stop one strategy runner and persist strategy status to stopped."""
+        import json as _json
         runner = self.strategies.get(strategy_id)
+        config_snapshot: dict | None = None
         if runner is not None:
             runner.stop()
+            if hasattr(runner.strategy, "get_config_snapshot"):
+                try:
+                    config_snapshot = runner.strategy.get_config_snapshot()
+                except Exception:
+                    logger.exception("get_config_snapshot failed strategy_id=%d", strategy_id)
         self.remove_strategy(strategy_id, apply_next_issue_only=False)
         if self._next_issue_strategies is not None:
             self._next_issue_strategies.pop(strategy_id, None)
@@ -1994,12 +2005,34 @@ class AccountWorker:
             self._next_issue_profiles.pop(strategy_id, None)
 
         try:
-            await strategy_update_status(
-                self.db,
-                strategy_id=strategy_id,
-                operator_id=self.operator_id,
-                status="stopped",
-            )
+            if config_snapshot is not None:
+                row = await (
+                    await self.db.execute(
+                        "SELECT strategy_config FROM strategies WHERE id=? AND operator_id=?",
+                        (strategy_id, self.operator_id),
+                    )
+                ).fetchone()
+                existing_cfg: dict = {}
+                if row and row[0]:
+                    try:
+                        existing_cfg = _json.loads(row[0])
+                    except Exception:
+                        pass
+                existing_cfg["runtime_state"] = config_snapshot
+                await strategy_update(
+                    self.db,
+                    strategy_id=strategy_id,
+                    operator_id=self.operator_id,
+                    status="stopped",
+                    strategy_config=_json.dumps(existing_cfg, ensure_ascii=False),
+                )
+            else:
+                await strategy_update_status(
+                    self.db,
+                    strategy_id=strategy_id,
+                    operator_id=self.operator_id,
+                    status="stopped",
+                )
         except Exception:
             logger.exception(
                 "strategy stop persist failed strategy_id=%d account_id=%d reason=%s",

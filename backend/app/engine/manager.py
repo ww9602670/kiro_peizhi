@@ -833,6 +833,72 @@ class EngineManager:
                         "sequence": seq_values,
                         "direction_codes": key_codes,
                     }
+            elif strategy_type == "random_martin":
+                from app.engine.random_plan_generator import Plan, PeriodBet
+                from app.config import BOCAI_DB_PATH as _RM_DB_PATH
+                import sqlite3 as _sqlite3
+
+                cfg = strategy_config
+                plan_set_id = cfg.get("plan_set_id")
+                group_ids = cfg.get("group_ids", [])
+                if not plan_set_id or not group_ids:
+                    logger.warning(
+                        "random_martin missing plan_set_id or group_ids strategy_id=%s",
+                        strategy_data.get("id"),
+                    )
+                    return None
+                try:
+                    with _sqlite3.connect(_RM_DB_PATH) as _conn:
+                        row = _conn.execute(
+                            "SELECT plans_json FROM random_plan_sets WHERE id=?",
+                            (plan_set_id,),
+                        ).fetchone()
+                    if not row:
+                        logger.warning(
+                            "plan_set_id=%d not found strategy_id=%s",
+                            plan_set_id, strategy_data.get("id"),
+                        )
+                        return None
+                    all_plans_data = json.loads(row[0])
+                    all_plans: dict[int, Plan] = {
+                        pd["group_id"]: Plan(
+                            group_id=pd["group_id"],
+                            periods=[
+                                PeriodBet(
+                                    period_index=pb["period_index"],
+                                    ball=pb["ball"],
+                                    numbers=tuple(pb["numbers"]),
+                                    mask=pb["mask"],
+                                )
+                                for pb in pd["periods"]
+                            ],
+                        )
+                        for pd in all_plans_data
+                    }
+                    groups = [all_plans[gid] for gid in group_ids if gid in all_plans]
+                except Exception:
+                    logger.exception(
+                        "failed to load plan_set_id=%d strategy_id=%s",
+                        plan_set_id, strategy_data.get("id"),
+                    )
+                    return None
+                if len(groups) != len(group_ids):
+                    logger.warning(
+                        "some group_ids missing in plan_set plan_set_id=%d strategy_id=%s",
+                        plan_set_id, strategy_data.get("id"),
+                    )
+                    return None
+                kwargs = {
+                    "groups": groups,
+                    "N": int(cfg.get("N", len(groups[0].periods))),
+                    "M": int(cfg["M"]),
+                    "base_unit_fen": int(base_amount),
+                    "martin_multiplier": float(cfg.get("martin_multiplier", 2.0)),
+                    "runtime_state": cfg.get("runtime_state", {}),
+                    "alert_service": self.alert_service,
+                    "operator_id": int(strategy_data.get("operator_id") or 0),
+                    "strategy_name": str(strategy_data.get("name") or "random_martin"),
+                }
             else:
                 logger.warning("unsupported strategy type=%s", strategy_type)
                 return None

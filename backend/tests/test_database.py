@@ -38,6 +38,8 @@ EXPECTED_TABLES = {
     "shared_market_uncovered_urls",
     "simulation_bet_orders",
     "simulation_strategy_stats",
+    "random_backtest_tasks",
+    "random_plan_sets",
 }
 
 

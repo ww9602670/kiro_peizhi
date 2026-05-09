@@ -36,6 +36,7 @@ StrategyPermissionType = Literal[
     "ai_random_martin",
     "ai_same_random_flat",
     "ai_same_random_martin",
+    "random_martin",
 ]
 
 STRATEGY_PERMISSION_TYPES: tuple[str, ...] = (
@@ -51,6 +52,7 @@ STRATEGY_PERMISSION_TYPES: tuple[str, ...] = (
     "ai_random_martin",
     "ai_same_random_flat",
     "ai_same_random_martin",
+    "random_martin",
 )
 _STRATEGY_PERMISSION_TYPE_SET = set(STRATEGY_PERMISSION_TYPES)
 
@@ -163,8 +165,9 @@ class StrategyCreate(BaseModel):
         "ai_random_martin",
         "ai_same_random_flat",
         "ai_same_random_martin",
+        "random_martin",
     ]
-    play_code: str = Field(..., min_length=1)
+    play_code: str = Field(default="", min_length=0)
     base_amount: float = Field(..., gt=0)
     martin_sequence: Optional[list[float]] = None
     strategy_config: Optional[dict[str, Any]] = None
@@ -177,6 +180,21 @@ class StrategyCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_strategy(self):
+        if self.type == "random_martin":
+            if not isinstance(self.strategy_config, dict):
+                raise ValueError("random_martin 需要 strategy_config 包含 plan_set_id、group_ids、N、M 等字段")
+            cfg = self.strategy_config
+            if not cfg.get("plan_set_id"):
+                raise ValueError("random_martin strategy_config 缺少 plan_set_id")
+            group_ids = cfg.get("group_ids", [])
+            if not group_ids or not (10 <= len(group_ids) <= 1500):
+                raise ValueError("random_martin group_ids 数量必须在 10-1500 之间")
+            if not cfg.get("M"):
+                raise ValueError("random_martin strategy_config 缺少 M（追投上限）")
+            self.play_code = "RANDOM_MARTIN"
+            self.martin_sequence = None
+            return self
+
         if is_random_pick_type(self.type):
             if not isinstance(self.strategy_config, dict):
                 raise ValueError("strategy_config")
@@ -383,3 +401,4 @@ class StrategyInfo(BaseModel):
     play_code_name: str = ""
     account_name: Optional[str] = None
     platform_type: Optional[str] = None
+    bust_events: Optional[list[dict[str, Any]]] = None

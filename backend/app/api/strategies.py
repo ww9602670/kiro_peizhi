@@ -415,6 +415,18 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
 
     platform_type = row.get("platform_type", "JND28WEB")
 
+    bust_events = None
+    if row.get("type") == "random_martin" and strategy_config:
+        rt = strategy_config.get("runtime_state", {})
+        groups = rt.get("groups", [])
+        busted = [
+            {"group_id": i, "bust_count": g["bust_count"]}
+            for i, g in enumerate(groups)
+            if isinstance(g, dict) and g.get("bust_count", 0) > 0
+        ]
+        if busted:
+            bust_events = busted
+
     return StrategyInfo(
         id=row["id"],
         account_id=row["account_id"],
@@ -435,10 +447,9 @@ def _to_strategy_info(row: dict) -> StrategyInfo:
         total_pnl=_fen_to_yuan(row["total_pnl"]),
         gate_window_issues=row.get("gate_window_issues"),
         platform_type=platform_type,
+        bust_events=bust_events,
     )
 
-
-#   
 
 @router.get("/strategies")
 async def list_strategies(
@@ -464,12 +475,12 @@ async def create_strategy(
 ):
     """
 
-    
-    1. account_id 
-    2. schema 
-    3. 
+
+    1. account_id
+    2. schema
+    3.
     """
-    # 1.  account 
+    # 1.  account
     account = await _load_account_with_strategy_gate_context(
         db,
         account_id=body.account_id,
@@ -481,9 +492,21 @@ async def create_strategy(
         body.platform_type,
         account,
     )
-
-    # 2. 
     play_code = body.play_code
+
+    # random_martin: 验证 plan_set_id 归属
+    if body.type == "random_martin" and body.strategy_config:
+        plan_set_id = body.strategy_config.get("plan_set_id")
+        if plan_set_id:
+            ps_row = await (
+                await db.execute(
+                    "SELECT id FROM random_plan_sets WHERE id=? AND operator_id=?",
+                    (plan_set_id, operator["id"]),
+                )
+            ).fetchone()
+            if not ps_row:
+                raise BizError(4001, f"plan_set_id={plan_set_id} 不存在或不属于当前操作者")
+
     strategy_config_json = (
         json.dumps(body.strategy_config, ensure_ascii=False)
         if body.strategy_config is not None

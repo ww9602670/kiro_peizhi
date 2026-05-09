@@ -13,6 +13,7 @@ from app.api.admin import router as admin_router
 from app.api.alerts import router as alerts_router
 from app.api.auth import router as auth_router
 from app.api.backtest import router as backtest_router
+from app.api.random_backtest import router as random_backtest_router
 from app.api.bet_orders import router as bet_orders_router
 from app.api.dashboard import router as dashboard_router
 from app.api.health import router as health_router
@@ -73,6 +74,7 @@ async def lifespan(app: FastAPI):
         jnd28_db_path=BOCAI_HISTORY_DB_PATH,
         bocai_db_path=BOCAI_DB_PATH,
     )
+    app.state.random_backtest_engines = {}  # task_id → RandomBacktestEngine
 
     logger.info("preparing worker restore")
     await account_platform_session_clear_locks(db)
@@ -157,3 +159,4 @@ app.include_router(odds_router, prefix="/api/v1", tags=["odds"])
 app.include_router(play_codes_router, prefix="/api/v1", tags=["play-codes"])
 app.include_router(lottery_router, prefix="/api/v1/lottery", tags=["lottery"])
 app.include_router(backtest_router, prefix="/api/v1", tags=["backtest"])
+app.include_router(random_backtest_router, prefix="/api/v1", tags=["random-backtest"])

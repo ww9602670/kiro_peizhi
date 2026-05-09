@@ -15,12 +15,13 @@ import StrategyStatusTag from '@/components/StrategyStatusTag';
 import Toast from '@/components/Toast';
 import { useConfirm } from '@/hooks/useConfirm';
 import { useToast } from '@/hooks/useToast';
-import type { StrategyInfo } from '@/types/api/strategy';
+import type { RandomMartinConfig, StrategyInfo } from '@/types/api/strategy';
 import type { AccountInfo } from '@/types/api/account';
 import { getPlatformLabel } from '@/utils/platformLabels';
 import { getPlayCodeDisplay } from '@/utils/playCodeDisplay';
 import Backtest from './Backtest';
 import BetOrders from './BetOrders';
+import RandomBacktest from './RandomBacktest';
 import StrategyForm from './StrategyForm';
 import './Strategies.css';
 
@@ -34,6 +35,7 @@ function getTypeBadge(type: string): { label: string; className: string } {
   if (type === 'ai_random_flat') return { label: 'AI推荐平注', className: 'type-badge-flat' };
   if (type === 'ai_random_martin') return { label: 'AI推荐马丁', className: 'type-badge-martin' };
   if (type === 'martin') return { label: '马丁', className: 'type-badge-martin' };
+  if (type === 'random_martin') return { label: '随机马丁', className: 'type-badge-martin' };
   return { label: '普通', className: 'type-badge-flat' };
 }
 
@@ -47,7 +49,7 @@ function getOmissionRandomConfigDisplay(strategy: StrategyInfo): string {
   return pickCount ? `每类${pickCount}个` : '';
 }
 
-type StrategyWorkspace = 'list' | 'orders' | 'backtest';
+type StrategyWorkspace = 'list' | 'orders' | 'backtest' | 'random-backtest';
 
 interface StrategiesProps {
   createIntent?: StrategyCreateIntent | null;
@@ -90,6 +92,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
   const [showForm, setShowForm] = useState(false);
   const [editingStrategy, setEditingStrategy] = useState<StrategyInfo | null>(null);
   const [createAccountId, setCreateAccountId] = useState<number | undefined>(undefined);
+  const [pendingRandomMartinConfig, setPendingRandomMartinConfig] = useState<RandomMartinConfig | null>(null);
   const [actionLoading, setActionLoading] = useState<Record<number, string>>({});
   const { confirmState, confirm, notify, handleConfirm, handleCancel } = useConfirm();
   const { messages, removeToast } = useToast();
@@ -172,6 +175,14 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     showMergedNotice,
     strategyGateLoading,
   ]);
+
+  const handleRandomMartinCreate = useCallback((config: RandomMartinConfig) => {
+    setWorkspace('list');
+    setEditingStrategy(null);
+    setCreateAccountId(undefined);
+    setPendingRandomMartinConfig(config);
+    setShowForm(true);
+  }, []);
 
   const withActionLoadingSafe = useCallback(
     async (id: number, action: string, task: () => Promise<void>, fallbackError: string) => {
@@ -256,6 +267,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     setShowForm(false);
     setEditingStrategy(null);
     setCreateAccountId(undefined);
+    setPendingRandomMartinConfig(null);
     void fetchStrategies();
   };
 
@@ -263,6 +275,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
     setShowForm(false);
     setEditingStrategy(null);
     setCreateAccountId(undefined);
+    setPendingRandomMartinConfig(null);
   };
 
   if (showForm) {
@@ -271,6 +284,7 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
         strategy={editingStrategy}
         initialAccountId={createAccountId}
         existingStrategies={strategies}
+        randomMartinConfig={pendingRandomMartinConfig}
         onDone={handleFormDone}
         onCancel={handleFormCancel}
       />
@@ -347,10 +361,20 @@ export default function Strategies({ createIntent, onCreateIntentConsumed }: Str
         >
           回测
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={workspace === 'random-backtest'}
+          className={`workspace-tab ${workspace === 'random-backtest' ? 'workspace-tab-active' : ''}`}
+          onClick={() => setWorkspace('random-backtest')}
+        >
+          随机回测
+        </button>
       </div>
 
       {workspace === 'orders' && <BetOrders />}
       {workspace === 'backtest' && <Backtest />}
+      {workspace === 'random-backtest' && <RandomBacktest onCreateStrategy={handleRandomMartinCreate} />}
 
       {workspace === 'list' && (
         <>
@@ -465,6 +489,16 @@ function StrategyCard({
           </span>
         </div>
       </div>
+
+      {strategy.type === 'random_martin' && strategy.bust_events && strategy.bust_events.length > 0 && (
+        <div className="bust-events">
+          {strategy.bust_events.map(e => (
+            <span key={e.group_id} className="bust-event-tag">
+              第 {e.group_id + 1} 组已爆掉 {e.bust_count} 次
+            </span>
+          ))}
+        </div>
+      )}
 
       <div className="strategy-actions">
         {strategy.status === 'stopped' && (
