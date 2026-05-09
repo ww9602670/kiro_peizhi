@@ -164,7 +164,9 @@ async def test_admin_shared_market_uncovered_ignore_recheck(client, admin_header
     assert recheck_resp.status_code == 200
     recheck_body = recheck_resp.json()
     assert recheck_body["code"] == 0
-    assert recheck_body["data"]["status"] == "pending"
+    # P3: recheck now runs detection synchronously. With no runtime in test env,
+    # the row stays at 'detecting' (set by mark_detecting before runtime gate).
+    assert recheck_body["data"]["status"] in ("pending", "detecting")
 
 
 @pytest.mark.asyncio

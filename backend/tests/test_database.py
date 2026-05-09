@@ -40,6 +40,8 @@ EXPECTED_TABLES = {
     "simulation_strategy_stats",
     "random_backtest_tasks",
     "random_plan_sets",
+    "account_shared_market_routes",
+    "shared_market_alert_dedupe",
 }
 
 
