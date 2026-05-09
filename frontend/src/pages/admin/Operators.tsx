@@ -46,6 +46,7 @@ const STRATEGY_PERMISSION_OPTIONS: Array<{ value: StrategyPermissionType; label:
   { value: 'ai_random_martin', label: 'AI推荐马丁' },
   { value: 'red_wave_double_martin', label: '红波追双' },
   { value: 'green_wave_single_martin', label: '绿波追单' },
+  { value: 'random_martin', label: 'AI马丁' },
 ];
 
 export default function Operators() {

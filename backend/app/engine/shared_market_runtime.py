@@ -720,6 +720,22 @@ class SharedMarketContracts:
             allow_failure=True,
         )
 
+    async def shared_market_group_url_exists(
+        self,
+        *,
+        normalized_url: str,
+    ) -> dict[str, Any] | None:
+        result = await self._invoke_with_variants(
+            "shared_market_group_url_exists",
+            [
+                {"normalized_url": normalized_url},
+            ],
+            allow_failure=True,
+        )
+        if isinstance(result, dict):
+            return result
+        return None
+
     async def active_admin_operator_ids(self) -> list[int]:
         result = await self._invoke_with_variants(
             "operator_list_all",
@@ -1123,6 +1139,47 @@ class SharedMarketRuntime:
         if not normalized_url:
             return None, None
 
+        # P0: 优先检查 URL 是否已绑定到 shared_market_group_urls。
+        # 如果已绑定且组仍 enabled，直接复用绑定，避免反复跑 detector probe
+        # 导致 review_required 假阳性（修复"已绑定 URL 仍被标 uncovered"问题）。
+        try:
+            existing = await self._contracts.shared_market_group_url_exists(
+                normalized_url=normalized_url,
+            )
+        except Exception:
+            existing = None
+        if existing and isinstance(existing, dict):
+            existing_group_id = self._safe_dict_id(
+                existing,
+                keys=("shared_group_id",),
+            )
+            if existing_group_id > 0:
+                group_row = await self._contracts.shared_market_group_get(
+                    shared_group_id=existing_group_id,
+                )
+                if isinstance(group_row, dict) and bool(group_row.get("enabled", True)):
+                    logger.info(
+                        "shared_url_already_bound platform_type=%s group_id=%d normalized_url=%s",
+                        platform_type,
+                        existing_group_id,
+                        normalized_url,
+                    )
+                    # 仍记一次 hit_count 但直接标 matched 后返回。
+                    touch_row = await self._contracts.uncovered_url_touch(
+                        platform_type=platform_type,
+                        normalized_url=normalized_url,
+                        sample_raw_url=sample_raw_url or platform_url,
+                        last_account_id=account_id,
+                        last_platform_type=platform_type,
+                    )
+                    row_id = self._safe_dict_id(touch_row, keys=("id",))
+                    if row_id > 0:
+                        await self._contracts.uncovered_url_mark_matched(
+                            row_id=row_id,
+                            shared_group_id=existing_group_id,
+                        )
+                    return existing_group_id, None
+
         touch_row = await self._contracts.uncovered_url_touch(
             platform_type=platform_type,
             normalized_url=normalized_url,
@@ -1441,6 +1498,25 @@ class SharedMarketRuntime:
             draw_state=draw_state,
         )
 
+    # P1: JND28WEB 和 JND282 是同一物理平台的两种协议适配器，行情完全一致。
+    # 等价类用于 _discover_url_group_match 的 platform_type 匹配，避免严格相等
+    # 导致同物理平台的不同适配器被误判为不同共享组。
+    _PLATFORM_TYPE_EQUIV: dict[str, frozenset[str]] = {
+        "JND28WEB": frozenset({"JND28WEB", "JND282"}),
+        "JND282": frozenset({"JND28WEB", "JND282"}),
+    }
+
+    @classmethod
+    def _platform_types_compatible(cls, a: str, b: str) -> bool:
+        a_up = (a or "").strip().upper()
+        b_up = (b or "").strip().upper()
+        if not a_up or not b_up:
+            return False
+        if a_up == b_up:
+            return True
+        equiv = cls._PLATFORM_TYPE_EQUIV.get(a_up)
+        return equiv is not None and b_up in equiv
+
     async def _discover_url_group_match(
         self,
         *,
@@ -1479,7 +1555,10 @@ class SharedMarketRuntime:
                 _safe_stripped_text(row.get("collector_platform_type"))
                 or normalized_platform_type
             ).upper()
-            if collector_platform_type != normalized_platform_type:
+            # P1: 用等价类比较代替严格相等
+            if not self._platform_types_compatible(
+                collector_platform_type, normalized_platform_type
+            ):
                 continue
 
             try:

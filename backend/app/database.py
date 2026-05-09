@@ -519,7 +519,21 @@ DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_simulation_strategy_stats_operator ON simulation_strategy_stats(operator_id, account_id);",
 
-    # 18. random_backtest_tasks (PC28 随机马丁回测任务)
+    # 18. random_plan_sets (随机方案集，必须先于 random_backtest_tasks 创建以支持 FK)
+    """
+    CREATE TABLE IF NOT EXISTS random_plan_sets (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator_id         INTEGER NOT NULL REFERENCES operators(id),
+        num_groups          INTEGER NOT NULL,
+        periods_per_group   INTEGER NOT NULL,
+        numbers_per_period  INTEGER NOT NULL,
+        plans_json          TEXT NOT NULL,
+        created_at          TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_random_plan_sets_operator ON random_plan_sets(operator_id, created_at);",
+
+    # 19. random_backtest_tasks (PC28 随机马丁回测任务)
     """
     CREATE TABLE IF NOT EXISTS random_backtest_tasks (
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -537,20 +551,6 @@ DDL_STATEMENTS = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_random_backtest_tasks_operator ON random_backtest_tasks(operator_id, created_at);",
-
-    # 19. random_plan_sets (随机方案集，独立存储供回测和策略复用)
-    """
-    CREATE TABLE IF NOT EXISTS random_plan_sets (
-        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-        operator_id         INTEGER NOT NULL REFERENCES operators(id),
-        num_groups          INTEGER NOT NULL,
-        periods_per_group   INTEGER NOT NULL,
-        numbers_per_period  INTEGER NOT NULL,
-        plans_json          TEXT NOT NULL,
-        created_at          TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
-    );
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_random_plan_sets_operator ON random_plan_sets(operator_id, created_at);",
 ]
 
 

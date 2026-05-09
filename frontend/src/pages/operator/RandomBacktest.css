@@ -255,6 +255,26 @@
   font-size: 0.75rem;
 }
 
+/* Iteration tag + Phase 4 actions */
+.rb-iter-tag {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 0.75rem;
+  color: #fbbf24;
+  background: #1e293b;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-weight: normal;
+}
+.rb-phase4-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+.rb-phase4-actions .rb-btn-primary { flex: 1 1 auto; }
+.rb-phase4-actions .rb-btn-ghost { flex: 0 0 auto; }
+
 /* Selection status */
 .rb-selection-status {
   font-size: 0.85rem;

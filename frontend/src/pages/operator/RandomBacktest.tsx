@@ -96,6 +96,11 @@ export default function RandomBacktest({ onCreateStrategy }: RandomBacktestProps
   const [selectedGroups, setSelectedGroups] = useState<Set<number>>(new Set());
   const [selectTab, setSelectTab] = useState<'survived' | 'busted'>('survived');
 
+  // 多次回测筛选迭代（最多 5 层）
+  const MAX_ITERATION_DEPTH = 5;
+  const [iterationDepth, setIterationDepth] = useState(0);
+  const [filteredPlanIds, setFilteredPlanIds] = useState<number[] | null>(null);
+
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const stopPolling = useCallback(() => {
@@ -191,6 +196,10 @@ export default function RandomBacktest({ onCreateStrategy }: RandomBacktestProps
     setProgress(0);
     setTaskResult(null);
     try {
+      // 筛选模式：只测 filteredPlanIds 包含的组
+      const plansToTest = filteredPlanIds === null
+        ? planData.plans
+        : planData.plans.filter(p => filteredPlanIds.includes(p.group_id));
       const res = await createRandomBacktestTask({
         config: {
           fund_mode: fundMode,
@@ -201,7 +210,7 @@ export default function RandomBacktest({ onCreateStrategy }: RandomBacktestProps
           odds,
           chase_limit: chaseM,
         },
-        plans: planData.plans,
+        plans: plansToTest,
         plan_set_id: planData.plan_set_id,
         start_date: startDate,
         end_date: endDate,
@@ -396,7 +405,14 @@ export default function RandomBacktest({ onCreateStrategy }: RandomBacktestProps
       {phase >= 3 && (
         <div className="rb-card">
           <div className="rb-card-header">
-            <h2>回测执行</h2>
+            <h2>
+              回测执行
+              {iterationDepth > 0 && filteredPlanIds && (
+                <span className="rb-iter-tag">
+                  ｜第 {iterationDepth} 层迭代（{filteredPlanIds.length} 组）
+                </span>
+              )}
+            </h2>
             {!backtestRunning && (
               <button className="rb-btn-ghost" onClick={() => { setPhase(2); setTaskResult(null); }}>
                 返回方案
@@ -528,11 +544,53 @@ export default function RandomBacktest({ onCreateStrategy }: RandomBacktestProps
             已选 {selectedCount} 组
             {tooFew && ` （最少选择 10 组）`}
             {tooMany && ` （最多选择 1500 组）`}
+            {iterationDepth > 0 && (
+              <span className="rb-iter-tag"> · 第 {iterationDepth} 层迭代（最多 {MAX_ITERATION_DEPTH} 层）</span>
+            )}
           </div>
 
-          <button className="rb-btn-primary" onClick={handleCreateStrategy} disabled={!selectionValid}>
-            创建随机马丁策略 →
-          </button>
+          <div className="rb-phase4-actions">
+            <button
+              className="rb-btn-primary"
+              onClick={handleCreateStrategy}
+              disabled={!selectionValid}
+            >
+              创建AI马丁策略 →
+            </button>
+            <button
+              className="rb-btn-ghost"
+              disabled={selectedCount === 0 || iterationDepth >= MAX_ITERATION_DEPTH}
+              onClick={() => {
+                if (iterationDepth >= MAX_ITERATION_DEPTH) {
+                  showToast(`已达最大迭代深度 ${MAX_ITERATION_DEPTH} 层，请重置后再次开始`);
+                  return;
+                }
+                setFilteredPlanIds(Array.from(selectedGroups));
+                setIterationDepth(d => d + 1);
+                setSelectedGroups(new Set());
+                setTaskResult(null);
+                setProgress(0);
+                setPhase(3);
+              }}
+            >
+              用所选 {selectedCount} 组换日期再回测 ↻
+            </button>
+            {iterationDepth > 0 && (
+              <button
+                className="rb-btn-ghost"
+                onClick={() => {
+                  setFilteredPlanIds(null);
+                  setIterationDepth(0);
+                  setSelectedGroups(new Set());
+                  setTaskResult(null);
+                  setProgress(0);
+                  setPhase(3);
+                }}
+              >
+                重置回完整方案
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>

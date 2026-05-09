@@ -2043,6 +2043,20 @@ async def shared_market_group_url_add(
               updated_at=excluded.updated_at""",
         (shared_group_id, normalized_url, now, now),
     )
+    # P2: 同步把对应的 uncovered_url 标 matched，避免再被 worker 当作未覆盖处理
+    await db.execute(
+        """UPDATE shared_market_uncovered_urls
+           SET status='matched',
+               detection_status='matched',
+               review_status='matched',
+               matched_shared_group_id=?,
+               shared_group_id=?,
+               last_checked_at=?,
+               failure_reason=NULL,
+               detection_error=NULL
+           WHERE normalized_url=?""",
+        (shared_group_id, shared_group_id, now, normalized_url),
+    )
     await db.commit()
     row = await (await db.execute(
         "SELECT * FROM shared_market_group_urls WHERE normalized_url=?",

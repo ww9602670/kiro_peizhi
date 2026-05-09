@@ -784,17 +784,23 @@ async def recheck_shared_market_uncovered_url(
             normalized_url,
         )
     else:
-        asyncio.create_task(
-            _run_shared_url_detection_task(
-                runtime=runtime,
-                db=db,
-                record_id=record_id,
-                normalized_url=normalized_url,
-                platform_type=platform_type,
-                account_id=account_id,
-                sample_raw_url=row.get("sample_raw_url"),
-            )
+        # P3: 同步等待 detection 完成。原本 fire-and-forget 会让用户看到"已标记"
+        # 但其实结果还没出，必须刷新才能看到 matched/failed。
+        # 改为 await — 接口可能阻塞数秒（取决于平台探测耗时），但用户拿到结果前不会返回。
+        await _run_shared_url_detection_task(
+            runtime=runtime,
+            db=db,
+            record_id=record_id,
+            normalized_url=normalized_url,
+            platform_type=platform_type,
+            account_id=account_id,
+            sample_raw_url=row.get("sample_raw_url"),
         )
+
+    # 重新读最新记录返回，让前端立即看到 matched/failed 结果
+    refreshed = await shared_market_uncovered_url_get(db, row_id=record_id)
+    if refreshed is not None:
+        review = refreshed
 
     await audit_log_create(
         db,
