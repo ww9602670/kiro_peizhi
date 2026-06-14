@@ -426,6 +426,64 @@ def test_coordinate_or_limit_missing_is_fail_closed():
     assert all(item.event_type != ExecutionEventType.PLAN_GENERATED for item in orch.events)
 
 
+def test_known_standard_viewport_profile_allows_missing_runtime_coordinates():
+    orch = HedgeExecutionOrchestrator()
+    orch.start(HedgeExecutionConfig(main_amount_min=100, main_amount_max=100))
+
+    orch._latest_temporal_states = {
+        instance_id: _snapshot(
+            instance_id,
+            "R21",
+            include_coordinates=False,
+            include_limit=False,
+        )
+        for instance_id in ("a1", "a2", "a3", "a4")
+    }
+    for snapshot in orch._latest_temporal_states.values():
+        snapshot.safe_summary.update(
+            {
+                "limit_label": "4-250",
+                "runtime_viewport": {"width": 960, "height": 620},
+            }
+        )
+
+    plan = orch.evaluate_current_round()
+
+    assert plan is not None
+    blocked = [item for item in orch.events if item.event_type == ExecutionEventType.EXECUTION_BLOCKED]
+    assert not any("coordinate_not_verified" in item.safe_summary.get("reasons", ()) for item in blocked)
+
+
+def test_explicit_coordinate_false_still_blocks_even_with_standard_viewport():
+    orch = HedgeExecutionOrchestrator()
+    orch.start(HedgeExecutionConfig(main_amount_min=100, main_amount_max=100))
+
+    orch._latest_temporal_states = {
+        instance_id: _snapshot(
+            instance_id,
+            "R22",
+            include_coordinates=False,
+            include_limit=False,
+        )
+        for instance_id in ("a1", "a2", "a3", "a4")
+    }
+    for snapshot in orch._latest_temporal_states.values():
+        snapshot.safe_summary.update(
+            {
+                "limit_label": "4-250",
+                "runtime_viewport": {"width": 960, "height": 620},
+                "coordinate_ready": False,
+            }
+        )
+
+    plan = orch.evaluate_current_round()
+
+    assert plan is None
+    excluded = [item for item in orch.events if item.event_type == ExecutionEventType.ACCOUNT_EXCLUDED]
+    assert excluded
+    assert "coordinate_not_verified" in excluded[-1].safe_summary["reasons"]
+
+
 def test_addon_four_is_recorded_in_shadow_plan():
     orch = HedgeExecutionOrchestrator()
     config = HedgeExecutionConfig(

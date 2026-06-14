@@ -3325,7 +3325,20 @@ class MainDashboard(QMainWindow):
             or base_summary.get("room_id")
             or ""
         ).strip()
-        limit_label = str(stable_state.get("limit_label") or base_summary.get("limit_label") or base_summary.get("runtime_limit_label") or "").strip()
+        limit_label = InstanceCard._valid_limit_label(
+            stable_state.get("limit_label"),
+            stable_state.get("runtime_limit_label"),
+            stable_state.get("frontend_limit_label"),
+            stable_state.get("canvas_limit_label"),
+            stable_state.get("label_limit_label"),
+            base_summary.get("limit_label"),
+            base_summary.get("runtime_limit_label"),
+            base_summary.get("frontend_limit_label"),
+            base_summary.get("canvas_limit_label"),
+            base_summary.get("label_limit_label"),
+            base_summary.get("table_limit_label"),
+            base_summary.get("runtime_table_limit"),
+        )
         phase_key = str(stable_state.get("phase_key") or "").strip()
         timestamp_ms = int(data.get("timestamp_ms") or stable_state.get("timestamp_ms") or now_ms())
         try:
@@ -3340,25 +3353,25 @@ class MainDashboard(QMainWindow):
         page_alive = True
 
         summary = dict(base_summary)
-        summary.update(
-            {
-                "room_id": room_id,
-                "room_label": room_label,
-                "locked_room_id": room_id,
-                "locked_room_label": room_label,
-                "runtime_room_id": room_id,
-                "runtime_room_label": room_label,
-                "limit_label": limit_label,
-                "runtime_limit_label": limit_label,
-                "phase_key": phase_key,
-                "phase_text": phase_key,
-                "round_id": batch_id,
-                "runtime_v2_shadow_bridge": True,
-                "runtime_v2_shadow_online": True,
-                "runtime_v2_shadow_source": stable_state.get("source") or "",
-                "last_ws_age_ms": ws_age,
-            }
-        )
+        shadow_summary = {
+            "room_id": room_id,
+            "room_label": room_label,
+            "locked_room_id": room_id,
+            "locked_room_label": room_label,
+            "runtime_room_id": room_id,
+            "runtime_room_label": room_label,
+            "phase_key": phase_key,
+            "phase_text": phase_key,
+            "round_id": batch_id,
+            "runtime_v2_shadow_bridge": True,
+            "runtime_v2_shadow_online": True,
+            "runtime_v2_shadow_source": stable_state.get("source") or "",
+            "last_ws_age_ms": ws_age,
+        }
+        if limit_label:
+            shadow_summary["limit_label"] = limit_label
+            shadow_summary["runtime_limit_label"] = limit_label
+        summary.update(shadow_summary)
         balance_text = str(
             accepted_balance.get("balance_text")
             or stable_state.get("balance_text")

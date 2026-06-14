@@ -24,6 +24,8 @@ from bet_desktop.core.hedge_plan import (
     legal_amounts,
 )
 from bet_desktop.models.state_temporal_guard import TemporalStateSnapshot, now_ms
+from bet_desktop.vision.live_game_regions import BASE_SIZE as LIVE_GAME_BASE_SIZE
+from bet_desktop.vision.live_game_regions import LIVE_GAME_REGIONS
 
 MAX_SYNC_SNAPSHOT_AGE_MS = 2500
 MAX_SYNC_CAPTURE_SPREAD_MS = 1500
@@ -261,7 +263,7 @@ class HedgeExecutionOrchestrator:
             return None
 
         policy = config.to_plan_policy()
-        snapshots_for_plan, safety_blocks = self._build_account_snapshots(
+        snapshots_for_plan, safety_blocks, fact_sources = self._build_account_snapshots(
             config=config,
             snapshots=self._latest_temporal_states,
         )
@@ -274,7 +276,11 @@ class HedgeExecutionOrchestrator:
                     ExecutionEventType.ACCOUNT_EXCLUDED,
                     state=self._state.value,
                     message="鍧愭爣/闄愰鏍￠獙澶辫触",
-                    safe_summary={"account_id": account_id, "reasons": tuple(reasons)},
+                    safe_summary={
+                        "account_id": account_id,
+                        "reasons": tuple(reasons),
+                        "execution_facts": fact_sources.get(account_id, {}),
+                    },
                 )
             self._emit(
                 ExecutionEventType.EXECUTION_BLOCKED,
@@ -284,6 +290,7 @@ class HedgeExecutionOrchestrator:
                     "round_id": round_id,
                     "blocked_accounts": tuple(safety_blocks.keys()),
                     "reasons": ("fail_closed",),
+                    "execution_facts": fact_sources,
                 },
             )
             return None
@@ -615,9 +622,14 @@ class HedgeExecutionOrchestrator:
         *,
         config: HedgeExecutionConfig,
         snapshots: dict[str, TemporalStateSnapshot],
-    ) -> tuple[tuple[AccountExecutionSnapshot, ...], dict[str, tuple[str, ...]]]:
+    ) -> tuple[
+        tuple[AccountExecutionSnapshot, ...],
+        dict[str, tuple[str, ...]],
+        dict[str, dict[str, Any]],
+    ]:
         result: list[AccountExecutionSnapshot] = []
         safety_blocks: dict[str, list[str]] = {}
+        fact_sources: dict[str, dict[str, Any]] = {}
         required_ids = (config.main_account_id, *config.active_sub_account_ids)
         current_ms = now_ms()
 
@@ -628,20 +640,34 @@ class HedgeExecutionOrchestrator:
             reasons: list[str] = []
             execution_online = self._snapshot_execution_online(snapshot, current_ms=current_ms)
 
-            limit_bounds = self._parse_limit_bounds(summary)
+            limit_bounds, limit_source = self._resolve_limit_bounds(summary)
             if limit_bounds is None:
                 reasons.append("limit_not_verified")
                 table_min, table_max = (0, 0)
             else:
                 table_min, table_max = limit_bounds
 
-            coord_ready, chip_coord_ready, side_coord_ready = self._parse_coordinate_readiness(summary)
+            (
+                coord_ready,
+                chip_coord_ready,
+                side_coord_ready,
+                coordinate_source,
+            ) = self._resolve_coordinate_readiness(summary)
             if not coord_ready:
                 reasons.append("coordinate_not_verified")
             if not chip_coord_ready:
                 reasons.append("chip_coordinate_not_verified")
             if not side_coord_ready:
                 reasons.append("side_coordinate_not_verified")
+
+            fact_sources[instance_id] = {
+                "limit_source": limit_source,
+                "limit_bounds": tuple(limit_bounds) if limit_bounds is not None else None,
+                "coordinate_source": coordinate_source,
+                "coordinate_ready": bool(coord_ready),
+                "chip_coordinates_ready": bool(chip_coord_ready),
+                "side_coordinates_ready": bool(side_coord_ready),
+            }
 
             if reasons:
                 safety_blocks[instance_id] = tuple(dict.fromkeys(reasons))
@@ -670,7 +696,11 @@ class HedgeExecutionOrchestrator:
                     last_updated_ms=int(snapshot.timestamp_captured_ms),
                 )
             )
-        return tuple(result), {key: tuple(value) for key, value in safety_blocks.items()}
+        return (
+            tuple(result),
+            {key: tuple(value) for key, value in safety_blocks.items()},
+            fact_sources,
+        )
 
     def _check_execution_sync_gate(
         self,
@@ -793,10 +823,14 @@ class HedgeExecutionOrchestrator:
 
     @staticmethod
     def _parse_limit_bounds(summary: dict[str, Any]) -> tuple[int, int] | None:
+        return HedgeExecutionOrchestrator._resolve_limit_bounds(summary)[0]
+
+    @staticmethod
+    def _resolve_limit_bounds(summary: dict[str, Any]) -> tuple[tuple[int, int] | None, str]:
         table_min = HedgeExecutionOrchestrator._parse_positive_int(summary.get("table_min"))
         table_max = HedgeExecutionOrchestrator._parse_positive_int(summary.get("table_max"))
         if table_min is not None and table_max is not None and table_max >= table_min:
-            return (table_min, table_max)
+            return (table_min, table_max), "table_min/table_max"
 
         for key in (
             "limit_label",
@@ -810,8 +844,8 @@ class HedgeExecutionOrchestrator:
             limit_label = summary.get(key)
             parsed = HedgeExecutionOrchestrator._parse_limit_label(limit_label)
             if parsed is not None:
-                return parsed
-        return None
+                return parsed, key
+        return None, "missing"
 
     @staticmethod
     def _parse_limit_label(value: object) -> tuple[int, int] | None:
@@ -845,12 +879,18 @@ class HedgeExecutionOrchestrator:
 
     @staticmethod
     def _parse_coordinate_readiness(summary: dict[str, Any]) -> tuple[bool, bool, bool]:
+        ready, chips_ready, sides_ready, _source = HedgeExecutionOrchestrator._resolve_coordinate_readiness(summary)
+        return ready, chips_ready, sides_ready
+
+    @staticmethod
+    def _resolve_coordinate_readiness(summary: dict[str, Any]) -> tuple[bool, bool, bool, str]:
         runtime_coordinates = summary.get("runtime_coordinates")
         runtime_map = isinstance(runtime_coordinates, dict)
         chip_regions = runtime_coordinates.get("chips") if runtime_map and isinstance(runtime_coordinates, dict) else None
         side_regions = runtime_coordinates.get("bet_regions") if runtime_map and isinstance(runtime_coordinates, dict) else None
         chip_regions_valid = bool(isinstance(chip_regions, dict) and chip_regions)
         side_regions_valid = bool(isinstance(side_regions, dict) and side_regions)
+        runtime_coordinates_ready = runtime_map and chip_regions_valid and side_regions_valid
 
         coordinate_ready = HedgeExecutionOrchestrator._coerce_bool_or_none(summary.get("coordinate_ready"))
         chip_coordinate_ready = HedgeExecutionOrchestrator._coerce_bool_or_none(summary.get("chip_coordinate_ready"))
@@ -860,14 +900,50 @@ class HedgeExecutionOrchestrator:
         if side_coordinate_ready is None:
             side_coordinate_ready = HedgeExecutionOrchestrator._coerce_bool_or_none(summary.get("side_coordinates_ready"))
 
+        coordinate_explicit = coordinate_ready is not None
+        chip_coordinate_explicit = chip_coordinate_ready is not None
+        side_coordinate_explicit = side_coordinate_ready is not None
+        source = "runtime_coordinates" if runtime_coordinates_ready else "summary_flags"
         if coordinate_ready is None:
-            coordinate_ready = runtime_map and chip_regions_valid and side_regions_valid
+            coordinate_ready = runtime_coordinates_ready
         if chip_coordinate_ready is None:
             chip_coordinate_ready = runtime_map and chip_regions_valid
         if side_coordinate_ready is None:
             side_coordinate_ready = runtime_map and side_regions_valid
 
-        return bool(coordinate_ready), bool(chip_coordinate_ready), bool(side_coordinate_ready)
+        used_known_profile = False
+        if (
+            not all((coordinate_ready, chip_coordinate_ready, side_coordinate_ready))
+            and HedgeExecutionOrchestrator._known_standard_coordinate_profile_available(summary)
+        ):
+            if not coordinate_explicit:
+                coordinate_ready = True
+                used_known_profile = True
+            if not chip_coordinate_explicit:
+                chip_coordinate_ready = True
+                used_known_profile = True
+            if not side_coordinate_explicit:
+                side_coordinate_ready = True
+                used_known_profile = True
+        if used_known_profile:
+            source = "known_960x620_profile"
+
+        return bool(coordinate_ready), bool(chip_coordinate_ready), bool(side_coordinate_ready), source
+
+    @staticmethod
+    def _known_standard_coordinate_profile_available(summary: dict[str, Any]) -> bool:
+        chip_regions = {key for key in LIVE_GAME_REGIONS if str(key).startswith("chip_")}
+        side_regions = {"bet_player", "bet_banker", "bet_tie"}
+        if not chip_regions or not side_regions.issubset(LIVE_GAME_REGIONS.keys()):
+            return False
+
+        viewport = summary.get("runtime_viewport")
+        if isinstance(viewport, dict):
+            width = HedgeExecutionOrchestrator._parse_positive_int(viewport.get("width"))
+            height = HedgeExecutionOrchestrator._parse_positive_int(viewport.get("height"))
+            return (width, height) == LIVE_GAME_BASE_SIZE
+
+        return bool(summary.get("runtime_v2_shadow_bridge") or summary.get("runtime_v2_shadow_online"))
 
     @staticmethod
     def _coerce_bool_or_none(value: object) -> bool | None:

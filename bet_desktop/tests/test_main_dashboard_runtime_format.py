@@ -417,6 +417,55 @@ def test_runtime_v2_shadow_stable_state_feeds_execution_orchestrator() -> None:
     assert snapshot.safe_summary["runtime_coordinates"]["chips"]
 
 
+def test_runtime_v2_shadow_inherits_ui_visible_limit_label() -> None:
+    class _Orchestrator:
+        def __init__(self) -> None:
+            self.snapshots: list[TemporalStateSnapshot] = []
+
+        def on_temporal_state(self, snapshot: TemporalStateSnapshot) -> None:
+            self.snapshots.append(snapshot)
+
+    dashboard, _panel = _make_dashboard_with_progress("room entry")
+    dashboard._room_entry_targets = {"a2": 1}
+    dashboard.latest_temporal_states = {
+        "a2": TemporalStateSnapshot(
+            instance_id="a2",
+            batch_id="",
+            exact_countdown=-1,
+            ocr_balance="83.64",
+            safe_summary={
+                "last_ws_age_ms": 120,
+                "frontend_limit_label": "4-250",
+            },
+            source="test",
+        )
+    }
+    orchestrator = _Orchestrator()
+    dashboard._hedge_orchestrator = orchestrator
+
+    dashboard.on_runtime_v2_shadow(
+        "a2",
+        {
+            "timestamp_ms": now_ms(),
+            "session": {"expected_room_id": "182020001", "expected_room_label": "T001"},
+            "stable_state": {
+                "source": "page_runtime",
+                "room_label": "T001",
+                "room_id": "182020001",
+                "batch_id": "50-1781324015-8501604313-1163",
+                "countdown": 8,
+                "phase_key": "betting_open",
+                "confidence": 0.9,
+            },
+            "accepted_balance": {"balance_text": "83.64"},
+        },
+    )
+
+    snapshot = orchestrator.snapshots[-1]
+    assert snapshot.safe_summary["limit_label"] == "4-250"
+    assert snapshot.safe_summary["runtime_limit_label"] == "4-250"
+
+
 def test_room_entry_progress_does_not_finish_from_balance_only() -> None:
     dashboard, panel = _make_dashboard_with_progress("已点击房间 3，加载中")
     snapshot = TemporalStateSnapshot(
