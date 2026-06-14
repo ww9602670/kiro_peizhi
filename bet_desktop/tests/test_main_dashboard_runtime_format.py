@@ -466,6 +466,49 @@ def test_runtime_v2_shadow_inherits_ui_visible_limit_label() -> None:
     assert snapshot.safe_summary["runtime_limit_label"] == "4-250"
 
 
+def test_runtime_v2_shadow_inherits_limit_from_accepted_balance() -> None:
+    class _Orchestrator:
+        def __init__(self) -> None:
+            self.snapshots: list[TemporalStateSnapshot] = []
+
+        def on_temporal_state(self, snapshot: TemporalStateSnapshot) -> None:
+            self.snapshots.append(snapshot)
+
+    dashboard, _panel = _make_dashboard_with_progress("room entry")
+    dashboard._room_entry_targets = {"a3": 1}
+    dashboard.latest_temporal_states = {}
+    orchestrator = _Orchestrator()
+    dashboard._hedge_orchestrator = orchestrator
+
+    dashboard.on_runtime_v2_shadow(
+        "a3",
+        {
+            "timestamp_ms": now_ms(),
+            "session": {"expected_room_id": "182020001", "expected_room_label": "T001"},
+            "stable_state": {
+                "source": "frontend_object_scan",
+                "room_label": "T001",
+                "room_id": "182020001",
+                "batch_id": "8506200621",
+                "countdown": 9,
+                "phase_key": "betting_open",
+                "confidence": 1.0,
+            },
+            "accepted_balance": {
+                "source": "legacy_state",
+                "room_label": "T001",
+                "room_id": "182020001",
+                "limit_label": "4-250",
+                "balance_text": "208.18",
+            },
+        },
+    )
+
+    snapshot = orchestrator.snapshots[-1]
+    assert snapshot.safe_summary["limit_label"] == "4-250"
+    assert snapshot.safe_summary["runtime_limit_label"] == "4-250"
+
+
 def test_room_entry_progress_does_not_finish_from_balance_only() -> None:
     dashboard, panel = _make_dashboard_with_progress("已点击房间 3，加载中")
     snapshot = TemporalStateSnapshot(

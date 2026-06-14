@@ -3299,6 +3299,7 @@ class MainDashboard(QMainWindow):
         stable_state = data.get("stable_state") if isinstance(data.get("stable_state"), dict) else {}
         if not stable_state:
             return None
+        accepted_state = data.get("accepted_state") if isinstance(data.get("accepted_state"), dict) else {}
         accepted_balance = data.get("accepted_balance") if isinstance(data.get("accepted_balance"), dict) else {}
         session = data.get("session") if isinstance(data.get("session"), dict) else {}
         batch_id = str(stable_state.get("batch_id") or "").strip()
@@ -3331,6 +3332,16 @@ class MainDashboard(QMainWindow):
             stable_state.get("frontend_limit_label"),
             stable_state.get("canvas_limit_label"),
             stable_state.get("label_limit_label"),
+            accepted_state.get("limit_label"),
+            accepted_state.get("runtime_limit_label"),
+            accepted_state.get("frontend_limit_label"),
+            accepted_state.get("canvas_limit_label"),
+            accepted_state.get("label_limit_label"),
+            accepted_balance.get("limit_label"),
+            accepted_balance.get("runtime_limit_label"),
+            accepted_balance.get("frontend_limit_label"),
+            accepted_balance.get("canvas_limit_label"),
+            accepted_balance.get("label_limit_label"),
             base_summary.get("limit_label"),
             base_summary.get("runtime_limit_label"),
             base_summary.get("frontend_limit_label"),
