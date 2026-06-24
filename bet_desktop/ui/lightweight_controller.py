@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from time import time
 from typing import Any
 
@@ -26,6 +27,40 @@ from bet_desktop.ui.lightweight_models import (
 
 def _now_ms() -> int:
     return int(time() * 1000)
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text and text.lower() not in {"none", "null"}:
+            return text
+    return ""
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _as_decimal(value: Any) -> Decimal | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace(",", "").replace("￥", "").replace("元", "").strip()
+    try:
+        return Decimal(normalized)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "open", "can_bet", "betting"}
 
 
 class LightweightController:
@@ -51,6 +86,8 @@ class LightweightController:
         self.config = replace(self.config, main_account=self.main_account)
         self._account_modes = {account_id: "待命" for account_id in ACCOUNT_IDS}
         self._runtime_status = {account_id: "待命" for account_id in ACCOUNT_IDS}
+        self._runtime_snapshots: dict[str, dict[str, Any]] = {}
+        self._runtime_errors: dict[str, str] = {}
         self._update_platform_roles()
         self.adapter.refresh_runtime_environment(self.platform_slots)
         self._emit_account_status()
@@ -138,20 +175,76 @@ class LightweightController:
             role = "main" if slot.account_id == self.main_account else "sub"
             account_mode = self._account_modes.get(slot.account_id, "idle")
             runtime_status = self._runtime_status.get(slot.account_id, "待命")
+            snapshot = self._runtime_snapshots.get(slot.account_id, {})
+            safe_summary = snapshot.get("safe_summary", {}) if isinstance(snapshot, dict) else {}
+            if not isinstance(safe_summary, dict):
+                safe_summary = {}
+            room_label = _first_text(
+                safe_summary.get("room_label"),
+                safe_summary.get("locked_room_label"),
+                safe_summary.get("runtime_room_label"),
+                safe_summary.get("label_room_label"),
+                safe_summary.get("frontend_room_label"),
+                safe_summary.get("canvas_room_label"),
+                slot.target_room,
+                "-",
+            )
+            round_id = _first_text(
+                snapshot.get("batch_id") if isinstance(snapshot, dict) else "",
+                safe_summary.get("runtime_memory_game_no"),
+                safe_summary.get("label_game_no"),
+                safe_summary.get("frontend_batch_id"),
+                safe_summary.get("canvas_game_no"),
+                "-",
+            )
+            countdown = _as_int(snapshot.get("exact_countdown") if isinstance(snapshot, dict) else None)
+            if countdown is None:
+                countdown = _as_int(
+                    _first_text(
+                        safe_summary.get("runtime_countdown"),
+                        safe_summary.get("label_countdown"),
+                        safe_summary.get("frontend_countdown"),
+                        safe_summary.get("canvas_countdown"),
+                    ),
+                )
+            balance = _as_decimal(snapshot.get("ocr_balance") if isinstance(snapshot, dict) else None)
+            betting_open = _truthy(
+                safe_summary.get("runtime_betting_open")
+                if "runtime_betting_open" in safe_summary
+                else safe_summary.get("runtime_is_can_betting"),
+            )
+            phase_label = _first_text(
+                safe_summary.get("runtime_phase_label"),
+                safe_summary.get("label_phase_text"),
+                safe_summary.get("frontend_phase_text"),
+                safe_summary.get("canvas_phase_text"),
+                safe_summary.get("phase_text"),
+            )
+            state_label = runtime_status if runtime_status != "待命" else account_mode
+            if snapshot:
+                if betting_open:
+                    state_label = "可下注"
+                elif phase_label:
+                    state_label = phase_label
+                elif room_label != "-":
+                    state_label = "房间已打开"
+            elif slot.account_id in self._runtime_errors:
+                state_label = "异常"
+            updated_at_ms = _as_int(snapshot.get("timestamp_captured_ms") if isinstance(snapshot, dict) else None) or _now_ms()
             statuses.append(
                 AccountStatusSummary(
                     account_id=slot.account_id,
                     display_name=slot.display_name or slot.account_id,
                     mode=runtime_status,
                     role=role,
-                    room_label=slot.target_room or "-",
-                    round_id="-",
-                    countdown=None,
-                    betting_open=False,
-                    balance=None,
+                    room_label=room_label,
+                    round_id=round_id,
+                    countdown=countdown,
+                    betting_open=betting_open,
+                    balance=balance,
                     pending_amount=None,
-                    state_label=runtime_status if runtime_status != "待命" else account_mode,
-                    updated_at_ms=_now_ms(),
+                    state_label=state_label,
+                    updated_at_ms=updated_at_ms,
                 )
             )
         return statuses
@@ -374,9 +467,15 @@ class LightweightController:
             message = payload.get("message") or payload.get("error") or payload
             self._append_log(f"runtime error [{instance_id}]: {message}")
             self._runtime_status[instance_id] = "异常"
+            self._runtime_errors[instance_id] = str(message)
             return
         if event_type not in {"state", "health"}:
             return
+
+        if event_type == "state":
+            self._runtime_snapshots[instance_id] = dict(payload)
+            self._runtime_errors.pop(instance_id, None)
+            self._runtime_status[instance_id] = "状态已更新"
 
         game_launch_context = str(payload.get("game_launch_context") or "")
         room_entry = str(payload.get("room_entry") or "")

@@ -259,6 +259,36 @@ def test_batch_enter_room_uses_config_room_index_for_button_click(tmp_path: Path
     assert adapter.commands[-1] == "enter_room room_index=1 accounts=a1,a3,a4"
 
 
+def test_runtime_state_event_updates_account_cards(tmp_path: Path) -> None:
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=FakeBrowserControlAdapter(max_log_entries=20),
+    )
+
+    controller._handle_runtime_event(
+        "a3",
+        "state",
+        {
+            "batch_id": "202606250001",
+            "exact_countdown": 12,
+            "ocr_balance": "1,234.50",
+            "timestamp_captured_ms": 1782350000000,
+            "safe_summary": {
+                "room_label": "1房",
+                "runtime_betting_open": True,
+                "runtime_phase_label": "下注中",
+            },
+        },
+    )
+
+    summary = next(item for item in controller.account_status if item.account_id == "a3")
+    assert summary.room_label == "1房"
+    assert summary.round_id == "202606250001"
+    assert summary.countdown == 12
+    assert str(summary.balance) == "1234.50"
+    assert summary.state_label == "可下注"
+
+
 def test_refresh_headless_defaults_to_sub_accounts(tmp_path: Path) -> None:
     adapter = FakeBrowserControlAdapter(max_log_entries=20)
     controller = LightweightController(
