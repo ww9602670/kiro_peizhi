@@ -43,17 +43,33 @@ class BrowserControlAdapter:
     def fill_login(self, account_ids: list[str]) -> tuple[int, str, str]:
         return self.run_command(["fill_login", *account_ids])
 
+    def open_login_pages(self, account_ids: list[str]) -> tuple[int, str, str]:
+        return self.run_command(["open_login_pages", *account_ids])
+
     def handoff_to_headless(self, account_ids: list[str]) -> tuple[int, str, str]:
         return self.run_command(["handoff_to_headless", *account_ids])
 
     def enter_room(self, account_ids: list[str], room_index: int) -> tuple[int, str, str]:
         return self.run_command(["enter_room", str(room_index), *account_ids])
 
+    def refresh_headless(self, account_ids: list[str]) -> tuple[int, str, str]:
+        return self.run_command(["refresh_headless", *account_ids])
+
     def release_headless(self, account_ids: list[str]) -> tuple[int, str, str]:
         return self.run_command(["release_headless", *account_ids])
 
     def stop_accounts(self, account_ids: list[str]) -> tuple[int, str, str]:
         return self.run_command(["stop_accounts", *account_ids])
+
+    def refresh_runtime_environment(self, platform_slots) -> None:
+        """Allow implementations to sync latest platform slot settings."""
+        return None
+
+    def poll_events(self, max_items: int = 128) -> list[dict]:
+        return []
+
+    def shutdown(self) -> None:
+        return None
 
 
 class FakeBrowserControlAdapter(BrowserControlAdapter):
@@ -74,7 +90,25 @@ class FakeBrowserControlAdapter(BrowserControlAdapter):
         return list(self._commands)
 
     def _append_command(self, command: list[str]) -> None:
-        rendered = shlex.join(command)
+        if not command:
+            rendered = ""
+        else:
+            action = command[0]
+            if action == "enter_room" and len(command) > 1:
+                room_index = command[1]
+                accounts = command[2:]
+                rendered = f"{action} room_index={room_index}"
+                if accounts:
+                    rendered += f" accounts={','.join(accounts)}"
+                self._commands.append(rendered)
+                if len(self._commands) > self._max_command_log:
+                    self._commands = self._commands[-self._max_command_log :]
+                return
+            accounts = command[1:]
+            if accounts:
+                rendered = f"{action} accounts={','.join(accounts)}"
+            else:
+                rendered = action
         self._commands.append(rendered)
         if len(self._commands) > self._max_command_log:
             self._commands = self._commands[-self._max_command_log :]
@@ -95,9 +129,17 @@ class FakeBrowserControlAdapter(BrowserControlAdapter):
         self._record_action("fill_login", account_ids)
         return super().fill_login(account_ids)
 
+    def open_login_pages(self, account_ids: list[str]) -> tuple[int, str, str]:
+        self._record_action("open_login_pages", account_ids)
+        return super().open_login_pages(account_ids)
+
     def handoff_to_headless(self, account_ids: list[str]) -> tuple[int, str, str]:
         self._record_action("handoff_to_headless", account_ids)
         return super().handoff_to_headless(account_ids)
+
+    def refresh_headless(self, account_ids: list[str]) -> tuple[int, str, str]:
+        self._record_action("refresh_headless", account_ids)
+        return super().refresh_headless(account_ids)
 
     def enter_room(self, account_ids: list[str], room_index: int) -> tuple[int, str, str]:
         self._record_action("enter_room", account_ids, f"room_index={room_index}")

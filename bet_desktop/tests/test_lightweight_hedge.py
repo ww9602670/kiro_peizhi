@@ -6,8 +6,9 @@ from pathlib import Path
 
 from bet_desktop.ui.lightweight_browser_adapter import FakeBrowserControlAdapter
 from bet_desktop.ui.lightweight_config_store import LightweightConfigStore
+from bet_desktop.ui.lightweight_cluster_adapter import LightweightClusterAdapter, platform_slot_to_cluster_config
 from bet_desktop.ui.lightweight_controller import LightweightController
-from bet_desktop.ui.lightweight_models import ACCOUNT_IDS, parse_proxy_bundle_lines, resolve_sub_accounts
+from bet_desktop.ui.lightweight_models import ACCOUNT_IDS, PlatformSlot, parse_proxy_bundle_lines, resolve_sub_accounts
 
 
 def test_lightweight_config_round_trip_and_legacy_adapter(tmp_path: Path) -> None:
@@ -149,6 +150,172 @@ def test_controller_start_trigger_and_status_change(tmp_path: Path) -> None:
 
     controller.start_clicked()
     assert controller.execution_state == "running"
-    assert any("对冲系统已启动" in item for item in logs)
+    assert any("启动轻量控制" in item for item in logs)
     assert not adapter.commands
     assert all(summary.state_label == "待命" for summary in controller.account_status)
+
+
+def test_controller_start_does_not_start_accounts(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller.start_clicked()
+    assert adapter.commands == []
+
+
+def test_batch_handoff_targets_follow_main_account(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller.set_main_account("a3")
+    adapter.commands.clear()
+    controller.batch_handoff_clicked()
+    assert adapter.commands[-1] == "handoff_to_headless accounts=a1,a2,a4"
+
+    controller.set_main_account("a2")
+    adapter.commands.clear()
+    controller.batch_handoff_clicked()
+    assert adapter.commands[-1] == "handoff_to_headless accounts=a1,a3,a4"
+
+
+def test_batch_enter_room_uses_config_room_index_for_button_click(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller.apply_execution_config({"room_index": 4})
+    controller.batch_enter_room_clicked(False)
+    assert adapter.commands[-1] == "enter_room room_index=4 accounts=a1,a3,a4"
+
+    controller.batch_enter_room_clicked(0)
+    assert adapter.commands[-1] == "enter_room room_index=1 accounts=a1,a3,a4"
+
+
+def test_refresh_headless_defaults_to_sub_accounts(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller.set_main_account("a3")
+    controller.refresh_headless_clicked()
+    assert adapter.commands[-1] == "refresh_headless accounts=a1,a2,a4"
+
+    controller.refresh_headless_clicked(["a2"])
+    assert adapter.commands[-1] == "refresh_headless accounts=a2"
+
+
+def test_platform_slot_to_cluster_config_mapping() -> None:
+    slot = PlatformSlot(
+        account_id="a2",
+        login_url="https://login.example.com",
+        account_username="u2",
+        account_password="p2",
+        target_url="https://target.example.com",
+        proxy_host="127.0.0.1",
+        proxy_port="8080",
+        proxy_username="px",
+        proxy_password="pxpwd",
+        proxy_expire_at="2026-12-31",
+    )
+    config = platform_slot_to_cluster_config(slot)
+
+    assert config.instance_id == "a2"
+    assert config.login_url == "https://login.example.com"
+    assert config.target_url == ""
+    assert config.username == "u2"
+    assert config.password == "p2"
+    assert config.proxy == {
+        "host": "127.0.0.1",
+        "port": "8080",
+        "username": "px",
+        "password": "pxpwd",
+    }
+    assert config.headless is False
+    assert config.browser_channel == "chrome"
+    assert config.viewport_width == 960
+    assert config.viewport_height == 620
+    assert config.runtime_shadow_interval_ms >= 1000
+
+    probe_config = platform_slot_to_cluster_config(
+        slot,
+        enable_frontend_probe=True,
+        enable_canvas_probe=True,
+        enable_runtime_scan=True,
+    )
+    assert probe_config.enable_frontend_probe is True
+    assert probe_config.enable_canvas_probe is True
+    assert probe_config.enable_runtime_scan is True
+
+
+def test_cluster_adapter_command_order(monkeypatch) -> None:
+    captured: list[object] = []
+
+    class FakeWorkerController:
+        def __init__(self, configs: list) -> None:
+            self.configs = list(configs)
+            self.actions: list[tuple[str, object]] = []
+
+        def start(self) -> None:
+            self.actions.append(("start", None))
+
+        def start_configs(self, configs: list) -> None:
+            self.actions.append(("start_configs", tuple(cfg.instance_id for cfg in configs)))
+
+        def send_command(self, account_id: str, command: dict[str, object]) -> None:
+            self.actions.append(("send", account_id, command.get("command"), dict(command)))
+
+        def stop_instances(self, account_ids: list[str]) -> None:
+            self.actions.append(("stop_instances", tuple(account_ids)))
+
+        def poll_events(self, max_items: int = 128):
+            return []
+
+        def stop(self) -> None:
+            self.actions.append(("stop", None))
+
+    def fake_factory(configs: list) -> FakeWorkerController:
+        worker = FakeWorkerController(configs)
+        captured.append(worker)
+        return worker
+
+    monkeypatch.setattr(
+        "bet_desktop.ui.lightweight_cluster_adapter.ClusterProcessController",
+        fake_factory,
+    )
+
+    adapter = LightweightClusterAdapter()
+    slots = (
+        PlatformSlot(account_id="a1", login_url="https://a1.local/login", account_username="u1", account_password="p1"),
+        PlatformSlot(account_id="a2", login_url="https://a2.local/login", account_username="u2", account_password="p2"),
+        PlatformSlot(account_id="a3", login_url="https://a3.local/login", account_username="u3", account_password="p3"),
+    )
+    adapter.refresh_runtime_environment(slots)
+
+    adapter.open_login_pages(["a1", "a2"])
+    adapter.fill_login(["a1", "a2"])
+    adapter.handoff_to_headless(["a1"])
+    adapter.enter_room(["a1"], 3)
+    adapter.refresh_headless(["a1"])
+    adapter.release_headless(["a1"])
+
+    assert captured, "cluster factory should be created"
+    actions = captured[0].actions
+    assert actions[0][0] == "start"
+    assert actions[1] == ("send", "a1", "navigate", {"command": "navigate", "url": "https://a1.local/login"})
+    assert actions[2] == ("send", "a2", "navigate", {"command": "navigate", "url": "https://a2.local/login"})
+    assert actions[3] == ("send", "a1", "fill_login", {"command": "fill_login", "username": "u1", "password": "p1"})
+    assert actions[4] == ("send", "a2", "fill_login", {"command": "fill_login", "username": "u2", "password": "p2"})
+    assert actions[5] == ("send", "a1", "handoff_to_headless", {"command": "handoff_to_headless"})
+    assert actions[6] == ("send", "a1", "enter_room", {"command": "enter_room", "room_index": 3})
+    assert actions[7] == ("send", "a1", "capture_game_launch_context", {"command": "capture_game_launch_context"})
+    assert actions[8] == ("send", "a1", "release_headless", {"command": "release_headless"})

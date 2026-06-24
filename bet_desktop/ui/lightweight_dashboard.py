@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont, QFontDatabase
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -65,6 +65,10 @@ class LightweightDashboard(QMainWindow):
         self._apply_style()
         self._bind_controller()
         self._refresh_from_controller()
+        self._runtime_poll_timer = QTimer(self)
+        self._runtime_poll_timer.setInterval(1200)
+        self._runtime_poll_timer.timeout.connect(self.controller.poll_runtime_events)
+        self._runtime_poll_timer.start()
         self._append_log("轻量窗口初始化完成")
 
     def _build_ui(self, root: QWidget) -> None:
@@ -129,9 +133,9 @@ class LightweightDashboard(QMainWindow):
         batch_layout.addWidget(hint, 1)
         batch_layout.addWidget(self._button("批量启动", "", self.controller.batch_start_clicked))
         batch_layout.addWidget(self._button("批量填登录", "", self.controller.batch_fill_login_clicked))
-        batch_layout.addWidget(self._button("批量接管", "primary", self.controller.batch_handoff_clicked, enabled=False))
-        batch_layout.addWidget(self._button("批量进房", "success", self.controller.batch_enter_room_clicked, enabled=False))
-        batch_layout.addWidget(self._button("批量释放", "", self.controller.batch_release_clicked, enabled=False))
+        batch_layout.addWidget(self._button("接管副号", "primary", self.controller.batch_handoff_clicked))
+        batch_layout.addWidget(self._button("批量进房", "success", self.controller.batch_enter_room_clicked))
+        batch_layout.addWidget(self._button("释放无头", "", self.controller.batch_release_clicked))
         batch_layout.addWidget(self._button("批量停止", "danger", self.controller.batch_stop_clicked))
         page_layout.addWidget(batch_strip)
 
@@ -271,10 +275,10 @@ class LightweightDashboard(QMainWindow):
         content_layout.addWidget(self._advanced_title("手动动作", "人工"))
         control_grid = QGridLayout()
         control_grid.setSpacing(8)
-        self.handoff_btn = self._button("a1/a3/a4 接管", "primary", self.controller.batch_handoff_clicked, enabled=False)
+        self.handoff_btn = self._button("a1/a3/a4 接管", "primary", self.controller.batch_handoff_clicked)
         control_grid.addWidget(self.handoff_btn, 0, 0, 1, 2)
-        control_grid.addWidget(self._button("批量进房", "", self.controller.batch_enter_room_clicked, enabled=False), 1, 0)
-        control_grid.addWidget(self._button("同步", "", self._protected_notice, enabled=False), 1, 1)
+        control_grid.addWidget(self._button("批量进房", "", self.controller.batch_enter_room_clicked), 1, 0)
+        control_grid.addWidget(self._button("刷新无头", "", self.controller.refresh_headless_clicked), 1, 1)
         control_grid.addWidget(self._button("测试发一轮", "success", self.controller.test_one_round_clicked), 2, 0, 1, 2)
         control_grid.addWidget(self._button("测试 10 轮", "", self.controller.test_ten_rounds_clicked), 3, 0, 1, 2)
         control_grid.addWidget(self._button("打开观察窗", "", self._protected_notice, enabled=False), 4, 0, 1, 2)
