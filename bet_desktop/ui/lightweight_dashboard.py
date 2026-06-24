@@ -131,7 +131,7 @@ class LightweightDashboard(QMainWindow):
         hint = QLabel("批量动作放在 4 个摘要卡片下方，避免配置页顶部拥挤。")
         hint.setObjectName("hint")
         batch_layout.addWidget(hint, 1)
-        batch_layout.addWidget(self._button("批量启动", "", self.controller.batch_start_clicked))
+        batch_layout.addWidget(self._button("打开登录页", "", self.controller.open_login_pages_clicked))
         batch_layout.addWidget(self._button("批量填登录", "", self.controller.batch_fill_login_clicked))
         batch_layout.addWidget(self._button("接管副号", "primary", self.controller.batch_handoff_clicked))
         batch_layout.addWidget(self._button("批量进房", "success", self.controller.batch_enter_room_clicked))
