@@ -72,6 +72,12 @@ class LightweightDashboard(QMainWindow):
         self._runtime_poll_timer.start()
         self._append_log("轻量窗口初始化完成")
 
+    def closeEvent(self, event) -> None:
+        if self._runtime_poll_timer.isActive():
+            self._runtime_poll_timer.stop()
+        self.controller.shutdown_runtime()
+        super().closeEvent(event)
+
     def _build_ui(self, root: QWidget) -> None:
         layout = QVBoxLayout(root)
         layout.setContentsMargins(16, 14, 16, 14)

@@ -17,7 +17,9 @@ def main() -> int:
     from bet_desktop.ui.lightweight_dashboard import LightweightDashboard
 
     app = QApplication(sys.argv)
-    window = LightweightDashboard(controller=LightweightController(adapter=LightweightClusterAdapter()))
+    controller = LightweightController(adapter=LightweightClusterAdapter())
+    app.aboutToQuit.connect(controller.shutdown_runtime)
+    window = LightweightDashboard(controller=controller)
     window.show()
     return app.exec()
 

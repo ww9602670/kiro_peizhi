@@ -154,6 +154,34 @@ def test_dashboard_enter_room_uses_selected_room(tmp_path: Path) -> None:
     app.processEvents()
 
 
+def test_dashboard_close_shuts_down_runtime(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+
+    class ShutdownTrackingAdapter(FakeBrowserControlAdapter):
+        def __init__(self) -> None:
+            super().__init__(max_log_entries=20)
+            self.shutdown_count = 0
+
+        def shutdown(self) -> None:
+            self.shutdown_count += 1
+            super().shutdown()
+
+    adapter = ShutdownTrackingAdapter()
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+    dashboard = LightweightDashboard(controller=controller)
+    dashboard.show()
+    app.processEvents()
+
+    dashboard.close()
+    app.processEvents()
+
+    assert adapter.shutdown_count >= 1
+    assert dashboard._runtime_poll_timer.isActive() is False
+
+
 def test_fake_adapter_command_logging_and_limit() -> None:
     adapter = FakeBrowserControlAdapter(max_log_entries=10)
     adapter.start_accounts(["a1", "a2"])
@@ -464,6 +492,9 @@ def test_cluster_adapter_command_order(monkeypatch) -> None:
         def stop_instances(self, account_ids: list[str]) -> None:
             self.actions.append(("stop_instances", tuple(account_ids)))
 
+        def running_instance_ids(self):
+            return {cfg.instance_id for cfg in self.configs}
+
         def poll_events(self, max_items: int = 128):
             return []
 
@@ -509,3 +540,6 @@ def test_cluster_adapter_command_order(monkeypatch) -> None:
     assert actions[6] == ("send", "a1", "enter_room", {"command": "enter_room", "room_index": 3})
     assert actions[7] == ("send", "a1", "capture_game_launch_context", {"command": "capture_game_launch_context"})
     assert actions[8] == ("send", "a1", "release_headless", {"command": "release_headless"})
+
+    adapter.shutdown()
+    assert actions[9] == ("stop_instances", ("a1", "a2"))

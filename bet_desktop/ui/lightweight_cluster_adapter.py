@@ -298,4 +298,14 @@ class LightweightClusterAdapter(BrowserControlAdapter):
     def shutdown(self) -> None:
         if self._controller is None:
             return
-        self._controller.stop()
+        controller = self._controller
+        try:
+            running_ids: list[str] = []
+            if hasattr(controller, "running_instance_ids"):
+                running_ids = sorted(str(instance_id) for instance_id in controller.running_instance_ids())
+            if running_ids and hasattr(controller, "stop_instances"):
+                controller.stop_instances(running_ids)
+            else:
+                controller.stop()
+        finally:
+            self._controller = None
