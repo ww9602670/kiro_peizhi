@@ -93,9 +93,67 @@ def _decayed_countdown(snapshot: dict[str, Any], safe_summary: dict[str, Any], *
     return max(0, countdown - age_seconds)
 
 
+def _runtime_room_label_from_summary(safe_summary: dict[str, Any]) -> str:
+    return _first_text(
+        safe_summary.get("room_label"),
+        safe_summary.get("locked_room_label"),
+        safe_summary.get("runtime_room_label"),
+        safe_summary.get("label_room_label"),
+        safe_summary.get("frontend_room_label"),
+        safe_summary.get("canvas_room_label"),
+    )
+
+
+def _round_id_from_snapshot(snapshot: dict[str, Any], safe_summary: dict[str, Any]) -> str:
+    return _first_text(
+        snapshot.get("batch_id") if isinstance(snapshot, dict) else "",
+        safe_summary.get("round_id"),
+        safe_summary.get("runtime_memory_game_no"),
+        safe_summary.get("label_game_no"),
+        safe_summary.get("label_internal_game_no"),
+        safe_summary.get("frontend_batch_id"),
+        safe_summary.get("frontend_short_batch_id"),
+        safe_summary.get("canvas_game_no"),
+        safe_summary.get("canvas_internal_game_no"),
+        "-",
+    )
+
+
+def _phase_label_from_summary(safe_summary: dict[str, Any]) -> str:
+    return _first_text(
+        safe_summary.get("runtime_phase_label"),
+        safe_summary.get("label_phase_text"),
+        safe_summary.get("frontend_phase_text"),
+        safe_summary.get("canvas_phase_text"),
+        safe_summary.get("phase_text"),
+    )
+
+
+def _has_room_runtime_evidence(payload: dict[str, Any], safe_summary: dict[str, Any]) -> bool:
+    if _runtime_room_label_from_summary(safe_summary):
+        return True
+    if _round_id_from_snapshot(payload, safe_summary) != "-":
+        return True
+    if _decayed_countdown(payload, safe_summary, current_ms=_now_ms()) is not None:
+        return True
+    if _phase_label_from_summary(safe_summary):
+        return True
+    if _truthy(safe_summary.get("runtime_betting_open")) or _truthy(safe_summary.get("runtime_is_can_betting")):
+        return True
+    return bool(_first_text(
+        safe_summary.get("runtime_action"),
+        safe_summary.get("runtime_current_load_type"),
+        safe_summary.get("runtime_timed"),
+    ))
+
+
 def _payload_game_ready(payload: dict[str, Any], safe_summary: dict[str, Any] | None = None) -> bool:
     summary = safe_summary if safe_summary is not None else _safe_summary_from(payload)
-    return _truthy(payload.get("game_ready")) or _truthy(summary.get("game_ready"))
+    return (
+        _truthy(payload.get("game_ready"))
+        or _truthy(summary.get("game_ready"))
+        or _has_room_runtime_evidence(payload, summary)
+    )
 
 
 def _payload_hall_without_game(payload: dict[str, Any], safe_summary: dict[str, Any] | None = None) -> bool:
@@ -109,13 +167,7 @@ def _state_machine_label(safe_summary: dict[str, Any], *, betting_open: bool, st
         return f"数据过期 {max(1, int(age_ms / 1000))}秒"
     if _payload_hall_without_game({}, safe_summary):
         return "大厅"
-    phase_label = _first_text(
-        safe_summary.get("runtime_phase_label"),
-        safe_summary.get("label_phase_text"),
-        safe_summary.get("frontend_phase_text"),
-        safe_summary.get("canvas_phase_text"),
-        safe_summary.get("phase_text"),
-    )
+    phase_label = _phase_label_from_summary(safe_summary)
     parts: list[str] = []
     if phase_label:
         parts.append(phase_label)
@@ -149,6 +201,8 @@ class LightweightController:
         self._event_handlers: dict[str, list[Callable[[Any], None]]] = {}
         self._max_log_lines = max_log_lines
         self._log_lines: list[str] = []
+        if getattr(self.adapter, "on_log", None) is None:
+            self.adapter.on_log = self._append_log
 
         snapshot = self._load_snapshot()
         self.platform_slots = list(snapshot.platform_slots)
@@ -253,24 +307,9 @@ class LightweightController:
             runtime_status = self._runtime_status.get(slot.account_id, "待命")
             snapshot = self._runtime_snapshots.get(slot.account_id, {})
             safe_summary = _safe_summary_from(snapshot) if isinstance(snapshot, dict) else {}
-            room_label = _first_text(
-                safe_summary.get("room_label"),
-                safe_summary.get("locked_room_label"),
-                safe_summary.get("runtime_room_label"),
-                safe_summary.get("label_room_label"),
-                safe_summary.get("frontend_room_label"),
-                safe_summary.get("canvas_room_label"),
-                slot.target_room,
-                "-",
-            )
-            round_id = _first_text(
-                snapshot.get("batch_id") if isinstance(snapshot, dict) else "",
-                safe_summary.get("runtime_memory_game_no"),
-                safe_summary.get("label_game_no"),
-                safe_summary.get("frontend_batch_id"),
-                safe_summary.get("canvas_game_no"),
-                "-",
-            )
+            runtime_room_label = _runtime_room_label_from_summary(safe_summary)
+            room_label = _first_text(runtime_room_label, "-")
+            round_id = _round_id_from_snapshot(snapshot, safe_summary)
             countdown = _decayed_countdown(snapshot, safe_summary, current_ms=current_ms) if snapshot else None
             balance = _as_decimal(snapshot.get("ocr_balance") if isinstance(snapshot, dict) else None)
             updated_at_ms = _snapshot_timestamp_ms(snapshot) if snapshot else current_ms
@@ -281,13 +320,7 @@ class LightweightController:
                 if "runtime_betting_open" in safe_summary
                 else safe_summary.get("runtime_is_can_betting"),
             )
-            phase_label = _first_text(
-                safe_summary.get("runtime_phase_label"),
-                safe_summary.get("label_phase_text"),
-                safe_summary.get("frontend_phase_text"),
-                safe_summary.get("canvas_phase_text"),
-                safe_summary.get("phase_text"),
-            )
+            phase_label = _phase_label_from_summary(safe_summary)
             state_machine_label = _state_machine_label(safe_summary, betting_open=betting_open, stale=stale, age_ms=age_ms)
             state_label = runtime_status if runtime_status != "待命" else account_mode
             if snapshot:
@@ -440,10 +473,14 @@ class LightweightController:
             self._append_log("批量进房：无可用账号")
             return
         self._append_log(f"批量进房: 房间{resolved_room_index} {','.join(targets)}")
-        self.adapter.enter_room(targets, room_index=resolved_room_index)
-        for account_id in targets:
-            self._room_entry_requested[account_id] = resolved_room_index
-        self._mark_runtime_status(targets, "进房中")
+        code, stdout, stderr = self.adapter.enter_room(targets, room_index=resolved_room_index)
+        if code != 0:
+            self._emit_error(stderr or stdout or "批量进房命令未能发送")
+            self._mark_runtime_status(targets, "进房失败")
+        else:
+            for account_id in targets:
+                self._room_entry_requested[account_id] = resolved_room_index
+            self._mark_runtime_status(targets, "进房中")
         self._emit_account_status()
 
     def refresh_headless_clicked(self, account_ids: list[str] | bool | None = None) -> None:

@@ -408,6 +408,37 @@ def test_runtime_state_auto_reenters_when_account_returns_to_hall(tmp_path: Path
     assert any("自动回房" in item for item in controller.logs)
 
 
+def test_runtime_room_evidence_overrides_hall_marker(tmp_path: Path) -> None:
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=FakeBrowserControlAdapter(max_log_entries=20),
+    )
+
+    controller._handle_runtime_event(
+        "a2",
+        "state",
+        {
+            "batch_id": "",
+            "exact_countdown": 6,
+            "ocr_balance": "3165.29",
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {
+                "hall_ready": True,
+                "game_ready": False,
+                "runtime_room_label": "T001",
+                "label_internal_game_no": "50-1782342022-8540540455-1253",
+                "runtime_phase_label": "派奖中",
+            },
+        },
+    )
+
+    summary = next(item for item in controller.account_status if item.account_id == "a2")
+    assert summary.room_label == "T001"
+    assert summary.round_id == "50-1782342022-8540540455-1253"
+    assert summary.state_label != "大厅"
+    assert "派奖中" in summary.state_machine_label
+
+
 def test_refresh_headless_defaults_to_sub_accounts(tmp_path: Path) -> None:
     adapter = FakeBrowserControlAdapter(max_log_entries=20)
     controller = LightweightController(
@@ -543,3 +574,54 @@ def test_cluster_adapter_command_order(monkeypatch) -> None:
 
     adapter.shutdown()
     assert actions[9] == ("stop_instances", ("a1", "a2"))
+
+
+def test_cluster_adapter_enter_room_starts_missing_workers(monkeypatch) -> None:
+    captured: list[object] = []
+
+    class FakeWorkerController:
+        def __init__(self, configs: list) -> None:
+            self.configs = list(configs)
+            self.actions: list[tuple[str, object]] = []
+
+        def start(self) -> None:
+            self.actions.append(("start", tuple(cfg.instance_id for cfg in self.configs)))
+
+        def send_command(self, account_id: str, command: dict[str, object]) -> bool:
+            self.actions.append(("send", account_id, command.get("command"), dict(command)))
+            return True
+
+        def running_instance_ids(self):
+            return {cfg.instance_id for cfg in self.configs}
+
+        def stop_instances(self, account_ids: list[str]) -> None:
+            self.actions.append(("stop_instances", tuple(account_ids)))
+
+        def poll_events(self, max_items: int = 128):
+            return []
+
+    def fake_factory(configs: list) -> FakeWorkerController:
+        worker = FakeWorkerController(configs)
+        captured.append(worker)
+        return worker
+
+    monkeypatch.setattr(
+        "bet_desktop.ui.lightweight_cluster_adapter.ClusterProcessController",
+        fake_factory,
+    )
+
+    adapter = LightweightClusterAdapter()
+    adapter.refresh_runtime_environment(
+        (
+            PlatformSlot(account_id="a1", login_url="https://a1.local/login", account_username="u1", account_password="p1"),
+            PlatformSlot(account_id="a3", login_url="https://a3.local/login", account_username="u3", account_password="p3"),
+        )
+    )
+
+    code, _stdout, stderr = adapter.enter_room(["a1", "a3"], 2)
+
+    assert code == 0, stderr
+    assert captured
+    assert captured[0].actions[0] == ("start", ("a1", "a3"))
+    assert captured[0].actions[1] == ("send", "a1", "enter_room", {"command": "enter_room", "room_index": 2})
+    assert captured[0].actions[2] == ("send", "a3", "enter_room", {"command": "enter_room", "room_index": 2})

@@ -184,10 +184,10 @@ class LightweightClusterAdapter(BrowserControlAdapter):
         self._controller = ClusterProcessController(configs)
         self._controller.start()
 
-    def _send_command(self, account_id: str, command: dict[str, Any]) -> None:
+    def _send_command(self, account_id: str, command: dict[str, Any]) -> bool:
         if not self._controller:
-            return
-        self._controller.send_command(account_id, command)
+            return False
+        return bool(self._controller.send_command(account_id, command))
 
     def _start_instances(self, account_ids: list[str] | None = None, *, auto_fill_login: bool = False) -> None:
         slots = self._select_slots(account_ids)
@@ -250,21 +250,32 @@ class LightweightClusterAdapter(BrowserControlAdapter):
         return 0, "ok", ""
 
     def handoff_to_headless(self, account_ids: list[str]) -> tuple[int, str, str]:
+        self._ensure_controller(account_ids)
+        missed: list[str] = []
         for slot in self._select_slots(account_ids):
-            self._send_command(slot.account_id, {"command": "handoff_to_headless"})
+            if not self._send_command(slot.account_id, {"command": "handoff_to_headless"}):
+                missed.append(slot.account_id)
             self._append_log(f"handoff_to_headless accounts={slot.account_id}")
+        if missed:
+            return 1, "", f"handoff command not sent: {','.join(missed)}"
         return 0, "ok", ""
 
     def enter_room(self, account_ids: list[str], room_index: int) -> tuple[int, str, str]:
+        self._ensure_controller(account_ids)
+        missed: list[str] = []
         for slot in self._select_slots(account_ids):
-            self._send_command(
+            sent = self._send_command(
                 slot.account_id,
                 {
                     "command": "enter_room",
                     "room_index": int(room_index),
                 },
             )
+            if not sent:
+                missed.append(slot.account_id)
             self._append_log(f"enter_room accounts={slot.account_id} room_index={room_index}")
+        if missed:
+            return 1, "", f"enter_room command not sent: {','.join(missed)}"
         return 0, "ok", ""
 
     def refresh_headless(self, account_ids: list[str]) -> tuple[int, str, str]:
