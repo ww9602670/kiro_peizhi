@@ -106,10 +106,12 @@ class LightweightController:
 
     def _resolve_account_ids(
         self,
-        account_ids: list[str] | None = None,
+        account_ids: list[str] | bool | None = None,
         *,
         default_to_all: bool = False,
     ) -> list[str]:
+        if isinstance(account_ids, bool):
+            account_ids = None
         if account_ids is None:
             if not default_to_all:
                 return []
@@ -219,7 +221,7 @@ class LightweightController:
     def start_batch_clicked(self) -> None:
         self.start_batch(self.platform_slots_account_ids())
 
-    def open_login_pages_clicked(self, account_ids: list[str] | None = None) -> None:
+    def open_login_pages_clicked(self, account_ids: list[str] | bool | None = None) -> None:
         targets = self._resolve_account_ids(account_ids, default_to_all=True)
         if not targets:
             self._emit_error("无可用账号")
@@ -228,7 +230,7 @@ class LightweightController:
         self.adapter.open_login_pages(targets)
         self._mark_runtime_status(targets, "打开登录页")
 
-    def fill_login_clicked(self, account_ids: list[str] | None = None) -> None:
+    def fill_login_clicked(self, account_ids: list[str] | bool | None = None) -> None:
         targets = self._resolve_account_ids(account_ids, default_to_all=True)
         if not targets:
             self._emit_error("无可用账号")
@@ -274,7 +276,7 @@ class LightweightController:
         self._mark_runtime_status(targets, "进房中")
         self._emit_account_status()
 
-    def refresh_headless_clicked(self, account_ids: list[str] | None = None) -> None:
+    def refresh_headless_clicked(self, account_ids: list[str] | bool | None = None) -> None:
         targets = self._resolve_account_ids(account_ids, default_to_all=False) if account_ids else self._sub_account_ids()
         if not targets:
             self._append_log("刷新无头：无可用账号")

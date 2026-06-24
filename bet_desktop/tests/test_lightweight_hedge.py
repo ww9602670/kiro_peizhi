@@ -166,6 +166,20 @@ def test_controller_start_does_not_start_accounts(tmp_path: Path) -> None:
     assert adapter.commands == []
 
 
+def test_qt_checked_false_uses_default_account_targets(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller.open_login_pages_clicked(False)
+    assert adapter.commands[-1] == "open_login_pages accounts=a1,a2,a3,a4"
+
+    controller.fill_login_clicked(False)
+    assert adapter.commands[-1] == "fill_login accounts=a1,a2,a3,a4"
+
+
 def test_batch_handoff_targets_follow_main_account(tmp_path: Path) -> None:
     adapter = FakeBrowserControlAdapter(max_log_entries=20)
     controller = LightweightController(
