@@ -136,6 +136,24 @@ def test_dashboard_open_login_syncs_current_form_fields(tmp_path: Path) -> None:
     app.processEvents()
 
 
+def test_dashboard_enter_room_uses_selected_room(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+    dashboard = LightweightDashboard(controller=controller)
+
+    dashboard._set_room_index(3, log=False)
+    dashboard._on_enter_room()
+
+    assert controller.config.room_index == 3
+    assert adapter.commands[-1] == "enter_room room_index=3 accounts=a1,a3,a4"
+    dashboard.close()
+    app.processEvents()
+
+
 def test_fake_adapter_command_logging_and_limit() -> None:
     adapter = FakeBrowserControlAdapter(max_log_entries=10)
     adapter.start_accounts(["a1", "a2"])

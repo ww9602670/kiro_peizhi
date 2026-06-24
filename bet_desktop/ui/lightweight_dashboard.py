@@ -56,6 +56,7 @@ class LightweightDashboard(QMainWindow):
         self.slot_cards: dict[str, dict[str, QWidget]] = {}
         self.summary_cards: dict[str, dict[str, QLabel]] = {}
         self.role_buttons: dict[str, QPushButton] = {}
+        self.room_index_buttons: dict[int, list[QPushButton]] = {room_index: [] for room_index in (1, 2, 3)}
         self.account_cards: dict[str, dict[str, QLabel]] = {}
         self.plan_rows: dict[str, dict[str, QLabel]] = {}
 
@@ -134,6 +135,7 @@ class LightweightDashboard(QMainWindow):
         batch_layout.addWidget(self._button("打开登录页", "", self._on_open_login_pages))
         batch_layout.addWidget(self._button("批量填登录", "", self._on_fill_login))
         batch_layout.addWidget(self._button("接管副号", "primary", self._on_handoff))
+        batch_layout.addWidget(self._build_room_selector())
         batch_layout.addWidget(self._button("批量进房", "success", self._on_enter_room))
         batch_layout.addWidget(self._button("释放无头", "", self._on_release))
         batch_layout.addWidget(self._button("批量停止", "danger", self.controller.batch_stop_clicked))
@@ -659,6 +661,50 @@ class LightweightDashboard(QMainWindow):
         layout.addWidget(QLabel("低频轮询"))
         return banner
 
+    def _build_room_selector(self) -> QWidget:
+        selector = QFrame()
+        selector.setObjectName("roomSelector")
+        layout = QHBoxLayout(selector)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+        label = QLabel("进房")
+        label.setObjectName("hint")
+        layout.addWidget(label)
+
+        group = QButtonGroup(selector)
+        group.setExclusive(True)
+        for room_index in (1, 2, 3):
+            button = self._button(f"{room_index}房", "segment", None)
+            button.setCheckable(True)
+            button.setMinimumWidth(46)
+            button.clicked.connect(lambda checked=False, value=room_index: self._set_room_index(value))
+            group.addButton(button)
+            self.room_index_buttons.setdefault(room_index, []).append(button)
+            layout.addWidget(button)
+        self._sync_room_buttons()
+        return selector
+
+    def _selected_room_index(self) -> int:
+        try:
+            room_index = int(self.controller.config.room_index)
+        except (TypeError, ValueError):
+            room_index = 1
+        return max(1, min(3, room_index))
+
+    def _set_room_index(self, room_index: int, log: bool = True) -> None:
+        room_index = max(1, min(3, int(room_index)))
+        if room_index != self._selected_room_index():
+            self.controller.apply_execution_config({"room_index": room_index})
+        self._sync_room_buttons()
+        if log:
+            self._append_log(f"进房房间已选择: {room_index}房")
+
+    def _sync_room_buttons(self) -> None:
+        selected = self._selected_room_index()
+        for room_index, buttons in self.room_index_buttons.items():
+            for button in buttons:
+                button.setChecked(room_index == selected)
+
     def _spin(self, low: int, high: int, value: int) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(low, high)
@@ -767,7 +813,7 @@ class LightweightDashboard(QMainWindow):
 
     def _on_enter_room(self) -> None:
         if self._sync_form_to_controller():
-            self.controller.batch_enter_room_clicked()
+            self.controller.batch_enter_room_clicked(self._selected_room_index())
 
     def _on_refresh_headless(self) -> None:
         if self._sync_form_to_controller():
@@ -796,6 +842,7 @@ class LightweightDashboard(QMainWindow):
             "click_interval_ms": self.click_interval_input.value(),
             "min_countdown": self.min_countdown_input.value(),
             "confirm_ms": self.confirm_ms_input.value(),
+            "room_index": self._selected_room_index(),
         }
 
     def _collect_slot_fields(self) -> bool:
@@ -862,6 +909,7 @@ class LightweightDashboard(QMainWindow):
                     else:
                         widget.setText(str(getattr(slot, key)))
         self._sync_main_account(config.main_account)
+        self._sync_room_buttons()
         self._refresh_platform_summary()
         self._on_account_status_updated(self.controller.account_status)
 
@@ -1138,7 +1186,7 @@ class LightweightDashboard(QMainWindow):
             }
             QFrame#summaryCard, QFrame#accountCard, QFrame#gateItem,
             QFrame#planLine, QFrame#healthBox, QFrame#metricRow,
-            QFrame#batchStrip, QFrame#modeBanner {
+            QFrame#batchStrip, QFrame#modeBanner, QFrame#roomSelector {
                 background: #f8fbfe;
                 border: 1px solid #d9e4ee;
                 border-radius: 8px;
