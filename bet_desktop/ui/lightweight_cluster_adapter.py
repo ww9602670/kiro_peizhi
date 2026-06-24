@@ -29,6 +29,15 @@ def _runtime_shadow_interval_ms() -> int:
     return max(1000, _safe_int(os.environ.get("BET_DESKTOP_RUNTIME_SHADOW_INTERVAL_MS", "1000"), 1000))
 
 
+def normalize_login_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    if "://" in value:
+        return value
+    return f"https://{value}"
+
+
 def platform_slot_to_cluster_config(
     slot: PlatformSlot,
     *,
@@ -41,7 +50,7 @@ def platform_slot_to_cluster_config(
     """Convert lightweight platform data to cluster worker config."""
     return ClusterWorkerConfig(
         instance_id=slot.account_id,
-        login_url=slot.login_url,
+        login_url=normalize_login_url(slot.login_url),
         target_url="",
         username=slot.account_username,
         password=slot.account_password,
@@ -207,9 +216,10 @@ class LightweightClusterAdapter(BrowserControlAdapter):
             return
         self._start_instances([slot.account_id for slot in slots], auto_fill_login=False)
         for slot in slots:
-            if not slot.login_url:
+            login_url = normalize_login_url(slot.login_url)
+            if not login_url:
                 continue
-            self._send_command(slot.account_id, {"command": "navigate", "url": slot.login_url})
+            self._send_command(slot.account_id, {"command": "navigate", "url": login_url})
 
     def run_command(self, command: list[str] | tuple[str, ...]) -> tuple[int, str, str]:
         action = str(command[0]) if command else ""

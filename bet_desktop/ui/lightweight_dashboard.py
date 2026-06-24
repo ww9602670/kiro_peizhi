@@ -131,11 +131,11 @@ class LightweightDashboard(QMainWindow):
         hint = QLabel("批量动作放在 4 个摘要卡片下方，避免配置页顶部拥挤。")
         hint.setObjectName("hint")
         batch_layout.addWidget(hint, 1)
-        batch_layout.addWidget(self._button("打开登录页", "", self.controller.open_login_pages_clicked))
-        batch_layout.addWidget(self._button("批量填登录", "", self.controller.batch_fill_login_clicked))
-        batch_layout.addWidget(self._button("接管副号", "primary", self.controller.batch_handoff_clicked))
-        batch_layout.addWidget(self._button("批量进房", "success", self.controller.batch_enter_room_clicked))
-        batch_layout.addWidget(self._button("释放无头", "", self.controller.batch_release_clicked))
+        batch_layout.addWidget(self._button("打开登录页", "", self._on_open_login_pages))
+        batch_layout.addWidget(self._button("批量填登录", "", self._on_fill_login))
+        batch_layout.addWidget(self._button("接管副号", "primary", self._on_handoff))
+        batch_layout.addWidget(self._button("批量进房", "success", self._on_enter_room))
+        batch_layout.addWidget(self._button("释放无头", "", self._on_release))
         batch_layout.addWidget(self._button("批量停止", "danger", self.controller.batch_stop_clicked))
         page_layout.addWidget(batch_strip)
 
@@ -275,10 +275,10 @@ class LightweightDashboard(QMainWindow):
         content_layout.addWidget(self._advanced_title("手动动作", "人工"))
         control_grid = QGridLayout()
         control_grid.setSpacing(8)
-        self.handoff_btn = self._button("a1/a3/a4 接管", "primary", self.controller.batch_handoff_clicked)
+        self.handoff_btn = self._button("a1/a3/a4 接管", "primary", self._on_handoff)
         control_grid.addWidget(self.handoff_btn, 0, 0, 1, 2)
-        control_grid.addWidget(self._button("批量进房", "", self.controller.batch_enter_room_clicked), 1, 0)
-        control_grid.addWidget(self._button("刷新无头", "", self.controller.refresh_headless_clicked), 1, 1)
+        control_grid.addWidget(self._button("批量进房", "", self._on_enter_room), 1, 0)
+        control_grid.addWidget(self._button("刷新无头", "", self._on_refresh_headless), 1, 1)
         control_grid.addWidget(self._button("测试发一轮", "success", self.controller.test_one_round_clicked), 2, 0, 1, 2)
         control_grid.addWidget(self._button("测试 10 轮", "", self.controller.test_ten_rounds_clicked), 3, 0, 1, 2)
         control_grid.addWidget(self._button("打开观察窗", "", self._protected_notice, enabled=False), 4, 0, 1, 2)
@@ -736,7 +736,8 @@ class LightweightDashboard(QMainWindow):
             self._sync_main_account(account_id)
 
     def _on_save_config(self) -> None:
-        self._collect_slot_fields()
+        if not self._collect_slot_fields():
+            return
         self.controller.apply_execution_config(self._execution_updates())
         self.controller.save_config()
         self._refresh_platform_summary()
@@ -745,6 +746,36 @@ class LightweightDashboard(QMainWindow):
         self.controller.apply_execution_config(self._execution_updates())
         self._refresh_plan(self.controller.main_account)
         self._append_log("高级参数已应用")
+
+    def _sync_form_to_controller(self) -> bool:
+        if not self._collect_slot_fields():
+            return False
+        self.controller.apply_execution_config(self._execution_updates())
+        return True
+
+    def _on_open_login_pages(self) -> None:
+        if self._sync_form_to_controller():
+            self.controller.open_login_pages_clicked()
+
+    def _on_fill_login(self) -> None:
+        if self._sync_form_to_controller():
+            self.controller.batch_fill_login_clicked()
+
+    def _on_handoff(self) -> None:
+        if self._sync_form_to_controller():
+            self.controller.batch_handoff_clicked()
+
+    def _on_enter_room(self) -> None:
+        if self._sync_form_to_controller():
+            self.controller.batch_enter_room_clicked()
+
+    def _on_refresh_headless(self) -> None:
+        if self._sync_form_to_controller():
+            self.controller.refresh_headless_clicked()
+
+    def _on_release(self) -> None:
+        if self._sync_form_to_controller():
+            self.controller.batch_release_clicked()
 
     def _on_strategy_preview_changed(self, _value: int = 0) -> None:
         self._refresh_plan(self.controller.main_account)
@@ -767,7 +798,8 @@ class LightweightDashboard(QMainWindow):
             "confirm_ms": self.confirm_ms_input.value(),
         }
 
-    def _collect_slot_fields(self) -> None:
+    def _collect_slot_fields(self) -> bool:
+        is_valid = True
         for account_id, widgets in self.slot_cards.items():
             updates: dict[str, str] = {}
             for key in [
@@ -786,9 +818,21 @@ class LightweightDashboard(QMainWindow):
                     updates.update(parse_proxy_bundle_line(proxy_bundle))
                 except ValueError:
                     self._append_log(f"{account_id} 代理格式错误，应为：IP|端口|账号|密码|到期时间")
+                    is_valid = False
                     continue
+            else:
+                updates.update(
+                    {
+                        "proxy_host": "",
+                        "proxy_port": "",
+                        "proxy_username": "",
+                        "proxy_password": "",
+                        "proxy_expire_at": "",
+                    }
+                )
             if updates:
                 self.controller.update_platform_slot(account_id, updates)
+        return is_valid
 
     def _refresh_from_controller(self) -> None:
         config = self.controller.config

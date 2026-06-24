@@ -4,10 +4,13 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+from PyQt6.QtWidgets import QApplication
+
 from bet_desktop.ui.lightweight_browser_adapter import FakeBrowserControlAdapter
 from bet_desktop.ui.lightweight_config_store import LightweightConfigStore
-from bet_desktop.ui.lightweight_cluster_adapter import LightweightClusterAdapter, platform_slot_to_cluster_config
+from bet_desktop.ui.lightweight_cluster_adapter import LightweightClusterAdapter, normalize_login_url, platform_slot_to_cluster_config
 from bet_desktop.ui.lightweight_controller import LightweightController
+from bet_desktop.ui.lightweight_dashboard import LightweightDashboard
 from bet_desktop.ui.lightweight_models import ACCOUNT_IDS, PlatformSlot, parse_proxy_bundle_lines, resolve_sub_accounts
 
 
@@ -106,6 +109,31 @@ def test_proxy_bundle_saved_as_split_fields_in_controller(tmp_path: Path) -> Non
     assert slot.proxy_username == "revf18h1"
     assert slot.proxy_password == "IVSrG6hd"
     assert slot.proxy_expire_at == "2026-07-18"
+
+
+def test_dashboard_open_login_syncs_current_form_fields(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+    dashboard = LightweightDashboard(controller=controller)
+
+    dashboard.slot_cards["a1"]["login_url"].setText("72991.com")
+    dashboard.slot_cards["a1"]["account_username"].setText("xy111222")
+    dashboard.slot_cards["a1"]["account_password"].setText("Xy888999")
+    dashboard.slot_cards["a1"]["proxy_bundle"].setText("125.75.69.116|9198|cjls11b1|SHAsqzgN|2026-07-11")
+
+    dashboard._on_open_login_pages()
+
+    slot = next(item for item in controller.platform_slots if item.account_id == "a1")
+    assert slot.login_url == "72991.com"
+    assert slot.account_username == "xy111222"
+    assert slot.proxy_host == "125.75.69.116"
+    assert adapter.commands[-1] == "open_login_pages accounts=a1,a2,a3,a4"
+    dashboard.close()
+    app.processEvents()
 
 
 def test_fake_adapter_command_logging_and_limit() -> None:
@@ -269,6 +297,12 @@ def test_platform_slot_to_cluster_config_mapping() -> None:
     assert probe_config.enable_frontend_probe is True
     assert probe_config.enable_canvas_probe is True
     assert probe_config.enable_runtime_scan is True
+
+
+def test_normalize_login_url_adds_https_for_short_domains() -> None:
+    assert normalize_login_url("72991.com") == "https://72991.com"
+    assert normalize_login_url("https://72991.com") == "https://72991.com"
+    assert normalize_login_url("") == ""
 
 
 def test_cluster_adapter_command_order(monkeypatch) -> None:
