@@ -139,7 +139,7 @@ class LightweightClusterAdapter(BrowserControlAdapter):
         runtime_pipeline: str = "legacy",
         enable_frontend_probe: bool = False,
         enable_canvas_probe: bool = False,
-        enable_runtime_scan: bool = False,
+        enable_runtime_scan: bool = True,
         max_log_entries: int = 200,
         on_log: Any = None,
     ) -> None:

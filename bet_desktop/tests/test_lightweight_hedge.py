@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import QApplication
 from bet_desktop.ui.lightweight_browser_adapter import FakeBrowserControlAdapter
 from bet_desktop.ui.lightweight_config_store import LightweightConfigStore
 from bet_desktop.ui.lightweight_cluster_adapter import LightweightClusterAdapter, normalize_login_url, platform_slot_to_cluster_config
-from bet_desktop.ui.lightweight_controller import LightweightController
+from bet_desktop.ui.lightweight_controller import LightweightController, _now_ms
 from bet_desktop.ui.lightweight_dashboard import LightweightDashboard
 from bet_desktop.ui.lightweight_models import ACCOUNT_IDS, PlatformSlot, parse_proxy_bundle_lines, resolve_sub_accounts
 
@@ -287,6 +287,97 @@ def test_runtime_state_event_updates_account_cards(tmp_path: Path) -> None:
     assert summary.countdown == 12
     assert str(summary.balance) == "1234.50"
     assert summary.state_label == "可下注"
+    assert summary.state_machine_label == "下注中 · 可下注"
+
+
+def test_runtime_state_countdown_decays_and_marks_stale(tmp_path: Path) -> None:
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=FakeBrowserControlAdapter(max_log_entries=20),
+    )
+
+    controller._handle_runtime_event(
+        "a2",
+        "state",
+        {
+            "batch_id": "202606250002",
+            "exact_countdown": 12,
+            "timestamp_captured_ms": _now_ms() - 2200,
+            "safe_summary": {
+                "room_label": "1房",
+                "runtime_betting_open": True,
+                "runtime_phase_label": "下注中",
+            },
+        },
+    )
+
+    summary = next(item for item in controller.account_status if item.account_id == "a2")
+    assert summary.countdown in {9, 10}
+    assert summary.state_label == "可下注"
+    assert summary.state_machine_label == "下注中 · 可下注"
+    assert summary.stale is False
+
+    controller._handle_runtime_event(
+        "a2",
+        "state",
+        {
+            "batch_id": "202606250002",
+            "exact_countdown": 3,
+            "timestamp_captured_ms": _now_ms() - 6500,
+            "safe_summary": {
+                "room_label": "1房",
+                "runtime_betting_open": True,
+                "runtime_phase_label": "下注中",
+            },
+        },
+    )
+
+    stale_summary = next(item for item in controller.account_status if item.account_id == "a2")
+    assert stale_summary.countdown == 0
+    assert stale_summary.state_label == "数据过期"
+    assert stale_summary.state_machine_label.startswith("数据过期")
+    assert stale_summary.betting_open is False
+    assert stale_summary.stale is True
+
+
+def test_runtime_state_auto_reenters_when_account_returns_to_hall(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller.batch_enter_room_clicked(2)
+    adapter._commands.clear()
+    controller._handle_runtime_event(
+        "a1",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {
+                "hall_ready": True,
+                "game_ready": False,
+                "room_entry_expected_room_index": 2,
+            },
+        },
+    )
+
+    assert adapter.commands == ["enter_room room_index=2 accounts=a1"]
+    command_count = len(adapter.commands)
+    controller._handle_runtime_event(
+        "a1",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {
+                "hall_ready": True,
+                "game_ready": False,
+                "room_entry_expected_room_index": 2,
+            },
+        },
+    )
+    assert len(adapter.commands) == command_count
+    assert any("自动回房" in item for item in controller.logs)
 
 
 def test_refresh_headless_defaults_to_sub_accounts(tmp_path: Path) -> None:
@@ -405,6 +496,9 @@ def test_cluster_adapter_command_order(monkeypatch) -> None:
     adapter.release_headless(["a1"])
 
     assert captured, "cluster factory should be created"
+    assert captured[0].configs[0].enable_runtime_scan is True
+    assert captured[0].configs[0].enable_frontend_probe is False
+    assert captured[0].configs[0].enable_canvas_probe is False
     actions = captured[0].actions
     assert actions[0][0] == "start"
     assert actions[1] == ("send", "a1", "navigate", {"command": "navigate", "url": "https://a1.local/login"})

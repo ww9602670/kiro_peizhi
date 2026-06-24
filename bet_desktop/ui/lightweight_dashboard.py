@@ -492,9 +492,10 @@ class LightweightDashboard(QMainWindow):
         layout.addWidget(countdown)
         round_id = QLabel("局号：-")
         balance = QLabel("余额：-")
+        state_machine = QLabel("状态机：-")
         pending = QLabel("待确认：-")
         room = QLabel("房间：-")
-        for item in (room, round_id, balance, pending):
+        for item in (room, round_id, balance, state_machine, pending):
             layout.addWidget(item)
 
         foot = QHBoxLayout()
@@ -510,6 +511,7 @@ class LightweightDashboard(QMainWindow):
             "room": room,
             "round": round_id,
             "balance": balance,
+            "machine": state_machine,
             "pending": pending,
             "primary": primary,
         }
@@ -981,6 +983,7 @@ class LightweightDashboard(QMainWindow):
             balance = getattr(summary, "balance", None)
             pending = getattr(summary, "pending_amount", None)
             card["balance"].setText(f"余额：{balance if balance is not None else '-'}")
+            card["machine"].setText(f"状态机：{getattr(summary, 'state_machine_label', '-') or '-'}")
             card["pending"].setText(f"待确认：{pending if pending is not None else '-'}")
 
     def _append_log(self, message: str) -> None:

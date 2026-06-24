@@ -63,6 +63,78 @@ def _truthy(value: Any) -> bool:
     return text in {"1", "true", "yes", "open", "can_bet", "betting"}
 
 
+STATE_STALE_MS = 5_000
+AUTO_REENTRY_COOLDOWN_MS = 30_000
+
+
+def _safe_summary_from(payload: dict[str, Any]) -> dict[str, Any]:
+    safe_summary = payload.get("safe_summary", {}) if isinstance(payload, dict) else {}
+    return safe_summary if isinstance(safe_summary, dict) else {}
+
+
+def _snapshot_timestamp_ms(snapshot: dict[str, Any]) -> int:
+    return _as_int(snapshot.get("timestamp_captured_ms")) or _now_ms()
+
+
+def _decayed_countdown(snapshot: dict[str, Any], safe_summary: dict[str, Any], *, current_ms: int) -> int | None:
+    countdown = _as_int(snapshot.get("exact_countdown"))
+    if countdown is None:
+        countdown = _as_int(
+            _first_text(
+                safe_summary.get("runtime_countdown"),
+                safe_summary.get("label_countdown"),
+                safe_summary.get("frontend_countdown"),
+                safe_summary.get("canvas_countdown"),
+            ),
+        )
+    if countdown is None:
+        return None
+    age_seconds = max(0, int((current_ms - _snapshot_timestamp_ms(snapshot)) / 1000))
+    return max(0, countdown - age_seconds)
+
+
+def _payload_game_ready(payload: dict[str, Any], safe_summary: dict[str, Any] | None = None) -> bool:
+    summary = safe_summary if safe_summary is not None else _safe_summary_from(payload)
+    return _truthy(payload.get("game_ready")) or _truthy(summary.get("game_ready"))
+
+
+def _payload_hall_without_game(payload: dict[str, Any], safe_summary: dict[str, Any] | None = None) -> bool:
+    summary = safe_summary if safe_summary is not None else _safe_summary_from(payload)
+    hall_ready = _truthy(payload.get("hall_ready")) or _truthy(summary.get("hall_ready"))
+    return bool(hall_ready and not _payload_game_ready(payload, summary))
+
+
+def _state_machine_label(safe_summary: dict[str, Any], *, betting_open: bool, stale: bool, age_ms: int) -> str:
+    if stale:
+        return f"数据过期 {max(1, int(age_ms / 1000))}秒"
+    if _payload_hall_without_game({}, safe_summary):
+        return "大厅"
+    phase_label = _first_text(
+        safe_summary.get("runtime_phase_label"),
+        safe_summary.get("label_phase_text"),
+        safe_summary.get("frontend_phase_text"),
+        safe_summary.get("canvas_phase_text"),
+        safe_summary.get("phase_text"),
+    )
+    parts: list[str] = []
+    if phase_label:
+        parts.append(phase_label)
+    elif _payload_game_ready({}, safe_summary):
+        parts.append("房间内")
+    if betting_open:
+        parts.append("可下注")
+    timed = _first_text(safe_summary.get("runtime_timed"), safe_summary.get("runtime_countdown"))
+    action = _first_text(safe_summary.get("runtime_action"))
+    load_type = _first_text(safe_summary.get("runtime_current_load_type"))
+    if timed:
+        parts.append(f"时间{timed}")
+    if action:
+        parts.append(f"动作{action}")
+    if load_type:
+        parts.append(f"装载{load_type}")
+    return " · ".join(parts) if parts else "等待状态"
+
+
 class LightweightController:
     """Phase-1~3 controller with lightweight actions and summary events."""
 
@@ -88,6 +160,9 @@ class LightweightController:
         self._runtime_status = {account_id: "待命" for account_id in ACCOUNT_IDS}
         self._runtime_snapshots: dict[str, dict[str, Any]] = {}
         self._runtime_errors: dict[str, str] = {}
+        self._room_entry_requested: dict[str, int] = {}
+        self._auto_reentry_cooldowns_ms: dict[str, int] = {}
+        self._auto_reentry_enabled = True
         self._update_platform_roles()
         self.adapter.refresh_runtime_environment(self.platform_slots)
         self._emit_account_status()
@@ -171,14 +246,13 @@ class LightweightController:
 
     def _build_account_statuses(self) -> list[AccountStatusSummary]:
         statuses: list[AccountStatusSummary] = []
+        current_ms = _now_ms()
         for slot in self.platform_slots:
             role = "main" if slot.account_id == self.main_account else "sub"
             account_mode = self._account_modes.get(slot.account_id, "idle")
             runtime_status = self._runtime_status.get(slot.account_id, "待命")
             snapshot = self._runtime_snapshots.get(slot.account_id, {})
-            safe_summary = snapshot.get("safe_summary", {}) if isinstance(snapshot, dict) else {}
-            if not isinstance(safe_summary, dict):
-                safe_summary = {}
+            safe_summary = _safe_summary_from(snapshot) if isinstance(snapshot, dict) else {}
             room_label = _first_text(
                 safe_summary.get("room_label"),
                 safe_summary.get("locked_room_label"),
@@ -197,18 +271,12 @@ class LightweightController:
                 safe_summary.get("canvas_game_no"),
                 "-",
             )
-            countdown = _as_int(snapshot.get("exact_countdown") if isinstance(snapshot, dict) else None)
-            if countdown is None:
-                countdown = _as_int(
-                    _first_text(
-                        safe_summary.get("runtime_countdown"),
-                        safe_summary.get("label_countdown"),
-                        safe_summary.get("frontend_countdown"),
-                        safe_summary.get("canvas_countdown"),
-                    ),
-                )
+            countdown = _decayed_countdown(snapshot, safe_summary, current_ms=current_ms) if snapshot else None
             balance = _as_decimal(snapshot.get("ocr_balance") if isinstance(snapshot, dict) else None)
-            betting_open = _truthy(
+            updated_at_ms = _snapshot_timestamp_ms(snapshot) if snapshot else current_ms
+            age_ms = max(0, current_ms - updated_at_ms) if snapshot else 0
+            stale = bool(snapshot and age_ms > STATE_STALE_MS)
+            betting_open = (not stale) and _truthy(
                 safe_summary.get("runtime_betting_open")
                 if "runtime_betting_open" in safe_summary
                 else safe_summary.get("runtime_is_can_betting"),
@@ -220,17 +288,21 @@ class LightweightController:
                 safe_summary.get("canvas_phase_text"),
                 safe_summary.get("phase_text"),
             )
+            state_machine_label = _state_machine_label(safe_summary, betting_open=betting_open, stale=stale, age_ms=age_ms)
             state_label = runtime_status if runtime_status != "待命" else account_mode
             if snapshot:
-                if betting_open:
+                if stale:
+                    state_label = "数据过期"
+                elif betting_open:
                     state_label = "可下注"
+                elif _payload_hall_without_game(snapshot, safe_summary):
+                    state_label = "大厅"
                 elif phase_label:
                     state_label = phase_label
                 elif room_label != "-":
                     state_label = "房间已打开"
             elif slot.account_id in self._runtime_errors:
                 state_label = "异常"
-            updated_at_ms = _as_int(snapshot.get("timestamp_captured_ms") if isinstance(snapshot, dict) else None) or _now_ms()
             statuses.append(
                 AccountStatusSummary(
                     account_id=slot.account_id,
@@ -245,6 +317,9 @@ class LightweightController:
                     pending_amount=None,
                     state_label=state_label,
                     updated_at_ms=updated_at_ms,
+                    state_machine_label=state_machine_label,
+                    stale=stale,
+                    age_ms=age_ms,
                 )
             )
         return statuses
@@ -366,6 +441,8 @@ class LightweightController:
             return
         self._append_log(f"批量进房: 房间{resolved_room_index} {','.join(targets)}")
         self.adapter.enter_room(targets, room_index=resolved_room_index)
+        for account_id in targets:
+            self._room_entry_requested[account_id] = resolved_room_index
         self._mark_runtime_status(targets, "进房中")
         self._emit_account_status()
 
@@ -384,6 +461,9 @@ class LightweightController:
             return
         self._append_log(f"释放无头: {','.join(targets)}")
         self.adapter.release_headless(targets)
+        for account_id in targets:
+            self._room_entry_requested.pop(account_id, None)
+            self._auto_reentry_cooldowns_ms.pop(account_id, None)
         self._mark_runtime_status(targets, "已释放")
         self._emit_account_status()
 
@@ -476,6 +556,14 @@ class LightweightController:
             self._runtime_snapshots[instance_id] = dict(payload)
             self._runtime_errors.pop(instance_id, None)
             self._runtime_status[instance_id] = "状态已更新"
+            safe_summary = _safe_summary_from(payload)
+            if _payload_game_ready(payload, safe_summary):
+                self._runtime_status[instance_id] = "房间已打开"
+                self._room_entry_requested.setdefault(instance_id, self._room_index_from_payload(payload))
+                self._auto_reentry_cooldowns_ms.pop(instance_id, None)
+            elif _payload_hall_without_game(payload, safe_summary):
+                self._runtime_status[instance_id] = "已回大厅"
+                self._maybe_auto_reenter_room(instance_id, payload)
 
         game_launch_context = str(payload.get("game_launch_context") or "")
         room_entry = str(payload.get("room_entry") or "")
@@ -497,6 +585,30 @@ class LightweightController:
                 "game_ready": "房间已打开",
                 "timeout": "进房超时",
             }.get(room_entry, self._runtime_status.get(instance_id, "待命"))
+            if room_entry in {"entering", "click_confirmed", "game_ready"}:
+                self._room_entry_requested.setdefault(instance_id, self._room_index_from_payload(payload))
+
+    def _room_index_from_payload(self, payload: dict[str, Any]) -> int:
+        safe_summary = _safe_summary_from(payload)
+        room_index = _as_int(payload.get("room_index")) or _as_int(safe_summary.get("room_entry_expected_room_index"))
+        if room_index is not None and room_index >= 1:
+            return room_index
+        return max(1, int(self.config.room_index or 1))
+
+    def _maybe_auto_reenter_room(self, account_id: str, payload: dict[str, Any]) -> None:
+        if not self._auto_reentry_enabled:
+            return
+        room_index = int(self._room_entry_requested.get(account_id) or self._room_index_from_payload(payload))
+        if room_index < 1:
+            return
+        current_ms = _now_ms()
+        if current_ms < int(self._auto_reentry_cooldowns_ms.get(account_id, 0) or 0):
+            return
+        self._auto_reentry_cooldowns_ms[account_id] = current_ms + AUTO_REENTRY_COOLDOWN_MS
+        self._room_entry_requested[account_id] = room_index
+        self._append_log(f"自动回房: {account_id} 检测到大厅，重进 {room_index} 房")
+        self.adapter.enter_room([account_id], room_index=room_index)
+        self._runtime_status[account_id] = "自动回房中"
 
     def shutdown_runtime(self) -> None:
         self.adapter.shutdown()

@@ -293,6 +293,9 @@ class AccountStatusSummary:
     pending_amount: Decimal | None = None
     state_label: str = ""
     updated_at_ms: int = 0
+    state_machine_label: str = ""
+    stale: bool = False
+    age_ms: int = 0
 
 
 @dataclass(frozen=True)
