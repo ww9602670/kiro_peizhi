@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>四平台群控界面初稿 V4</title>
+  <style>
+    :root {
+      --bg: #0b1118;
+      --panel: #101923;
+      --panel-2: #151f2b;
+      --panel-3: #1d2a38;
+      --line: #2c3c4e;
+      --text: #edf7ff;
+      --muted: #90a5b8;
+      --accent: #2e9bd5;
+      --ok: #2ec985;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      display: grid;
+      place-items: center;
+    }
+
+    h1, h2, h3, p { margin: 0; }
+
+    .stage {
+      width: 1180px;
+      min-height: 760px;
+      padding: 22px;
+      background: #0d141d;
+      border: 1px solid #263543;
+      border-radius: 8px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .main {
+      min-height: 716px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .head {
+      height: 58px;
+      padding: 0 20px;
+      background: #0c131a;
+      border-bottom: 1px solid #172633;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .title {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .tool-btn {
+      height: 38px;
+      padding: 0 14px;
+      border: 1px solid #34485c;
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .content {
+      padding: 20px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .section-title {
+      font-size: 18px;
+      color: #d9eeff;
+      margin-bottom: 12px;
+    }
+
+    .platforms {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+
+    .platform-card {
+      min-height: 194px;
+      padding: 16px;
+      background: var(--panel-2);
+      border: 1px solid #2b4055;
+      border-radius: 8px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .platform-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .slot {
+      color: #98d7ff;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .state {
+      color: #7be3b1;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .name-input {
+      width: 100%;
+      height: 42px;
+      padding: 0 12px;
+      border: 1px solid #31475b;
+      border-radius: 6px;
+      background: #1a2430;
+      color: var(--text);
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .card-meta {
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .card-meta span {
+      min-height: 28px;
+      padding: 6px 8px;
+      border: 1px solid #27394c;
+      border-radius: 6px;
+      background: #111b26;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .start-btn {
+      height: 42px;
+      border: 1px solid #2085c6;
+      border-radius: 6px;
+      background: #12659a;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .group-panel {
+      padding: 18px;
+      border: 1px solid #2b4055;
+      border-radius: 8px;
+      background: #0f1821;
+    }
+
+    .group-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .big-action {
+      height: 116px;
+      padding: 0 22px;
+      border-radius: 8px;
+      border: 1px solid #3a5870;
+      background: var(--panel-3);
+      color: var(--text);
+      text-align: left;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .big-action strong {
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+
+    .big-action span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .room-action {
+      border-color: #2877a9;
+      background: #14324a;
+    }
+
+    .log {
+      min-height: 110px;
+      padding: 14px;
+      background: #081019;
+      border: 1px solid #23394e;
+      border-radius: 8px;
+      color: #8bd8ff;
+      font-size: 14px;
+      line-height: 1.8;
+    }
+
+    .overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(3, 8, 13, .64);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .16s ease;
+    }
+
+    .drawer {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 520px;
+      height: 100%;
+      background: #101923;
+      border-left: 1px solid #304154;
+      transform: translateX(100%);
+      transition: transform .18s ease;
+      display: grid;
+      grid-template-rows: 58px auto;
+    }
+
+    body.open .overlay {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    body.open .drawer {
+      transform: translateX(0);
+    }
+
+    .drawer-content {
+      padding: 16px;
+      display: grid;
+      gap: 14px;
+      align-content: start;
+      overflow: auto;
+    }
+
+    .platform-list {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .platform-row {
+      min-height: 48px;
+      padding: 8px 10px;
+      border: 1px solid #2b3d50;
+      border-radius: 8px;
+      background: #101a24;
+      display: grid;
+      grid-template-columns: 1fr 66px;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .platform-row.active {
+      border-color: #2f79a7;
+      background: #102132;
+    }
+
+    .row-name {
+      color: #dbeeff;
+      font-size: 14px;
+      font-weight: 700;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .edit-btn, .save-btn, .secondary {
+      height: 36px;
+      border-radius: 6px;
+      border: 1px solid #38516a;
+      background: #202c3b;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .active .edit-btn,
+    .save-btn {
+      border-color: #2a83bc;
+      background: #174b70;
+    }
+
+    .edit-card {
+      border: 1px solid #2b3d50;
+      border-radius: 8px;
+      background: #0d151e;
+      overflow: hidden;
+    }
+
+    .edit-head {
+      min-height: 48px;
+      padding: 0 12px;
+      background: #121e2a;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #24394e;
+    }
+
+    .edit-head h3 {
+      font-size: 16px;
+      color: #bce4ff;
+    }
+
+    .edit-body {
+      padding: 12px;
+      display: grid;
+      gap: 9px;
+    }
+
+    .config-row {
+      display: grid;
+      grid-template-columns: 78px 1fr;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .mini-input {
+      height: 32px;
+      padding: 0 10px;
+      border: 1px solid #2d4054;
+      border-radius: 6px;
+      background: #1a2430;
+      color: #dbeeff;
+      font-size: 14px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .masked {
+      color: #9fb0c1;
+      letter-spacing: 1px;
+    }
+
+    .side-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <section class="main" aria-label="四平台主界面">
+      <div class="head">
+        <h1 class="title">四平台群控台</h1>
+        <button class="tool-btn" id="openConfig">平台配置</button>
+      </div>
+
+      <div class="content">
+        <section>
+          <h2 class="section-title">平台启动</h2>
+          <div class="platforms">
+            <article class="platform-card">
+              <div class="platform-top">
+                <span class="slot">平台 1</span>
+                <span class="state">配置完整</span>
+              </div>
+              <input class="name-input" value="228 娱乐平台" aria-label="平台1名称">
+              <div class="card-meta">
+                <span>代理：已绑定</span>
+                <span>账号：vhsi578</span>
+              </div>
+              <button class="start-btn">启动平台 1</button>
+            </article>
+
+            <article class="platform-card">
+              <div class="platform-top">
+                <span class="slot">平台 2</span>
+                <span class="state">配置完整</span>
+              </div>
+              <input class="name-input" value="备用平台 A" aria-label="平台2名称">
+              <div class="card-meta">
+                <span>代理：已绑定</span>
+                <span>账号：已绑定</span>
+              </div>
+              <button class="start-btn">启动平台 2</button>
+            </article>
+
+            <article class="platform-card">
+              <div class="platform-top">
+                <span class="slot">平台 3</span>
+                <span class="state">配置完整</span>
+              </div>
+              <input class="name-input" value="备用平台 B" aria-label="平台3名称">
+              <div class="card-meta">
+                <span>代理：已绑定</span>
+                <span>账号：已绑定</span>
+              </div>
+              <button class="start-btn">启动平台 3</button>
+            </article>
+
+            <article class="platform-card">
+              <div class="platform-top">
+                <span class="slot">平台 4</span>
+                <span class="state">未完善</span>
+              </div>
+              <input class="name-input" value="自定义平台名称" aria-label="平台4名称">
+              <div class="card-meta">
+                <span>代理：未绑定</span>
+                <span>账号：未绑定</span>
+              </div>
+              <button class="start-btn">启动平台 4</button>
+            </article>
+          </div>
+        </section>
+
+        <section class="group-panel">
+          <h2 class="section-title">群控操作</h2>
+          <div class="group-actions">
+            <button class="big-action">
+              <strong>一键接管大厅</strong>
+              <span>接管全部已启动平台的大厅窗口</span>
+            </button>
+            <button class="big-action room-action">
+              <strong>进入房间</strong>
+              <span>让全部已启动平台进入各自配置的目标房间</span>
+            </button>
+          </div>
+        </section>
+
+        <div class="log">
+          平台 1：大厅就绪　|　平台 2：大厅就绪　|　平台 3：未启动　|　平台 4：待补充<br>
+          代理、网址、平台账号密码不在主界面常驻显示；点击右上角“平台配置”后再进入二级配置。
+        </div>
+      </div>
+    </section>
+
+    <div class="overlay" id="overlay"></div>
+    <aside class="drawer" aria-label="二级配置抽屉">
+      <div class="head">
+        <h2 class="title" style="font-size: 19px;">二级配置</h2>
+        <button class="tool-btn" id="closeConfig">关闭</button>
+      </div>
+
+      <div class="drawer-content">
+        <section class="platform-list">
+          <div class="platform-row active">
+            <div class="row-name">平台 1：228 娱乐平台</div>
+            <button class="edit-btn">编辑</button>
+          </div>
+          <div class="platform-row">
+            <div class="row-name">平台 2：备用平台 A</div>
+            <button class="edit-btn">编辑</button>
+          </div>
+          <div class="platform-row">
+            <div class="row-name">平台 3：备用平台 B</div>
+            <button class="edit-btn">编辑</button>
+          </div>
+          <div class="platform-row">
+            <div class="row-name">平台 4：自定义平台名称</div>
+            <button class="edit-btn">编辑</button>
+          </div>
+        </section>
+
+        <section class="edit-card">
+          <div class="edit-head">
+            <h3>平台 1：228 娱乐平台</h3>
+            <button class="save-btn">保存</button>
+          </div>
+          <div class="edit-body">
+            <div class="config-row"><div class="label">平台名称</div><div class="mini-input">228 娱乐平台</div></div>
+            <div class="config-row"><div class="label">平台网址</div><div class="mini-input">https://228.com</div></div>
+            <div class="config-row"><div class="label">目标房间</div><div class="mini-input">已配置房间入口</div></div>
+            <div class="config-row"><div class="label">代理主机</div><div class="mini-input">proxy-host-01</div></div>
+            <div class="config-row"><div class="label">代理端口</div><div class="mini-input">8080</div></div>
+            <div class="config-row"><div class="label">代理账号</div><div class="mini-input">proxy-user-01</div></div>
+            <div class="config-row"><div class="label">代理密码</div><div class="mini-input masked">********</div></div>
+            <div class="config-row"><div class="label">平台账号</div><div class="mini-input">vhsi578</div></div>
+            <div class="config-row"><div class="label">平台密码</div><div class="mini-input masked">********</div></div>
+          </div>
+        </section>
+
+        <div class="side-actions">
+          <button class="secondary">导入配置表</button>
+          <button class="secondary">导出配置表</button>
+          <button class="secondary">测试全部登录</button>
+          <button class="secondary">刷新浏览器环境</button>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    const openConfig = document.getElementById('openConfig');
+    const closeConfig = document.getElementById('closeConfig');
+    const overlay = document.getElementById('overlay');
+    openConfig.addEventListener('click', () => document.body.classList.add('open'));
+    closeConfig.addEventListener('click', () => document.body.classList.remove('open'));
+    overlay.addEventListener('click', () => document.body.classList.remove('open'));
+    if (new URLSearchParams(location.search).get('open') === '1') {
+      document.body.classList.add('open');
+    }
+  </script>
+</body>
+</html>

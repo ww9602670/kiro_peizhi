@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>四平台群控台 Tab 初版设计 v2</title>
+  <style>
+    :root {
+      --bg: #0b1118;
+      --panel: #121922;
+      --section: #151e29;
+      --field: #202938;
+      --line: #334155;
+      --text: #e5f2ff;
+      --muted: #91a4b8;
+      --cyan: #8bdcff;
+      --blue: #147bb6;
+      --green: #2dd4bf;
+      --yellow: #fbbf24;
+      --red: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #071018;
+      color: var(--text);
+      font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    }
+    .page {
+      padding: 20px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(560px, 1fr));
+      gap: 20px;
+    }
+    .mock {
+      background: var(--bg);
+      border: 1px solid #2f3d50;
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 920px;
+    }
+    .title {
+      background: #0d141c;
+      color: #f1f7ff;
+      font-size: 22px;
+      font-weight: 800;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    .tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .tab {
+      border: 1px solid var(--line);
+      background: #17202c;
+      border-radius: 6px;
+      padding: 11px;
+      color: var(--muted);
+      text-align: center;
+      font-weight: 700;
+    }
+    .tab.active {
+      background: #0f2a3a;
+      border-color: #276b91;
+      color: var(--cyan);
+    }
+    .section {
+      border: 1px solid #2e3b4c;
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .section-title {
+      background: #0e151d;
+      color: var(--cyan);
+      font-weight: 800;
+      padding: 8px 10px;
+      margin-bottom: 12px;
+    }
+    .section-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .section-head span { color: #dbeafe; font-weight: 700; }
+    .section-head button { margin-left: auto; }
+    .platform-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .card {
+      border: 1px solid #344255;
+      border-radius: 8px;
+      background: var(--section);
+      padding: 12px;
+    }
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .platform-no {
+      color: var(--cyan);
+      font-size: 18px;
+      font-weight: 800;
+    }
+    .name-box, .field, .log-box {
+      background: var(--field);
+      border: 1px solid #344255;
+      border-radius: 5px;
+      padding: 10px;
+      color: #f8fbff;
+    }
+    .status-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      color: #d6f7ff;
+      font-size: 14px;
+      margin: 8px 0;
+    }
+    .button-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    button, .btn {
+      border: 1px solid #3f526b;
+      border-radius: 6px;
+      background: #202b3a;
+      color: #f0f9ff;
+      padding: 10px 12px;
+      font-weight: 800;
+      font-size: 14px;
+      text-align: center;
+    }
+    .primary {
+      background: linear-gradient(180deg, #1687c7, #126fa4);
+      border-color: #2199df;
+    }
+    .wide { grid-column: 1 / -1; }
+    .global-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .progress {
+      margin-top: 10px;
+      border: 1px solid #24455e;
+      border-radius: 6px;
+      background: #0d1720;
+      color: #8bdcff;
+      padding: 10px;
+      line-height: 1.5;
+      font-weight: 700;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 150px 1fr;
+      gap: 10px;
+      align-items: center;
+    }
+    .label {
+      background: #0e151d;
+      color: #d7f2ff;
+      padding: 10px;
+      min-height: 42px;
+    }
+    .preview {
+      color: var(--yellow);
+      font-weight: 900;
+      font-size: 16px;
+    }
+    .ops-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .runtime-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .mini-title {
+      color: var(--cyan);
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+    .log-box {
+      height: 270px;
+      overflow: hidden;
+      font-family: Consolas, "Microsoft YaHei", monospace;
+      font-size: 13px;
+      line-height: 1.65;
+      color: #dbeafe;
+      background: #091018;
+    }
+    .log-line.good { color: #86efac; }
+    .log-line.warn { color: #fde68a; }
+    .log-line.bad { color: #fca5a5; }
+    .note {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="mock">
+      <div class="title">全局控制配置</div>
+      <div class="tabs">
+        <div class="tab active">四平台群控</div>
+        <div class="tab">执行与算法</div>
+      </div>
+
+      <div class="section">
+        <div class="section-head">
+          <span>平台启动</span>
+          <button>平台配置</button>
+        </div>
+        <div class="platform-grid">
+          <div class="card">
+            <div class="card-head"><div class="platform-no">平台 1</div><button>编辑</button></div>
+            <div class="name-box">228.com</div>
+            <div class="status-row"><span>代理：已绑定</span><span>账号：已绑定</span></div>
+            <div class="button-row">
+              <button class="primary">启动/重启</button>
+              <button>填写登录</button>
+              <button>接管大厅</button>
+              <button>进房 ▾</button>
+              <button class="wide">释放无头</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><div class="platform-no">平台 2</div><button>编辑</button></div>
+            <div class="name-box">PG</div>
+            <div class="status-row"><span>代理：已绑定</span><span>账号：已绑定</span></div>
+            <div class="button-row">
+              <button class="primary">启动/重启</button>
+              <button>填写登录</button>
+              <button>接管大厅</button>
+              <button>进房 ▾</button>
+              <button class="wide">释放无头</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><div class="platform-no">平台 3</div><button>编辑</button></div>
+            <div class="name-box">永利</div>
+            <div class="status-row"><span>代理：已绑定</span><span>账号：已绑定</span></div>
+            <div class="button-row">
+              <button class="primary">启动/重启</button>
+              <button>填写登录</button>
+              <button>接管大厅</button>
+              <button>进房 ▾</button>
+              <button class="wide">释放无头</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><div class="platform-no">平台 4</div><button>编辑</button></div>
+            <div class="name-box">威尼斯人</div>
+            <div class="status-row"><span>代理：已绑定</span><span>账号：已绑定</span></div>
+            <div class="button-row">
+              <button class="primary">启动/重启</button>
+              <button>填写登录</button>
+              <button>接管大厅</button>
+              <button>进房 ▾</button>
+              <button class="wide">释放无头</button>
+            </div>
+          </div>
+        </div>
+        <div class="global-actions">
+          <button class="primary wide">启动全部平台</button>
+          <button>一键接管大厅</button>
+          <button>进入房间 ▾</button>
+          <button>刷新无头状态</button>
+          <button>释放无头接管</button>
+        </div>
+        <div class="progress">无头接管进度：a1: 已进入房间 1 ｜ a2: 大厅就绪 ｜ a3: 未接管 ｜ a4: 未接管</div>
+      </div>
+    </section>
+
+    <section class="mock">
+      <div class="title">全局控制配置</div>
+      <div class="tabs">
+        <div class="tab">四平台群控</div>
+        <div class="tab active">执行与算法</div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">算法边界值与测试用例注入</div>
+        <div class="form-grid">
+          <div class="label">对冲方向模型</div>
+          <div class="field">选项 A：主闲 / 副庄对冲 ▾</div>
+          <div class="label">基础目标总额</div>
+          <div class="field">100 ▲ ▼</div>
+          <div class="label">拆分预览</div>
+          <div class="field preview">主号 100 ｜ 副号合计 100 ｜ 校验通过</div>
+        </div>
+        <div class="ops-grid">
+          <button class="primary">启动执行</button>
+          <button>暂停</button>
+          <button>停止</button>
+          <button>清空日志</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">执行过程监控</div>
+        <div class="runtime-grid">
+          <div class="card">
+            <div class="mini-title">算法拆分</div>
+            <div class="field">主号完整金额 100 ｜ 副号合计 100</div>
+          </div>
+          <div class="card">
+            <div class="mini-title">下注状态</div>
+            <div class="field">主号 a1 已下注 100 ｜ 副号等待分配</div>
+          </div>
+          <div class="card">
+            <div class="mini-title">副号拆分</div>
+            <div class="field">a2 40 ｜ a3 30 ｜ a4 30 ｜ 合计 100</div>
+          </div>
+          <div class="card">
+            <div class="mini-title">结算状态</div>
+            <div class="field">等待主号与副号真实余额刷新</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">实时执行日志</div>
+        <div class="log-box">
+          <div class="log-line good">[12:01:08] 主号金额：a1 = 100，主号按完整目标金额下注</div>
+          <div class="log-line">[12:01:09] 副号筛选：a2 / a3 / a4 满足下注条件</div>
+          <div class="log-line good">[12:01:09] 副号拆分：a2 40，a3 30，a4 30，副号合计 100</div>
+          <div class="log-line good">[12:01:10] 校验通过：副号合计 100 = 主号金额 100</div>
+          <div class="log-line">[12:01:11] 下注执行：a1 主号 100，a2 40，a3 30，a4 30</div>
+          <div class="log-line warn">[12:01:12] 阻断检查：如副号数量变化，将重新拆分并再次校验</div>
+          <div class="log-line">[12:01:15] 结算等待：主号与副号真实余额刷新中</div>
+        </div>
+        <div class="note">说明：这里先作为 UI 预留区，后续只接现有执行事件日志，不改余额、局号、倒计时、房间号、限红、坐标定位链路。</div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

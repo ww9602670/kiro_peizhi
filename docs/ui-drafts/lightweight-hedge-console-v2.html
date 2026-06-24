@@ -1,0 +1,985 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>轻量对冲控制台 V2</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f9;
+      --surface: #ffffff;
+      --surface-soft: #f9fbfc;
+      --line: #d9e0e6;
+      --text: #18212a;
+      --muted: #637180;
+      --green: #16855f;
+      --green-soft: #e7f6ef;
+      --red: #b83b42;
+      --red-soft: #fae9ea;
+      --amber: #b06d18;
+      --amber-soft: #fff3dc;
+      --blue: #2368b2;
+      --blue-soft: #eaf2fb;
+      --ink: #26323d;
+      --shadow: 0 12px 28px rgba(29, 45, 58, .08);
+      font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      letter-spacing: 0;
+    }
+
+    button, input, select {
+      font: inherit;
+      letter-spacing: 0;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 232px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      background: #202a33;
+      color: #edf4f7;
+      padding: 18px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 8px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, .12);
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 8px;
+      background: #d9f1e7;
+      color: #114d38;
+      font-weight: 800;
+    }
+
+    .brand h1 {
+      font-size: 17px;
+      line-height: 1.2;
+      margin: 0;
+      font-weight: 750;
+    }
+
+    .brand small {
+      display: block;
+      margin-top: 3px;
+      color: #b7c2ca;
+      font-size: 12px;
+    }
+
+    .nav {
+      display: grid;
+      gap: 6px;
+    }
+
+    .nav button {
+      width: 100%;
+      min-height: 42px;
+      border: 0;
+      border-radius: 8px;
+      color: #d8e2e8;
+      background: transparent;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .nav button.active {
+      background: #eff8f4;
+      color: #153b2f;
+      font-weight: 700;
+    }
+
+    .side-status {
+      margin-top: auto;
+      border-top: 1px solid rgba(255, 255, 255, .12);
+      padding: 14px 8px 2px;
+      display: grid;
+      gap: 10px;
+      color: #c8d4dc;
+      font-size: 13px;
+    }
+
+    .side-status strong {
+      color: #ffffff;
+      font-weight: 700;
+    }
+
+    .main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .topbar {
+      min-height: 74px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 22px;
+    }
+
+    .title-block h2 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+
+    .title-block p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .top-actions,
+    .button-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      min-height: 36px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--ink);
+      padding: 0 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .btn.primary {
+      background: var(--green);
+      border-color: var(--green);
+      color: #ffffff;
+      font-weight: 700;
+    }
+
+    .btn.warn {
+      background: var(--amber-soft);
+      border-color: #e6bd77;
+      color: #70440d;
+    }
+
+    .btn.danger {
+      background: var(--red-soft);
+      border-color: #efb7bb;
+      color: #862a31;
+    }
+
+    .btn.icon {
+      width: 36px;
+      padding: 0;
+    }
+
+    .page {
+      display: none;
+      padding: 18px 22px 24px;
+      gap: 16px;
+    }
+
+    .page.active {
+      display: grid;
+    }
+
+    .toolbar-band,
+    .section-band {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .toolbar-band {
+      padding: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .summary-line {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+
+    .pill {
+      min-height: 28px;
+      border-radius: 999px;
+      padding: 4px 10px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--ink);
+      background: #eef2f5;
+      border: 1px solid #dbe3e8;
+    }
+
+    .pill.ok {
+      background: var(--green-soft);
+      color: #105840;
+      border-color: #bde5d2;
+    }
+
+    .pill.wait {
+      background: var(--amber-soft);
+      color: #70440d;
+      border-color: #e8c584;
+    }
+
+    .pill.live {
+      background: var(--blue-soft);
+      color: #174f8d;
+      border-color: #bdd6ee;
+    }
+
+    .platform-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(210px, 1fr));
+      gap: 12px;
+    }
+
+    .platform-card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .account-title {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+    }
+
+    .account-dot {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      color: #ffffff;
+      background: var(--blue);
+      font-size: 13px;
+      font-weight: 800;
+      flex: 0 0 auto;
+    }
+
+    .account-title h3 {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.2;
+    }
+
+    .account-title small {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .role {
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 12px;
+      background: #eef2f5;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      white-space: nowrap;
+    }
+
+    .role.main-role {
+      color: #105840;
+      background: var(--green-soft);
+      border-color: #bde5d2;
+    }
+
+    .fields {
+      display: grid;
+      gap: 8px;
+    }
+
+    .field {
+      display: grid;
+      gap: 4px;
+    }
+
+    .field label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .field input,
+    .field select {
+      width: 100%;
+      min-height: 34px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: var(--surface-soft);
+      color: var(--text);
+      padding: 0 9px;
+      outline: none;
+    }
+
+    .compact-fields {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .card-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .card-actions .btn {
+      min-width: 0;
+      padding: 0 8px;
+    }
+
+    .section-band {
+      padding: 14px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 10px;
+    }
+
+    .section-head h3 {
+      margin: 0;
+      font-size: 16px;
+    }
+
+    .control-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+    }
+
+    .run-layout {
+      display: grid;
+      grid-template-columns: 1.15fr .85fr;
+      gap: 14px;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(170px, 1fr));
+      gap: 10px;
+    }
+
+    .status-card {
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .status-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .status-name {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 800;
+    }
+
+    .mode-badge {
+      color: var(--muted);
+      background: #eef2f5;
+      border: 1px solid var(--line);
+      padding: 3px 7px;
+      border-radius: 999px;
+      font-size: 12px;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .metric {
+      border-left: 3px solid #b8c4ce;
+      padding-left: 8px;
+      min-width: 0;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 2px;
+      font-size: 15px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 8px;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 700;
+      background: var(--surface-soft);
+    }
+
+    .log-list {
+      display: grid;
+      gap: 8px;
+      max-height: 310px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .log-item {
+      border-left: 3px solid #b8c4ce;
+      background: var(--surface-soft);
+      padding: 9px 10px;
+      border-radius: 6px;
+      display: grid;
+      gap: 3px;
+      font-size: 13px;
+    }
+
+    .log-item strong {
+      color: var(--ink);
+    }
+
+    .log-item span {
+      color: var(--muted);
+    }
+
+    .footer-band {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 0 2px;
+    }
+
+    @media (max-width: 1280px) {
+      .platform-grid,
+      .status-grid {
+        grid-template-columns: repeat(2, minmax(240px, 1fr));
+      }
+
+      .control-grid {
+        grid-template-columns: repeat(3, minmax(150px, 1fr));
+      }
+
+      .run-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: sticky;
+        top: 0;
+        z-index: 3;
+        padding: 12px;
+      }
+
+      .brand {
+        padding-bottom: 10px;
+      }
+
+      .nav {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .nav button {
+        justify-content: center;
+        font-size: 13px;
+      }
+
+      .side-status {
+        display: none;
+      }
+
+      .topbar,
+      .toolbar-band,
+      .section-head {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .topbar {
+        padding: 14px;
+      }
+
+      .page {
+        padding: 14px;
+      }
+
+      .platform-grid,
+      .status-grid,
+      .control-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .card-actions {
+        grid-template-columns: 1fr;
+      }
+
+      .top-actions .btn,
+      .button-row .btn {
+        flex: 1 1 130px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">轻</div>
+        <div>
+          <h1>轻量对冲控制台</h1>
+          <small>4 账号 · 接管后轻量执行</small>
+        </div>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <button class="active" data-page="config"><span>⚙</span><span>平台配置</span></button>
+        <button data-page="runtime"><span>▶</span><span>运行控制</span></button>
+        <button data-page="records"><span>▣</span><span>执行记录</span></button>
+      </nav>
+      <div class="side-status">
+        <div>接管状态：<strong>2 无头 / 1 有头</strong></div>
+        <div>目标房间：<strong>旗舰厅 910</strong></div>
+        <div>发送门槛：<strong>倒计时 ≥ 10 秒</strong></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="title-block">
+          <h2 id="page-title">平台配置</h2>
+          <p id="page-subtitle">配置 4 个平台账号，并保留原 UI 的启动、登录、接管、进房按钮。</p>
+        </div>
+        <div class="top-actions">
+          <button class="btn primary" data-log="启动执行"><span>▶</span>启动执行</button>
+          <button class="btn warn" data-log="暂停执行"><span>Ⅱ</span>暂停</button>
+          <button class="btn danger" data-log="停止执行"><span>■</span>停止</button>
+          <button class="btn" data-log="清空日志"><span>⌫</span>清空日志</button>
+        </div>
+      </header>
+
+      <section class="page active" id="config-page">
+        <div class="toolbar-band">
+          <div class="summary-line">
+            <span class="pill ok">主号 a2 有头</span>
+            <span class="pill live">a1/a3/a4 副号</span>
+            <span class="pill wait">接管后走轻量核心</span>
+          </div>
+          <div class="button-row">
+            <button class="btn" data-log="批量启动浏览器"><span>⟳</span>批量启动</button>
+            <button class="btn" data-log="批量填写登录"><span>✎</span>批量填登录</button>
+            <button class="btn primary" data-log="批量大厅接管"><span>↪</span>批量接管大厅</button>
+          </div>
+        </div>
+
+        <div class="platform-grid">
+          <article class="platform-card">
+            <div class="card-head">
+              <div class="account-title">
+                <div class="account-dot">a1</div>
+                <div>
+                  <h3>平台 1</h3>
+                  <small>副号 · 无头候选</small>
+                </div>
+              </div>
+              <span class="role">副号</span>
+            </div>
+            <div class="fields">
+              <div class="field"><label>平台名称</label><input value="平台 1" /></div>
+              <div class="field"><label>登录地址</label><input value="https://example-login-1" /></div>
+              <div class="field"><label>目标房间</label><input value="旗舰厅 910" /></div>
+              <div class="compact-fields">
+                <div class="field"><label>代理地址</label><input value="127.0.0.1" /></div>
+                <div class="field"><label>代理端口</label><input value="8081" /></div>
+              </div>
+              <div class="compact-fields">
+                <div class="field"><label>账号</label><input value="account_a1" /></div>
+                <div class="field"><label>密码</label><input value="••••••" type="password" /></div>
+              </div>
+            </div>
+            <div class="card-actions">
+              <button class="btn" data-log="a1 启动/重启"><span>⟳</span>启动/重启</button>
+              <button class="btn" data-log="a1 填写登录"><span>✎</span>填登录</button>
+              <button class="btn primary" data-log="a1 接管大厅"><span>↪</span>接管大厅</button>
+              <button class="btn" data-log="a1 进入房间"><span>⌂</span>进房</button>
+              <button class="btn" data-log="a1 释放无头"><span>□</span>释放无头</button>
+              <button class="btn danger" data-log="a1 停止"><span>■</span>停止</button>
+            </div>
+          </article>
+
+          <article class="platform-card">
+            <div class="card-head">
+              <div class="account-title">
+                <div class="account-dot" style="background: var(--green);">a2</div>
+                <div>
+                  <h3>平台 2</h3>
+                  <small>主号 · 有头观测</small>
+                </div>
+              </div>
+              <span class="role main-role">主号</span>
+            </div>
+            <div class="fields">
+              <div class="field"><label>平台名称</label><input value="平台 2" /></div>
+              <div class="field"><label>登录地址</label><input value="https://example-login-2" /></div>
+              <div class="field"><label>目标房间</label><input value="旗舰厅 910" /></div>
+              <div class="compact-fields">
+                <div class="field"><label>代理地址</label><input value="127.0.0.1" /></div>
+                <div class="field"><label>代理端口</label><input value="8082" /></div>
+              </div>
+              <div class="compact-fields">
+                <div class="field"><label>账号</label><input value="account_a2" /></div>
+                <div class="field"><label>密码</label><input value="••••••" type="password" /></div>
+              </div>
+            </div>
+            <div class="card-actions">
+              <button class="btn" data-log="a2 启动/重启"><span>⟳</span>启动/重启</button>
+              <button class="btn" data-log="a2 填写登录"><span>✎</span>填登录</button>
+              <button class="btn primary" data-log="a2 接管大厅"><span>↪</span>接管大厅</button>
+              <button class="btn" data-log="a2 进入房间"><span>⌂</span>进房</button>
+              <button class="btn" data-log="a2 保持有头"><span>☉</span>保持有头</button>
+              <button class="btn danger" data-log="a2 停止"><span>■</span>停止</button>
+            </div>
+          </article>
+
+          <article class="platform-card">
+            <div class="card-head">
+              <div class="account-title">
+                <div class="account-dot">a3</div>
+                <div>
+                  <h3>平台 3</h3>
+                  <small>副号 · 无头执行</small>
+                </div>
+              </div>
+              <span class="role">副号</span>
+            </div>
+            <div class="fields">
+              <div class="field"><label>平台名称</label><input value="平台 3" /></div>
+              <div class="field"><label>登录地址</label><input value="https://example-login-3" /></div>
+              <div class="field"><label>目标房间</label><input value="旗舰厅 910" /></div>
+              <div class="compact-fields">
+                <div class="field"><label>代理地址</label><input value="127.0.0.1" /></div>
+                <div class="field"><label>代理端口</label><input value="8083" /></div>
+              </div>
+              <div class="compact-fields">
+                <div class="field"><label>账号</label><input value="account_a3" /></div>
+                <div class="field"><label>密码</label><input value="••••••" type="password" /></div>
+              </div>
+            </div>
+            <div class="card-actions">
+              <button class="btn" data-log="a3 启动/重启"><span>⟳</span>启动/重启</button>
+              <button class="btn" data-log="a3 填写登录"><span>✎</span>填登录</button>
+              <button class="btn primary" data-log="a3 接管大厅"><span>↪</span>接管大厅</button>
+              <button class="btn" data-log="a3 进入房间"><span>⌂</span>进房</button>
+              <button class="btn" data-log="a3 释放无头"><span>□</span>释放无头</button>
+              <button class="btn danger" data-log="a3 停止"><span>■</span>停止</button>
+            </div>
+          </article>
+
+          <article class="platform-card">
+            <div class="card-head">
+              <div class="account-title">
+                <div class="account-dot">a4</div>
+                <div>
+                  <h3>平台 4</h3>
+                  <small>副号 · 无头执行</small>
+                </div>
+              </div>
+              <span class="role">副号</span>
+            </div>
+            <div class="fields">
+              <div class="field"><label>平台名称</label><input value="平台 4" /></div>
+              <div class="field"><label>登录地址</label><input value="https://example-login-4" /></div>
+              <div class="field"><label>目标房间</label><input value="旗舰厅 910" /></div>
+              <div class="compact-fields">
+                <div class="field"><label>代理地址</label><input value="127.0.0.1" /></div>
+                <div class="field"><label>代理端口</label><input value="8084" /></div>
+              </div>
+              <div class="compact-fields">
+                <div class="field"><label>账号</label><input value="account_a4" /></div>
+                <div class="field"><label>密码</label><input value="••••••" type="password" /></div>
+              </div>
+            </div>
+            <div class="card-actions">
+              <button class="btn" data-log="a4 启动/重启"><span>⟳</span>启动/重启</button>
+              <button class="btn" data-log="a4 填写登录"><span>✎</span>填登录</button>
+              <button class="btn primary" data-log="a4 接管大厅"><span>↪</span>接管大厅</button>
+              <button class="btn" data-log="a4 进入房间"><span>⌂</span>进房</button>
+              <button class="btn" data-log="a4 释放无头"><span>□</span>释放无头</button>
+              <button class="btn danger" data-log="a4 停止"><span>■</span>停止</button>
+            </div>
+          </article>
+        </div>
+
+        <div class="footer-band">V2 草图：配置字段和按钮名称按旧 UI 的平台配置、浏览器启动、填写登录、大厅接管、进房流程整理。</div>
+      </section>
+
+      <section class="page" id="runtime-page">
+        <div class="toolbar-band">
+          <div class="summary-line">
+            <span class="pill ok">房间一致</span>
+            <span class="pill ok">可下注</span>
+            <span class="pill live">倒计时 12 秒</span>
+            <span class="pill wait">点击间隔 250 ms</span>
+          </div>
+          <div class="button-row">
+            <button class="btn primary" data-log="轻量核心启动"><span>▶</span>启动轻量核心</button>
+            <button class="btn" data-log="重新同步房间"><span>↻</span>同步房间</button>
+            <button class="btn" data-log="发送测试计划"><span>↗</span>发送测试计划</button>
+          </div>
+        </div>
+
+        <div class="section-band">
+          <div class="section-head">
+            <h3>执行参数</h3>
+            <div class="button-row">
+              <button class="btn" data-log="保存执行参数"><span>✓</span>保存参数</button>
+              <button class="btn" data-log="恢复默认参数"><span>↺</span>恢复默认</button>
+            </div>
+          </div>
+          <div class="control-grid">
+            <div class="field"><label>主号</label><select><option>a2</option><option>a1</option><option>a3</option><option>a4</option></select></div>
+            <div class="field"><label>副号</label><input value="a1,a3,a4" /></div>
+            <div class="field"><label>无头账号</label><input value="a1,a3,a4" /></div>
+            <div class="field"><label>金额范围</label><input value="80-150" /></div>
+            <div class="field"><label>点击间隔</label><select><option>250 ms</option><option>200 ms</option><option>300 ms</option><option>400 ms</option></select></div>
+            <div class="field"><label>发送门槛</label><select><option>倒计时 ≥ 10 秒</option><option>倒计时 ≥ 9 秒</option><option>倒计时 ≥ 11 秒</option></select></div>
+          </div>
+        </div>
+
+        <div class="run-layout">
+          <div class="section-band">
+            <div class="section-head">
+              <h3>4 账号实时状态</h3>
+              <span class="pill ok">统一发号者已就绪</span>
+            </div>
+            <div class="status-grid">
+              <article class="status-card">
+                <div class="status-top"><div class="status-name"><span class="account-dot">a1</span>平台 1</div><span class="mode-badge">无头</span></div>
+                <div class="metric-grid">
+                  <div class="metric"><span>房间</span><strong>旗舰厅 910</strong></div>
+                  <div class="metric"><span>局号</span><strong>240624-118</strong></div>
+                  <div class="metric"><span>倒计时</span><strong>12 秒</strong></div>
+                  <div class="metric"><span>状态</span><strong>可下注</strong></div>
+                </div>
+              </article>
+              <article class="status-card">
+                <div class="status-top"><div class="status-name"><span class="account-dot" style="background: var(--green);">a2</span>平台 2</div><span class="mode-badge">有头</span></div>
+                <div class="metric-grid">
+                  <div class="metric"><span>房间</span><strong>旗舰厅 910</strong></div>
+                  <div class="metric"><span>局号</span><strong>240624-118</strong></div>
+                  <div class="metric"><span>倒计时</span><strong>12 秒</strong></div>
+                  <div class="metric"><span>状态</span><strong>可下注</strong></div>
+                </div>
+              </article>
+              <article class="status-card">
+                <div class="status-top"><div class="status-name"><span class="account-dot">a3</span>平台 3</div><span class="mode-badge">无头</span></div>
+                <div class="metric-grid">
+                  <div class="metric"><span>房间</span><strong>旗舰厅 910</strong></div>
+                  <div class="metric"><span>局号</span><strong>240624-118</strong></div>
+                  <div class="metric"><span>倒计时</span><strong>11 秒</strong></div>
+                  <div class="metric"><span>状态</span><strong>可下注</strong></div>
+                </div>
+              </article>
+              <article class="status-card">
+                <div class="status-top"><div class="status-name"><span class="account-dot">a4</span>平台 4</div><span class="mode-badge">无头</span></div>
+                <div class="metric-grid">
+                  <div class="metric"><span>房间</span><strong>旗舰厅 910</strong></div>
+                  <div class="metric"><span>局号</span><strong>240624-118</strong></div>
+                  <div class="metric"><span>倒计时</span><strong>12 秒</strong></div>
+                  <div class="metric"><span>状态</span><strong>可下注</strong></div>
+                </div>
+              </article>
+            </div>
+          </div>
+
+          <div class="section-band">
+            <div class="section-head">
+              <h3>本轮执行计划</h3>
+              <span class="pill live">预计 4.8 秒</span>
+            </div>
+            <table>
+              <thead>
+                <tr><th>账号</th><th>方向</th><th>金额</th><th>步数</th><th>结果</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>a2</td><td>庄</td><td>144</td><td>4</td><td>等待发送</td></tr>
+                <tr><td>a1</td><td>闲</td><td>48</td><td>3</td><td>等待发送</td></tr>
+                <tr><td>a3</td><td>闲</td><td>48</td><td>3</td><td>等待发送</td></tr>
+                <tr><td>a4</td><td>闲</td><td>48</td><td>3</td><td>等待发送</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="records-page">
+        <div class="section-band">
+          <div class="section-head">
+            <h3>执行记录</h3>
+            <div class="button-row">
+              <button class="btn" data-log="导出记录"><span>⇩</span>导出</button>
+              <button class="btn" data-log="清空记录"><span>⌫</span>清空</button>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr><th>轮次</th><th>发送倒计时</th><th>点击间隔</th><th>最长耗时</th><th>缺口</th><th>状态</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>118</td><td>12 秒</td><td>250 ms</td><td>4.9 秒</td><td>0</td><td>完整</td></tr>
+              <tr><td>117</td><td>11 秒</td><td>250 ms</td><td>5.2 秒</td><td>0</td><td>完整</td></tr>
+              <tr><td>116</td><td>12 秒</td><td>300 ms</td><td>5.7 秒</td><td>0</td><td>完整</td></tr>
+              <tr><td>115</td><td>10 秒</td><td>300 ms</td><td>5.9 秒</td><td>0</td><td>完整</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-band">
+          <div class="section-head">
+            <h3>轻量日志</h3>
+            <span class="pill ok">最近 5 条</span>
+          </div>
+          <div class="log-list" id="log-list">
+            <div class="log-item"><strong>20:41:18 统一发号</strong><span>4 个账号房间一致，倒计时满足，发送执行计划。</span></div>
+            <div class="log-item"><strong>20:41:19 a2</strong><span>主号有头执行，计划 144，实际 144。</span></div>
+            <div class="log-item"><strong>20:41:20 a1/a3/a4</strong><span>副号无头并行执行，缺口 0。</span></div>
+            <div class="log-item"><strong>20:41:23 本轮结束</strong><span>最长耗时 4.9 秒，状态完整。</span></div>
+            <div class="log-item"><strong>20:41:24 等待下一局</strong><span>状态刷新进入低频等待。</span></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const pages = {
+      config: {
+        title: "平台配置",
+        subtitle: "配置 4 个平台账号，并保留原 UI 的启动、登录、接管、进房按钮。"
+      },
+      runtime: {
+        title: "运行控制",
+        subtitle: "接管完成后，由轻量核心统一确认房间、局号、倒计时，再并行发出下注计划。"
+      },
+      records: {
+        title: "执行记录",
+        subtitle: "查看每轮发送时机、点击间隔、完成耗时、缺口结果。"
+      }
+    };
+
+    document.querySelectorAll(".nav button").forEach((button) => {
+      button.addEventListener("click", () => {
+        const name = button.dataset.page;
+        document.querySelectorAll(".nav button").forEach((item) => item.classList.toggle("active", item === button));
+        document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
+        document.getElementById(`${name}-page`).classList.add("active");
+        document.getElementById("page-title").textContent = pages[name].title;
+        document.getElementById("page-subtitle").textContent = pages[name].subtitle;
+      });
+    });
+
+    document.querySelectorAll("[data-log]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const list = document.getElementById("log-list");
+        if (!list) return;
+        const item = document.createElement("div");
+        item.className = "log-item";
+        const now = new Date();
+        const time = now.toTimeString().slice(0, 8);
+        item.innerHTML = `<strong>${time} ${button.dataset.log}</strong><span>界面草图动作已记录，后续接入真实后端。</span>`;
+        list.prepend(item);
+      });
+    });
+  </script>
+</body>
+</html>
