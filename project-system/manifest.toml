@@ -1,0 +1,7 @@
+version = 1
+project = "bocai_web"
+context = "docs/project-context.md"
+
+[paths]
+specs = "specs"
+

@@ -1,0 +1,898 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>轻量对冲控制台 V4 排版稿</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f7fb;
+      --surface: #ffffff;
+      --soft: #edf4fa;
+      --soft-2: #f6f9fc;
+      --line: #d5e2ee;
+      --text: #102033;
+      --muted: #5f6f82;
+      --blue: #2563eb;
+      --green: #13865d;
+      --amber: #b7791f;
+      --red: #d62828;
+      --cyan: #0f7b8f;
+      --shadow: 0 10px 24px rgba(20, 37, 56, 0.08);
+      --radius: 8px;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 1220px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.42;
+      letter-spacing: 0;
+    }
+
+    button, input, select { font: inherit; letter-spacing: 0; }
+
+    button {
+      border: 0;
+      cursor: pointer;
+      transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
+    }
+
+    button:active { transform: translateY(1px); filter: brightness(0.96); }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+      padding: 12px 16px;
+      background: rgba(255, 255, 255, 0.96);
+      border-bottom: 1px solid var(--line);
+      box-shadow: 0 3px 14px rgba(16, 32, 51, 0.05);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: var(--blue);
+      color: #fff;
+      font-weight: 800;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+
+    .brand small {
+      display: block;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      padding: 0 11px;
+      border-radius: 999px;
+      background: #e7f0ff;
+      color: var(--blue);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      padding: 10px 16px 0;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .tab {
+      height: 38px;
+      padding: 0 22px;
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      border-radius: 8px 8px 0 0;
+      background: #e8f0f8;
+      color: #08213f;
+      font-weight: 700;
+    }
+
+    .tab.active {
+      background: var(--blue);
+      color: #fff;
+      border-color: var(--blue);
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 270px minmax(570px, 1fr) 300px;
+      gap: 12px;
+      padding: 12px 16px 16px;
+      align-items: start;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: 0 4px 14px rgba(16, 32, 51, 0.04);
+      overflow: hidden;
+    }
+
+    .panel + .panel { margin-top: 12px; }
+
+    .panel-head {
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 800;
+      background: linear-gradient(90deg, #edf4fa, transparent);
+      padding: 2px 8px 2px 0;
+    }
+
+    .panel-body { padding: 12px; }
+
+    .stack { display: grid; gap: 10px; }
+
+    .main-button {
+      width: 100%;
+      height: 38px;
+      border-radius: 7px;
+      color: #fff;
+      font-weight: 800;
+      box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.12);
+    }
+
+    .main-button.green { background: var(--green); }
+    .main-button.amber { background: #f59e0b; color: #1f2937; }
+    .main-button.red { background: #e52525; }
+
+    .account-switch {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .switch {
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #edf4fa;
+      color: #08213f;
+      font-weight: 700;
+    }
+
+    .switch.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+
+    .note {
+      padding: 7px 9px;
+      background: var(--soft);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .room-actions {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .ghost {
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #eff5fb;
+      color: #0f2745;
+      font-weight: 700;
+    }
+
+    .advanced-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: 1fr 88px;
+      gap: 8px;
+      align-items: center;
+      font-size: 13px;
+    }
+
+    .mini-input {
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 8px;
+      background: #fff;
+      text-align: right;
+      color: var(--text);
+    }
+
+    .center-column {
+      display: grid;
+      gap: 12px;
+    }
+
+    .account-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .account-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft-2);
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+      min-height: 184px;
+    }
+
+    .account-top {
+      display: grid;
+      grid-template-columns: 40px 1fr auto;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .account-id {
+      width: 36px;
+      height: 34px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: #e6f0fa;
+      color: #06417a;
+      font-weight: 800;
+    }
+
+    .account-name {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+    }
+
+    .account-name strong {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      background: #edf4fa;
+      padding-left: 4px;
+    }
+
+    .account-name span {
+      color: var(--muted);
+      background: #edf4fa;
+      padding-left: 4px;
+      font-size: 12px;
+    }
+
+    .status-chip {
+      min-width: 64px;
+      height: 40px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      background: #e6f0fa;
+      color: #0f2745;
+      font-weight: 800;
+    }
+
+    .status-chip.ok { color: var(--green); background: #def7ec; }
+    .status-chip.bad { color: var(--blue); background: #e7f0ff; }
+    .status-chip.warn { color: var(--amber); background: #fff5df; }
+
+    .bet-state {
+      height: 42px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      background: #eaf1f7;
+      font-size: 30px;
+      font-weight: 900;
+      color: var(--blue);
+      white-space: nowrap;
+    }
+
+    .bet-state.open { color: var(--green); }
+
+    .meta {
+      display: grid;
+      gap: 4px;
+    }
+
+    .meta-row {
+      min-height: 22px;
+      display: flex;
+      align-items: center;
+      background: #edf4fa;
+      padding: 0 6px;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .card-actions {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .pnl-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+
+    .pnl-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft-2);
+      padding: 10px;
+      display: grid;
+      gap: 6px;
+      min-height: 92px;
+    }
+
+    .pnl-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 900;
+      min-width: 0;
+    }
+
+    .pnl-title span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .profit { color: var(--blue); }
+    .loss { color: var(--red); }
+
+    .pnl-amount {
+      font-size: 24px;
+      font-weight: 900;
+    }
+
+    .pnl-detail {
+      color: var(--muted);
+      font-size: 12px;
+      display: grid;
+      gap: 2px;
+    }
+
+    .right-column {
+      display: grid;
+      gap: 12px;
+    }
+
+    .plan-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .plan-row {
+      display: grid;
+      grid-template-columns: 74px 1fr 58px;
+      gap: 8px;
+      align-items: stretch;
+      min-height: 74px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft-2);
+      padding: 8px;
+    }
+
+    .plan-amount {
+      display: grid;
+      place-items: center;
+      border-radius: 7px;
+      background: #edf4fa;
+      font-size: 22px;
+      font-weight: 900;
+    }
+
+    .plan-info {
+      min-width: 0;
+      display: grid;
+      align-content: center;
+      gap: 4px;
+    }
+
+    .plan-info strong {
+      background: #edf4fa;
+      padding: 0 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .plan-info span {
+      color: #40536a;
+      background: #edf4fa;
+      padding: 0 4px;
+      font-size: 12px;
+    }
+
+    .role {
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      background: #e6edf5;
+      font-weight: 900;
+      color: #0f2745;
+    }
+
+    .role.main {
+      background: #fff1d4;
+      color: #8a5a00;
+    }
+
+    .plan-op {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      margin-top: -2px;
+    }
+
+    .tiny-button {
+      height: 26px;
+      padding: 0 10px;
+      border-radius: 7px;
+      background: #e7f0ff;
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .tiny-button.danger { background: #ffe6e6; color: var(--red); }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft-2);
+      padding: 9px;
+      min-height: 68px;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 22px;
+      line-height: 1.15;
+      margin-bottom: 5px;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      background: #edf4fa;
+      padding: 2px 4px;
+      font-size: 12px;
+    }
+
+    .log-box {
+      height: 128px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+      padding: 8px;
+      font-family: Consolas, "Microsoft YaHei", monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #203247;
+    }
+
+    .details-grid {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 12px;
+    }
+
+    .turnover-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .turnover {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft-2);
+      padding: 8px;
+    }
+
+    .turnover strong {
+      display: block;
+      font-size: 20px;
+      margin-top: 4px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      font-size: 12px;
+    }
+
+    th, td {
+      height: 30px;
+      padding: 0 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    th {
+      background: #eaf1f7;
+      color: #27384d;
+      font-weight: 800;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .advanced-details {
+      margin: 0 16px 16px;
+    }
+
+    @media (max-width: 1280px) {
+      body { min-width: 1180px; }
+      .workspace { grid-template-columns: 250px minmax(540px, 1fr) 286px; }
+      .pnl-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">轻</div>
+        <div>
+          <h1>轻量对冲控制台</h1>
+          <small>当前主号 a2 · 运行 01:42:36 · 3 号模式</small>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span class="pill">正常</span>
+        <span class="pill">第 128 轮</span>
+        <span class="pill">缺口 0</span>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab">平台配置</button>
+      <button class="tab active">运行控制</button>
+      <button class="tab">执行记录</button>
+    </nav>
+
+    <main class="workspace">
+      <aside>
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">运行控制</h2>
+            <span class="pill">运行中</span>
+          </div>
+          <div class="panel-body stack">
+            <div>
+              <strong>当前主号</strong>
+              <div class="account-switch" style="margin-top:8px">
+                <button class="switch">a1</button>
+                <button class="switch active">a2</button>
+                <button class="switch">a3</button>
+                <button class="switch">a4</button>
+              </div>
+            </div>
+            <div class="note">切换后，下局计划按新主号重排。</div>
+            <button class="main-button green">启动轻量控制</button>
+            <button class="main-button amber">暂停</button>
+            <button class="main-button red">急停</button>
+            <div class="room-actions">
+              <button class="ghost">接管</button>
+              <button class="ghost">进 1 房</button>
+              <button class="ghost">释放</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">高级设置</h2>
+            <button class="tiny-button">展开</button>
+          </div>
+          <div class="panel-body stack">
+            <div class="field-grid">
+              <span>主单下限</span>
+              <input class="mini-input" value="80">
+              <span>主单上限</span>
+              <input class="mini-input" value="150">
+              <span>点击间隔</span>
+              <input class="mini-input" value="200ms">
+              <span>余额阈值</span>
+              <input class="mini-input" value="80">
+            </div>
+            <div class="note">流水、执行轮次和调试日志移到下方高级明细。</div>
+          </div>
+        </section>
+      </aside>
+
+      <section class="center-column">
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">账号状态</h2>
+            <span class="pill">实时状态</span>
+          </div>
+          <div class="panel-body">
+            <div class="account-grid">
+              <article class="account-card">
+                <div class="account-top">
+                  <div class="account-id">a1</div>
+                  <div class="account-name"><strong>永利谢云</strong><span>副号 · 下局恢复</span></div>
+                  <div class="status-chip warn">待恢复</div>
+                </div>
+                <div class="bet-state">不可下注</div>
+                <div class="meta">
+                  <div class="meta-row">房间：T001</div>
+                  <div class="meta-row">局号：50-1782446627-8544328515</div>
+                  <div class="meta-row">余额：72.32</div>
+                  <div class="meta-row">进度：局号停更，等待下局恢复</div>
+                </div>
+                <div class="card-actions"><button class="ghost">重启</button><button class="ghost">接管</button><button class="ghost">进房</button></div>
+              </article>
+
+              <article class="account-card">
+                <div class="account-top">
+                  <div class="account-id">a2</div>
+                  <div class="account-name"><strong>威尼斯谢钧</strong><span>当前主号 · 有头观察</span></div>
+                  <div class="status-chip ok">可下注</div>
+                </div>
+                <div class="bet-state open">可下注 8秒</div>
+                <div class="meta">
+                  <div class="meta-row">房间：T001</div>
+                  <div class="meta-row">局号：50-1782446712-8544330051</div>
+                  <div class="meta-row">余额：3484.09</div>
+                  <div class="meta-row">进度：状态正常</div>
+                </div>
+                <div class="card-actions"><button class="ghost">重启</button><button class="ghost">接管</button><button class="ghost">进房</button></div>
+              </article>
+
+              <article class="account-card">
+                <div class="account-top">
+                  <div class="account-id">a3</div>
+                  <div class="account-name"><strong>勐东云永利</strong><span>副号 · 无头执行</span></div>
+                  <div class="status-chip ok">可下注</div>
+                </div>
+                <div class="bet-state open">可下注 7秒</div>
+                <div class="meta">
+                  <div class="meta-row">房间：T001</div>
+                  <div class="meta-row">局号：50-1782446712-8544330051</div>
+                  <div class="meta-row">余额：407.72</div>
+                  <div class="meta-row">进度：状态正常</div>
+                </div>
+                <div class="card-actions"><button class="ghost">重启</button><button class="ghost">接管</button><button class="ghost">进房</button></div>
+              </article>
+
+              <article class="account-card">
+                <div class="account-top">
+                  <div class="account-id">a4</div>
+                  <div class="account-name"><strong>新葡京谢隆建</strong><span>副号 · 无头执行</span></div>
+                  <div class="status-chip ok">可下注</div>
+                </div>
+                <div class="bet-state open">可下注 8秒</div>
+                <div class="meta">
+                  <div class="meta-row">房间：T001</div>
+                  <div class="meta-row">局号：50-1782446712-8544330051</div>
+                  <div class="meta-row">余额：654.27</div>
+                  <div class="meta-row">进度：状态正常</div>
+                </div>
+                <div class="card-actions"><button class="ghost">重启</button><button class="ghost">接管</button><button class="ghost">进房</button></div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">单账号盈亏</h2>
+            <button class="tiny-button">充值/提现记录</button>
+          </div>
+          <div class="panel-body">
+            <div class="pnl-grid">
+              <article class="pnl-card">
+                <div class="pnl-title"><span>a1 · 永利谢云</span><b class="loss">-194.50</b></div>
+                <div class="pnl-amount loss">亏损</div>
+                <div class="pnl-detail"><span>初始 266.82</span><span>当前 72.32</span></div>
+              </article>
+              <article class="pnl-card">
+                <div class="pnl-title"><span>a2 · 威尼斯</span><b class="profit">+150.70</b></div>
+                <div class="pnl-amount profit">盈利</div>
+                <div class="pnl-detail"><span>初始 3333.39</span><span>当前 3484.09</span></div>
+              </article>
+              <article class="pnl-card">
+                <div class="pnl-title"><span>a3 · 勐东云</span><b class="loss">-27.00</b></div>
+                <div class="pnl-amount loss">亏损</div>
+                <div class="pnl-detail"><span>初始 434.72</span><span>当前 407.72</span></div>
+              </article>
+              <article class="pnl-card">
+                <div class="pnl-title"><span>a4 · 新葡京</span><b class="loss">-26.00</b></div>
+                <div class="pnl-amount loss">亏损</div>
+                <div class="pnl-detail"><span>初始 680.27</span><span>当前 654.27</span></div>
+              </article>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <aside class="right-column">
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">本轮计划</h2>
+            <span class="pill">第 129 轮</span>
+          </div>
+          <div class="panel-body">
+            <div class="plan-list">
+              <div class="plan-row">
+                <div class="plan-amount">140</div>
+                <div class="plan-info"><strong>a2 · 主号方向 · 闲</strong><span>筹码 100+20+20 · 点击 200ms</span></div>
+                <div class="role main">主</div>
+                <div class="plan-op"><button class="tiny-button danger">下局剔除</button></div>
+              </div>
+              <div class="plan-row">
+                <div class="plan-amount">50</div>
+                <div class="plan-info"><strong>a3 · 副号对冲 · 庄</strong><span>筹码 20+20+10 · 点击 200ms</span></div>
+                <div class="role">副</div>
+                <div class="plan-op"><button class="tiny-button danger">下局剔除</button></div>
+              </div>
+              <div class="plan-row">
+                <div class="plan-amount">40</div>
+                <div class="plan-info"><strong>a4 · 副号对冲 · 庄</strong><span>筹码 20+10+10 · 点击 200ms</span></div>
+                <div class="role">副</div>
+                <div class="plan-op"><button class="tiny-button danger">下局剔除</button></div>
+              </div>
+              <div class="plan-row">
+                <div class="plan-amount">-</div>
+                <div class="plan-info"><strong>a1 · 已剔除</strong><span>局号停更 · 下局前检查</span></div>
+                <div class="role">-</div>
+                <div class="plan-op"><button class="tiny-button">下局恢复</button></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">运行摘要</h2>
+            <span class="pill">01:42:36</span>
+          </div>
+          <div class="panel-body">
+            <div class="summary-grid">
+              <div class="metric"><strong>128</strong><span>执行轮次</span></div>
+              <div class="metric"><strong>0</strong><span>总缺口</span></div>
+              <div class="metric"><strong>4586ms</strong><span>最慢整轮</span></div>
+              <div class="metric"><strong>4391ms</strong><span>最慢点击</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">轻量日志</h2>
+            <button class="tiny-button">摘要</button>
+          </div>
+          <div class="panel-body">
+            <div class="log-box">
+              09:18:12 plan ready round=129 legs=3<br>
+              09:18:13 a1 excluded reason=round_stale<br>
+              09:18:13 hedge gate ok accounts=a2,a3,a4<br>
+              09:18:14 waiting betting window cd=8<br>
+              09:18:15 click interval=200ms
+            </div>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <section class="panel advanced-details">
+      <div class="panel-head">
+        <h2 class="panel-title">高级明细</h2>
+        <span class="pill">默认折叠区</span>
+      </div>
+      <div class="panel-body">
+        <div class="details-grid">
+          <div>
+            <h3 class="panel-title" style="font-size:15px;margin:0 0 8px">下注流水累计</h3>
+            <div class="turnover-grid">
+              <div class="turnover">a1<strong>820</strong></div>
+              <div class="turnover">a2<strong>10560</strong></div>
+              <div class="turnover">a3<strong>4280</strong></div>
+              <div class="turnover">a4<strong>4120</strong></div>
+            </div>
+          </div>
+          <div>
+            <h3 class="panel-title" style="font-size:15px;margin:0 0 8px">执行轮次</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>轮次</th>
+                  <th>账号</th>
+                  <th>计划</th>
+                  <th>实际</th>
+                  <th>耗时</th>
+                  <th>结果</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>#128</td><td>a2/a3/a4</td><td>140 / 50 / 40</td><td>完整</td><td>3580ms</td><td>缺口 0</td></tr>
+                <tr><td>#127</td><td>a1/a2/a3/a4</td><td>120 / 40 / 40 / 40</td><td>a1 跳过</td><td>4210ms</td><td>缺口 0</td></tr>
+                <tr><td>#126</td><td>a2/a3/a4</td><td>150 / 60 / 50</td><td>完整</td><td>3892ms</td><td>缺口 0</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

@@ -221,8 +221,10 @@ class PlatformSlot:
 class ExecutionConfig:
     accounts: tuple[str, ...] = SUPPORTED_ACCOUNT_IDS
     main_account: str = DEFAULT_MAIN_ACCOUNT
+    main_successor_account: str = ""
     amount_min: int = 80
     amount_max: int = 150
+    min_balance_yuan: int = 0
     click_interval_ms: int = 200
     min_countdown: int = 10
     confirm_ms: int = 1200
@@ -233,8 +235,10 @@ class ExecutionConfig:
         payload: dict[str, Any] = {
             "accounts": list(self.accounts),
             "main_account": self.main_account,
+            "main_successor_account": self.main_successor_account,
             "amount_min": self.amount_min,
             "amount_max": self.amount_max,
+            "min_balance_yuan": self.min_balance_yuan,
             "click_interval_ms": self.click_interval_ms,
             "min_countdown": self.min_countdown,
             "confirm_ms": self.confirm_ms,
@@ -257,11 +261,16 @@ class ExecutionConfig:
         main_account = resolve_main_account(str(payload.get("main_account", DEFAULT_MAIN_ACCOUNT)))
         if main_account not in normalized:
             main_account = normalized[0] if normalized else DEFAULT_MAIN_ACCOUNT
+        successor = str(payload.get("main_successor_account") or "").strip()
+        if successor not in ALLOWED_ACCOUNT_IDS:
+            successor = ""
         return cls(
             accounts=tuple(normalized),
             main_account=main_account,
+            main_successor_account=successor,
             amount_min=int(payload.get("amount_min", 80)),
             amount_max=int(payload.get("amount_max", 150)),
+            min_balance_yuan=int(payload.get("min_balance_yuan", 0)),
             click_interval_ms=int(payload.get("click_interval_ms", 200)),
             min_countdown=int(payload.get("min_countdown", 10)),
             confirm_ms=int(payload.get("confirm_ms", 1200)),
@@ -269,8 +278,10 @@ class ExecutionConfig:
             extra={key: value for key, value in payload.items() if key not in {
                 "accounts",
                 "main_account",
+                "main_successor_account",
                 "amount_min",
                 "amount_max",
+                "min_balance_yuan",
                 "click_interval_ms",
                 "min_countdown",
                 "confirm_ms",
@@ -296,15 +307,20 @@ class AccountStatusSummary:
     state_machine_label: str = ""
     stale: bool = False
     age_ms: int = 0
+    target_room_label: str = ""
+    room_entry_detail: str = ""
 
 
 @dataclass(frozen=True)
 class RoundResult:
     round_id: str
+    round_number: int = 0
     room_label: str = ""
     send_countdowns: dict[str, int] = field(default_factory=dict)
     click_interval_ms: int = 200
     legs: list[Any] = field(default_factory=list)
+    results: list[Any] = field(default_factory=list)
+    elapsed_ms: int = 0
     max_elapsed_ms: int = 0
     missing_total: Decimal = Decimal("0")
     status: str = "skipped"

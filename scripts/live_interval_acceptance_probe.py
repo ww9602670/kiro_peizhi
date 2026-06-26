@@ -11,6 +11,7 @@ import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ from bet_desktop.browser.game_launch_url import read_baccarat_load_state  # noqa
 from bet_desktop.browser.login_flow import fill_login_form_when_visible  # noqa: E402
 from bet_desktop.browser.live_runtime_state import read_live_runtime_snapshot  # noqa: E402
 from bet_desktop.core.decomposition import decompose_value  # noqa: E402
+from scripts import live_fast_click_probe as fast_click_probe  # noqa: E402
 
 
 DEFAULT_ACCOUNT_IDS = ("a2", "a3", "a4")
@@ -99,6 +101,23 @@ def normalize_url(value: str) -> str:
     if re.match(r"^[a-z][a-z0-9+.-]*:", text, flags=re.IGNORECASE):
         return text
     return f"https://{text}"
+
+
+def public_game_no(value: Any) -> str:
+    """Round id used for UI display and same-round matching.
+
+    The H5 page appends an account-specific suffix after the third dash. Four
+    accounts in the same table round can have different suffixes, so it must not
+    participate in same-round matching.
+    """
+
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null", "-"}:
+        return ""
+    parts = text.split("-")
+    if len(parts) >= 4 and parts[-1].strip().isdigit():
+        return "-".join(part.strip() for part in parts[:3] if part.strip())
+    return text
 
 
 def load_platform_slots(path: Path) -> dict[str, dict[str, Any]]:
@@ -179,7 +198,12 @@ async def launch_account(playwright: Any, config: cw.ClusterWorkerConfig, event_
         "ws_parser": ws_parser,
         "launch_bundle": None,
     }
-    cw._attach_network_collectors(config, context, page, state, event_queue, ws_parser, runtime=runtime)
+    try:
+        cw._attach_network_collectors(config, context, page, state, event_queue, ws_parser, runtime=runtime)
+    except TypeError as exc:
+        if "runtime" not in str(exc):
+            raise
+        cw._attach_network_collectors(config, context, page, state, event_queue, ws_parser)
     login_fill_submitted = False
     if config.login_url:
         try:
@@ -493,38 +517,191 @@ def status_from_snapshot(item: dict[str, Any], load: Any, snapshot: Any) -> dict
     except Exception:
         trusted = None
         summary = {}
+
+    def _first_text(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text and text.lower() not in {"none", "null"}:
+                return text
+        return ""
+
+    def _first_int(*values: Any) -> int | None:
+        for value in values:
+            if value is None or value == "":
+                continue
+            try:
+                number = int(float(str(value).strip()))
+            except (TypeError, ValueError):
+                continue
+            if number >= 0:
+                return number
+        return None
+
+    def _bool_or_none(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if not text:
+            return None
+        if text in {"1", "true", "yes", "open", "can_bet", "canbet"}:
+            return True
+        if text in {"0", "false", "no", "closed", "close", "hall"}:
+            return False
+        return None
+
+    def _action_is_betting(raw_action: str) -> bool | None:
+        text = str(raw_action or "").strip().lower()
+        if not text:
+            return None
+        if text.isdigit():
+            try:
+                code = int(text)
+            except ValueError:
+                return None
+            if code == 3:
+                return True
+            if code == 5:
+                return False
+            return None
+        if text in {"betting", "open", "can_bet", "canbet", "true", "yes"}:
+            return True
+        if text in {"closed", "close", "false", "no", "hall"}:
+            return False
+        return None
+
     try:
         guard = cw._live_fire_plan_guard_snapshot(item.get("runtime") or {}, item["state"])
     except Exception:
         guard = {}
-    snapshot_game_no = str(getattr(snapshot, "game_no", "") or "") if snapshot is not None else ""
-    guard_game_no = str(guard.get("observed_batch_id") or "")
+    raw_snapshot_game_no = str(getattr(snapshot, "game_no", "") or "") if snapshot is not None else ""
+    raw_guard_game_no = str(guard.get("observed_batch_id") or "")
+    raw_frontend_game_no = _first_text(summary.get("frontend_batch_id"), summary.get("frontend_short_batch_id"))
+    raw_canvas_game_no = _first_text(summary.get("canvas_game_no"))
+    raw_display_game_no = _first_text(raw_canvas_game_no, raw_snapshot_game_no, raw_guard_game_no, raw_frontend_game_no)
+    snapshot_game_no = public_game_no(raw_snapshot_game_no)
+    guard_game_no = public_game_no(raw_guard_game_no)
+    frontend_game_no = public_game_no(raw_frontend_game_no)
+    canvas_game_no = public_game_no(raw_canvas_game_no)
+    display_game_no = public_game_no(raw_display_game_no)
     snapshot_countdown = getattr(snapshot, "countdown_seconds", None) if snapshot is not None else None
     guard_countdown = guard.get("countdown")
-    countdown = snapshot_countdown
-    try:
-        guard_countdown_int = int(guard_countdown)
-    except (TypeError, ValueError):
-        guard_countdown_int = -1
-    if countdown is None and guard_countdown_int >= 0:
-        countdown = guard_countdown_int
+    trusted_countdown = getattr(trusted, "exact_countdown", None) if trusted is not None else None
+    countdown = _first_int(
+        snapshot_countdown,
+        guard_countdown,
+        trusted_countdown,
+        summary.get("runtime_countdown"),
+        summary.get("runtime_timed"),
+        summary.get("frontend_runtime_timed"),
+        summary.get("canvas_countdown"),
+        summary.get("label_countdown"),
+    )
     betting_open = bool(getattr(snapshot, "betting_open", False)) if snapshot is not None else False
     if not betting_open:
         betting_open = bool(guard.get("betting_open"))
+    runtime_action = _first_text(summary.get("runtime_action"), str(getattr(frame, "action", "") or ""))
+    frontend_runtime_action = _first_text(summary.get("frontend_runtime_action"), summary.get("frontend_runtime_action_text"))
+    betting_from_action = _action_is_betting(runtime_action)
+    if betting_from_action is None:
+        betting_from_action = _action_is_betting(frontend_runtime_action)
+    if betting_from_action is not None:
+        betting_open = bool(betting_from_action)
+    elif (betting_from_runtime := _bool_or_none(summary.get("runtime_betting_open"))) is not None:
+        betting_open = bool(betting_from_runtime)
+    elif (betting_from_runtime := _bool_or_none(summary.get("runtime_is_can_betting"))) is not None:
+        betting_open = bool(betting_from_runtime)
+    elif (betting_from_runtime := _bool_or_none(summary.get("frontend_runtime_is_can_betting"))) is not None:
+        betting_open = bool(betting_from_runtime)
+    game_ready = bool(getattr(load, "game_ready", False))
+    hall_ready = bool(getattr(load, "hall_ready", False))
     room_id = str(getattr(frame, "room_id", "") or summary.get("room_id") or "") if frame is not None else str(summary.get("room_id") or "")
     room_label = str(getattr(frame, "table_label", "") or summary.get("room_label") or "") if frame is not None else str(summary.get("room_label") or "")
+    display_room_label = _first_text(
+        room_label,
+        summary.get("locked_room_label"),
+        summary.get("runtime_room_label"),
+        summary.get("frontend_room_label"),
+        summary.get("canvas_room_label"),
+    )
+    runtime_coordinates = summary.get("runtime_coordinates") if isinstance(summary.get("runtime_coordinates"), dict) else None
+    coordinates_ready = bool(
+        runtime_coordinates
+        and (
+            runtime_coordinates.get("bet_regions")
+            or runtime_coordinates.get("chips")
+        )
+    )
+    room_evidence = bool(
+        display_room_label
+        or room_id
+        or summary.get("locked_room_id")
+        or summary.get("runtime_room_id")
+        or summary.get("frontend_room_id")
+    )
+    in_game_evidence = bool(room_evidence and (display_game_no or coordinates_ready))
+    effective_game_ready = bool(game_ready or in_game_evidence)
+    effective_hall_ready = bool(hall_ready and not effective_game_ready)
+    display_phase = _first_text(
+        summary.get("display_phase"),
+        summary.get("canvas_phase_text"),
+        summary.get("runtime_phase_label"),
+        str(guard.get("phase") or ""),
+        summary.get("frontend_phase_text"),
+        summary.get("runtime_phase"),
+    )
+    if not display_phase:
+        if betting_open:
+            display_phase = "betting_open"
+        elif effective_game_ready:
+            display_phase = "game_ready"
+        elif effective_hall_ready:
+            display_phase = "hall"
+        else:
+            display_phase = ""
+    source_bits: list[str] = []
+    if raw_display_game_no == raw_canvas_game_no and raw_canvas_game_no:
+        source_bits.append("canvas_game_no")
+    elif raw_display_game_no == raw_snapshot_game_no and raw_snapshot_game_no:
+        source_bits.append("snapshot_game_no")
+    elif raw_display_game_no == raw_guard_game_no and raw_guard_game_no:
+        source_bits.append("guard")
+    elif raw_display_game_no == raw_frontend_game_no and raw_frontend_game_no:
+        source_bits.append("frontend_batch")
+    if _action_is_betting(runtime_action) is True:
+        source_bits.append("runtime_action")
+    if _action_is_betting(frontend_runtime_action) is True:
+        source_bits.append("frontend_runtime_action")
+    display_source = "+".join(dict.fromkeys(source_bits)) if source_bits else "legacy"
+    display_balance_cents = getattr(frame, "balance_cents", None) if frame is not None else None
+    if display_balance_cents is None:
+        display_balance_cents = summary.get("balance_cents")
     return {
         "account_id": item["id"],
         "mode": str((item.get("runtime") or {}).get("mode") or ""),
-        "game_ready": bool(getattr(load, "game_ready", False)),
-        "hall_ready": bool(getattr(load, "hall_ready", False)),
+        "game_ready": effective_game_ready,
+        "hall_ready": effective_hall_ready,
         "scene": str(getattr(load, "scene_name", "") or ""),
-        "game_no": guard_game_no or snapshot_game_no,
+        "game_no": display_game_no or guard_game_no or snapshot_game_no,
+        "display_game_no": display_game_no,
+        "display_room_label": display_room_label,
+        "display_balance_cents": display_balance_cents,
+        "display_betting_open": bool(betting_open),
+        "display_phase": display_phase,
+        "display_source": display_source,
         "snapshot_game_no": snapshot_game_no,
         "guard_game_no": guard_game_no,
+        "raw_game_no": raw_display_game_no,
+        "raw_snapshot_game_no": raw_snapshot_game_no,
+        "raw_guard_game_no": raw_guard_game_no,
+        "raw_frontend_game_no": raw_frontend_game_no,
+        "raw_canvas_game_no": raw_canvas_game_no,
+        "runtime_action": runtime_action,
+        "frontend_runtime_action": frontend_runtime_action,
+        "runtime_coordinates": runtime_coordinates,
         "game_no_source": "guard" if guard_game_no else ("snapshot" if snapshot_game_no else ""),
         "countdown": countdown,
         "betting_open": betting_open,
+        "frontend_betting_open": bool(_action_is_betting(frontend_runtime_action)) if frontend_runtime_action else bool(betting_open),
         "room_id": room_id,
         "room_label": room_label,
         "locked_room_id": str(summary.get("locked_room_id") or ""),
@@ -567,15 +744,12 @@ def status_room_identity(status: dict[str, Any], *, room_index: int) -> str:
 
 
 def status_round_guard_key(status: dict[str, Any]) -> str:
-    game_no = str(status.get("game_no") or "").strip()
+    game_no = public_game_no(status.get("game_no") or status.get("display_game_no") or status.get("raw_game_no"))
     if not game_no:
         return ""
     try:
-        return str(cw._manual_keepalive_batch_guard_key(game_no) or "").strip()
+        return public_game_no(cw._manual_keepalive_batch_guard_key(game_no)) or game_no
     except Exception:
-        parts = game_no.split("-")
-        if len(parts) >= 3:
-            return "-".join(parts[:3])
         return game_no
 
 
@@ -584,7 +758,7 @@ def compact_status(status: dict[str, Any], *, room_index: int) -> dict[str, Any]
         "game": bool(status.get("game_ready")),
         "hall": bool(status.get("hall_ready")),
         "room": status_room_identity(status, room_index=room_index) or "-",
-        "round": status.get("game_no") or "-",
+        "round": public_game_no(status.get("game_no")) or "-",
         "round_key": status_round_guard_key(status) or "-",
         "cd": status.get("countdown"),
         "open": bool(status.get("betting_open")),
@@ -615,7 +789,7 @@ async def write_status(accounts: dict[str, dict[str, Any]], path: Path, output: 
         (
             f"{sid} {s.get('mode', '-')} game={s.get('game_ready')} hall={s.get('hall_ready')} "
             f"room={status_room_identity(s, room_index=0) or '-'} "
-            f"round={s.get('game_no') or '-'} cd={s.get('countdown')} open={s.get('betting_open')} "
+            f"round={public_game_no(s.get('game_no')) or '-'} cd={s.get('countdown')} open={s.get('betting_open')} "
             f"pending={s.get('pending_cents')}"
         )
         for sid, s in statuses.items()
@@ -649,7 +823,7 @@ def coordinator_readiness(
         room_key = status_room_identity(status, room_index=room_index)
         if not room_key:
             return {"ok": False, "reason": f"{account_id}:room_missing", "account_id": account_id}
-        game_no = str(status.get("game_no") or "").strip()
+        game_no = public_game_no(status.get("game_no") or status.get("display_game_no") or status.get("raw_game_no"))
         if not game_no:
             return {"ok": False, "reason": f"{account_id}:round_missing", "account_id": account_id}
         round_key = status_round_guard_key(status)
@@ -848,19 +1022,20 @@ async def retry_headless_room_entries(
     now = time.time()
     if account_ids is None:
         account_ids = tuple(accounts.keys())
-    for account_id in account_ids:
+
+    async def retry_one(account_id: str) -> None:
         status = statuses.get(account_id, {})
         if status.get("game_ready") or not status.get("hall_ready"):
-            continue
+            return
         item = accounts.get(account_id)
         if not item:
-            continue
+            return
         runtime = item["runtime"]
         if runtime.get("mode") != "headless":
-            continue
+            return
         last_retry = float(item.get("last_room_retry_at") or 0.0)
         if now - last_retry < 12.0:
-            continue
+            return
         item["last_room_retry_at"] = now
         page = runtime.get("page")
         if status.get("hall_ready") and not status.get("game_ready"):
@@ -900,12 +1075,14 @@ async def retry_headless_room_entries(
                     "timestamp_ms": now_ms(),
                 },
             )
-            continue
+            return
         append_jsonl(
             output,
             {"event": "retry_enter_room_result", "account_id": account_id, "ok": bool(enter_ok), "timestamp_ms": now_ms()},
         )
         print_event({"event": "retry_enter_room_result", "account_id": account_id, "ok": bool(enter_ok)})
+
+    await asyncio.gather(*(retry_one(account_id) for account_id in account_ids))
 
 
 def split_sub_amounts(amount: int, count: int) -> tuple[int, ...]:
@@ -1058,12 +1235,292 @@ class DelayPatch:
             "LIVE_FIRE_PLAN_CONFIRM_DELAY_MS": self.confirm_ms,
         }
         for name, value in names.items():
+            if not hasattr(cw, name):
+                continue
             self.old[name] = int(getattr(cw, name))
             setattr(cw, name, int(value))
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         for name, value in self.old.items():
             setattr(cw, name, value)
+
+
+def fast_click_leg_from_cmd(account_id: str, cmd: dict[str, Any]) -> dict[str, Any]:
+    side = str(cmd.get("side") or "")
+    chips = [int(item) for item in (cmd.get("chips") or cmd.get("chip_sequence") or [])]
+    return {
+        "account_id": account_id,
+        "role": str(cmd.get("role") or "sub"),
+        "side": side,
+        "side_text": fast_click_probe.SIDE_CN.get(side, side),
+        "amount": int(cmd.get("amount") or 0),
+        "chips": chips,
+        "chip_steps": len(chips),
+    }
+
+
+async def select_active_game_page_for_click(item: dict[str, Any], trusted_status: dict[str, Any]) -> Any:
+    runtime = item.get("runtime") or {}
+    config = item.get("config")
+    context = runtime.get("context")
+    page = runtime.get("page")
+    expected_game_no = public_game_no(
+        trusted_status.get("game_no")
+        or trusted_status.get("display_game_no")
+        or trusted_status.get("raw_game_no")
+    )
+    if context is not None:
+        try:
+            pages = [candidate for candidate in list(context.pages) if not candidate.is_closed()]
+        except Exception:
+            pages = []
+        best_page = None
+        best_score = -1
+        for candidate in reversed(pages):
+            score = 0
+            try:
+                if str(getattr(candidate, "url", "") or "") and candidate.url != "about:blank":
+                    score += 1
+            except Exception:
+                pass
+            try:
+                load = await read_baccarat_load_state(candidate)
+                snapshot = await read_live_runtime_snapshot(candidate, instance_id=str(getattr(config, "instance_id", "") or item.get("id") or ""))
+                game_no = public_game_no(getattr(snapshot, "game_no", "") if snapshot is not None else "")
+                if bool(getattr(load, "game_ready", False)):
+                    score += 20
+                if game_no:
+                    score += 20
+                if expected_game_no and game_no == expected_game_no:
+                    score += 100
+                if snapshot is not None and bool(getattr(snapshot, "betting_open", False)):
+                    score += 30
+            except Exception:
+                pass
+            if score > best_score:
+                best_score = score
+                best_page = candidate
+        if best_page is not None and best_score > 0:
+            runtime["page"] = best_page
+            return best_page
+        if page is None:
+            page = await cw._active_page(context)
+            runtime["page"] = page
+    if page is None:
+        raise RuntimeError("missing active page for fast click executor")
+    return page
+
+
+async def fast_click_account_from_worker_item(
+    item: dict[str, Any],
+    trusted_status: dict[str, Any] | None = None,
+) -> fast_click_probe.AccountRuntime:
+    runtime = item.get("runtime") or {}
+    config = item.get("config")
+    context = runtime.get("context")
+    page = await select_active_game_page_for_click(item, trusted_status or {})
+    instance_id = str(item.get("id") or getattr(config, "instance_id", "") or "")
+    slot = fast_click_probe.SlotConfig(
+        instance_id=instance_id,
+        login_url=str(getattr(config, "login_url", "") or ""),
+        target_url=str(getattr(config, "target_url", "") or ""),
+        proxy={},
+        username=str(getattr(config, "username", "") or ""),
+        password=str(getattr(config, "password", "") or ""),
+    )
+    return fast_click_probe.AccountRuntime(
+        instance_id=instance_id,
+        slot=slot,
+        context=context,
+        page=page,
+        headed=str(runtime.get("mode") or "") != "headless",
+        browser=runtime.get("browser"),
+    )
+
+
+def fast_click_args_from_item(item: dict[str, Any], delay_ms: int, confirm_ms: int) -> argparse.Namespace:
+    config = item.get("config")
+    return SimpleNamespace(
+        width=int(getattr(config, "viewport_width", 960) or 960),
+        height=int(getattr(config, "viewport_height", 620) or 620),
+        delay_min_ms=int(delay_ms),
+        delay_max_ms=int(delay_ms),
+        confirm_delay_ms=int(confirm_ms),
+        min_click_countdown=1,
+    )
+
+
+def finance_from_status(status: dict[str, Any]) -> dict[str, int | None]:
+    balance = as_int_or_none(status.get("balance_cents"))
+    if balance is None:
+        balance = as_int_or_none(status.get("display_balance_cents"))
+    return {
+        "balance_cents": balance,
+        "pending_cents": as_int_or_none(status.get("pending_cents")),
+    }
+
+
+def rejected_trusted_leg(
+    account: fast_click_probe.AccountRuntime,
+    leg: dict[str, Any],
+    reason: str,
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "instance_id": account.instance_id,
+        "role": leg["role"],
+        "side": leg["side"],
+        "side_text": leg["side_text"],
+        "planned_amount": int(leg["amount"]),
+        "chips": [int(item) for item in leg["chips"]],
+        "status": "REJECTED",
+        "reason": reason,
+        "actual_amount": 0,
+        "missing_amount": int(leg["amount"]),
+        "pre_countdown": as_int_or_none(status.get("countdown")),
+        "pre_game_no": public_game_no(status.get("game_no") or status.get("display_game_no") or status.get("raw_game_no"))[:80],
+        "pre_finance": finance_from_status(status),
+    }
+
+
+async def execute_fast_click_with_trusted_preflight(
+    account: fast_click_probe.AccountRuntime,
+    leg: dict[str, Any],
+    cmd: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    trusted_status = dict(cmd.get("trusted_status") or {})
+    pre_countdown = as_int_or_none(trusted_status.get("countdown"))
+    pre_game_no = public_game_no(
+        trusted_status.get("game_no")
+        or trusted_status.get("display_game_no")
+        or trusted_status.get("raw_game_no")
+        or cmd.get("batch_id")
+    )
+    if not trusted_status:
+        return rejected_trusted_leg(account, leg, "trusted_preflight_missing", trusted_status)
+    trusted_betting_open = bool(trusted_status.get("betting_open"))
+    if not trusted_betting_open and bool(cmd.get("allow_countdown_window")) and pre_countdown is not None and pre_countdown > 0:
+        trusted_betting_open = True
+    if not trusted_betting_open:
+        return rejected_trusted_leg(account, leg, "trusted_preflight_not_betting_open", trusted_status)
+    if pre_countdown is None or int(pre_countdown) < int(args.min_click_countdown):
+        return rejected_trusted_leg(account, leg, "trusted_preflight_countdown_too_low", trusted_status)
+    if not pre_game_no:
+        return rejected_trusted_leg(account, leg, "trusted_preflight_round_missing", trusted_status)
+
+    side_region = fast_click_probe.SIDE_REGION[str(leg["side"])]
+    viewport = {"width": int(args.width), "height": int(args.height)}
+    side_point = fast_click_probe.region_center(side_region, viewport)
+    if side_point is None:
+        raise RuntimeError(f"missing side coordinate {side_region}")
+    chip_points: dict[int, tuple[float, float]] = {}
+    for chip in sorted(set(int(item) for item in leg["chips"])):
+        point = fast_click_probe.region_center(f"chip_{chip}", viewport)
+        if point is None:
+            raise RuntimeError(f"missing chip coordinate {chip}")
+        chip_points[chip] = point
+
+    pre_finance = finance_from_status(trusted_status)
+    started = now_ms()
+    steps: list[dict[str, Any]] = []
+    chips = [int(item) for item in leg["chips"]]
+    for index, chip in enumerate(chips, start=1):
+        chip_x, chip_y = chip_points[chip]
+        step_started = now_ms()
+        await account.page.mouse.click(chip_x, chip_y)
+        chip_clicked = now_ms()
+        chip_to_side_delay = random.randint(int(args.delay_min_ms), int(args.delay_max_ms))
+        await account.page.wait_for_timeout(chip_to_side_delay)
+        await account.page.mouse.click(side_point[0], side_point[1])
+        side_clicked = now_ms()
+        step: dict[str, Any] = {
+            "step_index": index,
+            "chip": chip,
+            "chip_click_start_ms": step_started,
+            "chip_click_end_ms": chip_clicked,
+            "chip_to_side_delay_ms": chip_to_side_delay,
+            "side_click_start_ms": chip_clicked + chip_to_side_delay,
+            "side_click_end_ms": side_clicked,
+            "step_elapsed_ms": side_clicked - step_started,
+        }
+        if index < len(chips):
+            next_delay = random.randint(int(args.delay_min_ms), int(args.delay_max_ms))
+            step["next_delay_ms"] = next_delay
+            await account.page.wait_for_timeout(next_delay)
+        steps.append(step)
+    click_done = now_ms()
+    await account.page.wait_for_timeout(int(args.confirm_delay_ms))
+    post_snapshot = await fast_click_probe.read_snapshot(account)
+    post_finance = fast_click_probe.finance_from_snapshot(post_snapshot)
+    settlement = fast_click_probe.compute_settlement(pre_finance, post_finance, int(leg["amount"]))
+    return {
+        "instance_id": account.instance_id,
+        "role": leg["role"],
+        "side": leg["side"],
+        "side_text": leg["side_text"],
+        "planned_amount": int(leg["amount"]),
+        "chips": chips,
+        "status": settlement["status"],
+        "actual_amount": settlement["actual_amount"],
+        "missing_amount": settlement["missing_amount"],
+        "evidence": settlement["evidence"],
+        "click_sequence_ms": click_done - started,
+        "elapsed_ms": now_ms() - started,
+        "pre_countdown": pre_countdown,
+        "post_countdown": getattr(post_snapshot, "countdown_seconds", None) if post_snapshot is not None else None,
+        "pre_game_no": pre_game_no[:80],
+        "post_game_no": public_game_no(getattr(post_snapshot, "game_no", "") if post_snapshot is not None else "")[:80],
+        "pre_finance": pre_finance,
+        "post_finance": post_finance,
+        "steps": steps,
+    }
+
+
+def attach_fast_click_timing(result: dict[str, Any], *, confirm_ms: int) -> dict[str, Any]:
+    account_id = str(result.get("account_id") or result.get("instance_id") or "")
+    result["account_id"] = account_id
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    compact_steps: list[dict[str, Any]] = []
+    chip_to_side_wait_total = 0
+    next_wait_total = 0
+    for step in steps:
+        chip_to_side_delay = as_int_or_none(step.get("chip_to_side_delay_ms")) or 0
+        next_delay = as_int_or_none(step.get("next_delay_ms")) or 0
+        chip_to_side_wait_total += chip_to_side_delay
+        next_wait_total += next_delay
+        compact_steps.append(
+            {
+                "step_index": step.get("step_index"),
+                "chip": step.get("chip"),
+                "status": result.get("status"),
+                "chip_click_ms": None,
+                "chip_to_side_delay_ms": chip_to_side_delay,
+                "side_click_ms": None,
+                "next_delay_ms": next_delay if next_delay else None,
+                "step_span_ms": step.get("step_elapsed_ms"),
+            }
+        )
+    result["step_count"] = len(steps)
+    result.setdefault("click_trace_timing", {})
+    result["click_trace_timing"].update(
+        {
+            "trace_id": result.get("execution_id"),
+            "status": result.get("status"),
+            "planned_amount": result.get("planned_amount"),
+            "actual_amount": result.get("actual_amount"),
+            "missing_amount": result.get("missing_amount"),
+            "worker_elapsed_ms": result.get("elapsed_ms"),
+            "step_count": len(steps),
+            "countdown_at_start": result.get("pre_countdown"),
+            "click_span_ms": result.get("click_sequence_ms"),
+            "chip_to_side_wait_total_ms": chip_to_side_wait_total,
+            "next_wait_total_ms": next_wait_total,
+            "confirm_wait_config_ms": int(confirm_ms),
+            "steps": compact_steps,
+        }
+    )
+    return result
 
 
 def prime_countdown_window_for_execution(
@@ -1077,7 +1534,7 @@ def prime_countdown_window_for_execution(
     for account_id, item in accounts.items():
         status = statuses.get(account_id) or {}
         countdown = as_int_or_none(status.get("countdown"))
-        game_no = str(status.get("game_no") or "").strip()
+        game_no = public_game_no(status.get("game_no") or status.get("display_game_no") or status.get("raw_game_no"))
         if countdown is None or countdown <= 0 or not game_no:
             continue
         room_label = str(status.get("room_label") or status.get("locked_room_label") or status_room_identity(status, room_index=room_index) or "")
@@ -1148,13 +1605,16 @@ async def run_worker_plan_with_timing(item: dict[str, Any], cmd: dict[str, Any])
     }
     timing["worker_call_start_ms"] = now_ms()
     try:
-        result = await cw._execute_live_fire_bet_plan(
-            item["config"],
-            item["runtime"],
-            item["state"],
-            item["event_queue"],
+        account = await fast_click_account_from_worker_item(item, dict(cmd.get("trusted_status") or {}))
+        leg = fast_click_leg_from_cmd(str(item.get("id") or account.instance_id), cmd)
+        result = await execute_fast_click_with_trusted_preflight(
+            account,
+            leg,
             cmd,
+            fast_click_args_from_item(item, int(cmd.get("delay_ms") or 200), int(cmd.get("confirm_ms") or 1200)),
         )
+        result["execution_id"] = cmd.get("execution_id")
+        attach_fast_click_timing(result, confirm_ms=int(cmd.get("confirm_ms") or 1200))
         return {"result": result, "timing": timing}
     except Exception as exc:
         return {"error": type(exc).__name__, "timing": timing}
@@ -1282,13 +1742,18 @@ async def execute_round(
         for leg in legs:
             item = accounts[str(leg["account_id"])]
             account_status = statuses.get(str(leg["account_id"])) or {}
-            account_round_id = str(account_status.get("game_no") or round_id).strip()
+            account_round_id = public_game_no(account_status.get("game_no") or round_id)
             execution_id = f"interval_probe:{round_id}:{leg['account_id']}:{delay_ms}:{now_ms()}"
             cmd = {
                 "side": str(leg["side"]),
+                "role": str(leg.get("role") or "sub"),
                 "batch_id": account_round_id,
+                "trusted_status": dict(account_status),
+                "allow_countdown_window": bool(allow_countdown_window),
                 "amount": int(leg["amount"]),
                 "chip_sequence": list(leg["chips"]),
+                "delay_ms": int(delay_ms),
+                "confirm_ms": int(confirm_ms),
                 "execution_id": execution_id,
                 "execution_contract": {
                     "execution_id": f"interval_probe:{round_id}:{leg['account_id']}:{delay_ms}",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -16,10 +17,16 @@ from bet_desktop.ui.lightweight_models import (
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+PROJECT_ROOT = _project_root()
 DEFAULT_CONFIG_CANDIDATES: tuple[Path, ...] = (
-    PROJECT_ROOT / "bet_desktop" / "artifacts" / "platform_proxy_profiles.json",
     PROJECT_ROOT / "dist" / "BetDesktop" / "bet_desktop" / "artifacts" / "platform_proxy_profiles.json",
+    PROJECT_ROOT / "bet_desktop" / "artifacts" / "platform_proxy_profiles.json",
 )
 
 
@@ -55,6 +62,7 @@ def default_execution_config() -> ExecutionConfig:
         main_account=DEFAULT_MAIN_ACCOUNT,
         amount_min=80,
         amount_max=150,
+        min_balance_yuan=0,
         click_interval_ms=200,
         min_countdown=10,
         confirm_ms=1200,
@@ -121,7 +129,7 @@ class LightweightConfigStore:
         for account_id in ACCOUNT_IDS:
             slot_data = platform_slots_payload.get(account_id, {})
             if slot_data:
-                slot = PlatformSlot.from_legacy_data(account_id=account_id, payload=slot_data)
+                slot = PlatformSlot.from_dict(account_id=account_id, payload=slot_data)
             else:
                 legacy_data = legacy_slots.get(account_id, {})
                 slot = PlatformSlot.from_legacy_data(account_id=account_id, payload=legacy_data) if legacy_data else PlatformSlot(account_id=account_id)

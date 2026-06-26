@@ -40,6 +40,10 @@ class BrowserControlAdapter:
     def start_accounts(self, account_ids: list[str]) -> tuple[int, str, str]:
         return self.run_command(["start_accounts", *account_ids])
 
+    def restart_accounts(self, account_ids: list[str]) -> tuple[int, str, str]:
+        self.stop_accounts(account_ids)
+        return self.start_accounts(account_ids)
+
     def fill_login(self, account_ids: list[str]) -> tuple[int, str, str]:
         return self.run_command(["fill_login", *account_ids])
 
@@ -60,6 +64,18 @@ class BrowserControlAdapter:
 
     def stop_accounts(self, account_ids: list[str]) -> tuple[int, str, str]:
         return self.run_command(["stop_accounts", *account_ids])
+
+    def execute_rounds(self, **kwargs) -> tuple[int, str, str]:
+        return self.run_command(["execute_rounds"])
+
+    def start_hedge(self, **kwargs) -> tuple[int, str, str]:
+        return self.run_command(["start_hedge"])
+
+    def pause_hedge(self) -> tuple[int, str, str]:
+        return self.run_command(["pause_hedge"])
+
+    def stop_hedge(self) -> tuple[int, str, str]:
+        return self.run_command(["stop_hedge"])
 
     def refresh_runtime_environment(self, platform_slots) -> None:
         """Allow implementations to sync latest platform slot settings."""
@@ -124,6 +140,10 @@ class FakeBrowserControlAdapter(BrowserControlAdapter):
     def start_accounts(self, account_ids: list[str]) -> tuple[int, str, str]:
         self._record_action("start", account_ids)
         return super().start_accounts(account_ids)
+
+    def restart_accounts(self, account_ids: list[str]) -> tuple[int, str, str]:
+        self._record_action("restart", account_ids)
+        return super().restart_accounts(account_ids)
 
     def fill_login(self, account_ids: list[str]) -> tuple[int, str, str]:
         self._record_action("fill_login", account_ids)

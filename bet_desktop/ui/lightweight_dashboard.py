@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from time import monotonic
+from typing import Any
 
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont, QFontDatabase
@@ -11,6 +14,7 @@ from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QButtonGroup,
+    QComboBox,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -35,6 +39,8 @@ from bet_desktop.ui.lightweight_browser_adapter import CommandBrowserControlAdap
 from bet_desktop.ui.lightweight_controller import LightweightController
 from bet_desktop.ui.lightweight_models import ACCOUNT_IDS, DEFAULT_MAIN_ACCOUNT, parse_proxy_bundle_line
 
+SIDE_TEXT_CN = {"banker": "庄", "player": "闲", "tie": "和"}
+
 
 class LightweightDashboard(QMainWindow):
     def __init__(
@@ -57,8 +63,20 @@ class LightweightDashboard(QMainWindow):
         self.summary_cards: dict[str, dict[str, QLabel]] = {}
         self.role_buttons: dict[str, QPushButton] = {}
         self.room_index_buttons: dict[int, list[QPushButton]] = {room_index: [] for room_index in (1, 2, 3)}
-        self.account_cards: dict[str, dict[str, QLabel]] = {}
-        self.plan_rows: dict[str, dict[str, QLabel]] = {}
+        self.account_cards: dict[str, dict[str, QWidget]] = {}
+        self.plan_rows: dict[str, dict[str, QWidget]] = {}
+        self.health_labels: dict[str, QLabel] = {}
+        self.turnover_labels: dict[str, dict[str, QLabel]] = {}
+        self.pnl_rows: dict[str, dict[str, QLabel]] = {}
+        self.round_table = None
+        self._current_balances: dict[str, Decimal] = {}
+        self._initial_balances: dict[str, Decimal] = {}
+        self._deposit_totals: dict[str, Decimal] = {}
+        self._withdraw_totals: dict[str, Decimal] = {}
+        self._profit_tracking_active = True
+        self._turnover_reset_index = 0
+        self._run_started_at: float | None = None
+        self._plan_account_states: dict[str, str] = {account_id: "normal" for account_id in ACCOUNT_IDS}
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -68,7 +86,7 @@ class LightweightDashboard(QMainWindow):
         self._refresh_from_controller()
         self._runtime_poll_timer = QTimer(self)
         self._runtime_poll_timer.setInterval(1200)
-        self._runtime_poll_timer.timeout.connect(self.controller.poll_runtime_events)
+        self._runtime_poll_timer.timeout.connect(self._poll_runtime_events)
         self._runtime_poll_timer.start()
         self._append_log("轻量窗口初始化完成")
 
@@ -142,7 +160,7 @@ class LightweightDashboard(QMainWindow):
         batch_layout.addWidget(self._button("批量填登录", "", self._on_fill_login))
         batch_layout.addWidget(self._button("接管副号", "primary", self._on_handoff))
         batch_layout.addWidget(self._build_room_selector())
-        batch_layout.addWidget(self._button("批量进房", "success", self._on_enter_room))
+        batch_layout.addWidget(self._button("副号进房", "success", self._on_enter_room))
         batch_layout.addWidget(self._button("释放无头", "", self._on_release))
         batch_layout.addWidget(self._button("批量停止", "danger", self.controller.batch_stop_clicked))
         page_layout.addWidget(batch_strip)
@@ -196,15 +214,13 @@ class LightweightDashboard(QMainWindow):
         center = QVBoxLayout()
         center.setSpacing(12)
         center.addWidget(self._build_account_status_panel())
-        center.addWidget(self._build_gate_panel())
-        center.addWidget(self._build_rounds_panel())
+        center.addWidget(self._build_log_panel())
         layout.addLayout(center, 2)
 
         right = QVBoxLayout()
         right.setSpacing(12)
         right.addWidget(self._build_plan_panel())
         right.addWidget(self._build_health_panel())
-        right.addWidget(self._build_log_panel(), 1)
         layout.addLayout(right, 1)
         return page
 
@@ -252,7 +268,13 @@ class LightweightDashboard(QMainWindow):
         note.setWordWrap(True)
         note.setObjectName("hint")
         body.addWidget(note)
-        body.addWidget(self._button("启动轻量控制", "success", self.controller.start_clicked))
+        room_entry_row = QHBoxLayout()
+        room_entry_row.addWidget(self._build_room_selector(), 1)
+        room_entry_row.addWidget(self._button("副号进房", "", self._on_enter_room))
+        room_entry_row.addWidget(self._button("全部进房", "", self._on_enter_room_all))
+        room_entry_row.addWidget(self._button("释放", "", self._on_release))
+        body.addLayout(room_entry_row)
+        body.addWidget(self._button("启动轻量控制", "success", self._on_start))
         body.addWidget(self._button("暂停", "warn", self.controller.pause_clicked))
         body.addWidget(self._button("急停", "danger", self.controller.stop_clicked))
         return panel
@@ -285,7 +307,7 @@ class LightweightDashboard(QMainWindow):
         control_grid.setSpacing(8)
         self.handoff_btn = self._button("a1/a3/a4 接管", "primary", self._on_handoff)
         control_grid.addWidget(self.handoff_btn, 0, 0, 1, 2)
-        control_grid.addWidget(self._button("批量进房", "", self._on_enter_room), 1, 0)
+        control_grid.addWidget(self._button("副号进房", "", self._on_enter_room), 1, 0)
         control_grid.addWidget(self._button("刷新无头", "", self._on_refresh_headless), 1, 1)
         control_grid.addWidget(self._button("测试发一轮", "success", self.controller.test_one_round_clicked), 2, 0, 1, 2)
         control_grid.addWidget(self._button("测试 10 轮", "", self.controller.test_ten_rounds_clicked), 3, 0, 1, 2)
@@ -305,6 +327,8 @@ class LightweightDashboard(QMainWindow):
         ]:
             content_layout.addWidget(self._metric_row(label, value))
 
+        content_layout.addWidget(self._build_rounds_panel())
+        content_layout.addWidget(self._build_gate_panel())
         wrapper.addWidget(content)
 
         def toggle(checked: bool) -> None:
@@ -316,7 +340,7 @@ class LightweightDashboard(QMainWindow):
         return panel
 
     def _build_account_status_panel(self) -> QWidget:
-        panel, body = self._panel("账号状态", "等待同房")
+        panel, body = self._panel("账号状态", "实时状态")
         grid = QGridLayout()
         grid.setSpacing(10)
         for index, account_id in enumerate(ACCOUNT_IDS):
@@ -325,18 +349,15 @@ class LightweightDashboard(QMainWindow):
         return panel
 
     def _build_gate_panel(self) -> QWidget:
-        panel, body = self._panel("发号门槛", "待确认")
-        gate_grid = QGridLayout()
-        gate_grid.setSpacing(8)
-        gates = [
-            ("同房", "等待 a1/a2/a3/a4"),
-            ("同局", "等待共同局号"),
-            ("倒计时", "门槛 >= 10 秒"),
-            ("预检", "发号前并行确认"),
-        ]
-        for index, (name, detail) in enumerate(gates):
-            gate_grid.addWidget(self._gate_item(name, "待确认", detail), index // 2, index % 2)
-        body.addLayout(gate_grid)
+        panel, body = self._panel("下注流水累计", "")
+        header = panel.layout().itemAt(0).layout()
+        if header is not None:
+            header.addWidget(self._button("重置流水", "", self._on_reset_turnover))
+        turnover_grid = QGridLayout()
+        turnover_grid.setSpacing(8)
+        for index, account_id in enumerate(ACCOUNT_IDS):
+            turnover_grid.addWidget(self._turnover_item(account_id), index // 2, index % 2)
+        body.addLayout(turnover_grid)
         return panel
 
     def _build_rounds_panel(self) -> QWidget:
@@ -351,6 +372,10 @@ class LightweightDashboard(QMainWindow):
 
     def _build_plan_panel(self) -> QWidget:
         panel, body = self._panel("本轮计划", "对冲")
+        header = panel.layout().itemAt(0).layout()
+        if header is not None:
+            self.plan_round_label = self._pill("计划 0 轮", "info")
+            header.addWidget(self.plan_round_label)
         for account_id in ACCOUNT_IDS:
             row = QFrame()
             row.setObjectName("planLine")
@@ -368,38 +393,54 @@ class LightweightDashboard(QMainWindow):
             chips.setObjectName("planMeta")
             chips.setWordWrap(True)
             role = self._pill("副", "")
+            state = self._pill("正常", "")
+            action = self._button(
+                "下局剔除",
+                "",
+                lambda checked=False, account_id=account_id: self._on_plan_state_action(account_id),
+            )
             layout.addWidget(amount)
             text_box = QVBoxLayout()
             text_box.setSpacing(3)
             text_box.addWidget(side)
             text_box.addWidget(chips)
             layout.addLayout(text_box, 1)
+            layout.addWidget(state)
+            layout.addWidget(action)
             layout.addWidget(role)
             body.addWidget(row)
-            self.plan_rows[account_id] = {"amount": amount, "side": side, "chips": chips, "role": role}
+            self.plan_rows[account_id] = {
+                "row": row,
+                "amount": amount,
+                "side": side,
+                "chips": chips,
+                "role": role,
+                "state": state,
+                "action": action,
+            }
         return panel
 
     def _build_health_panel(self) -> QWidget:
         panel, body = self._panel("运行摘要", "正常")
         grid = QGridLayout()
         grid.setSpacing(8)
-        for index, (value, label) in enumerate([
-            ("0", "测试轮次"),
-            ("0", "总缺口"),
-            ("-", "最慢整轮"),
-            ("-", "最慢点击"),
+        for index, (key, value, label) in enumerate([
+            ("rounds", "0", "测试轮次"),
+            ("missing", "0", "总缺口"),
+            ("max_round_ms", "-", "最慢整轮"),
+            ("max_click_ms", "-", "最慢点击"),
+            ("runtime", "00:00:00", "运行时间"),
         ]):
-            grid.addWidget(self._health_box(value, label), index // 2, index % 2)
+            grid.addWidget(self._health_box(value, label, key), index // 2, index % 2)
         body.addLayout(grid)
         return panel
 
     def _build_log_panel(self) -> QWidget:
-        panel, body = self._panel("轻量日志", "摘要")
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setObjectName("logView")
-        self.log_view.setMinimumHeight(220)
-        body.addWidget(self.log_view)
+        panel, body = self._panel("单账号盈亏", "启动后统计")
+        for account_id in ACCOUNT_IDS:
+            item = self._pnl_item(account_id)
+            self._enrich_pnl_item(item, account_id)
+            body.addWidget(item)
         return panel
 
     def _build_platform_summary_card(self, account_id: str) -> QWidget:
@@ -493,33 +534,36 @@ class LightweightDashboard(QMainWindow):
         top.addWidget(state)
         layout.addLayout(top)
 
-        countdown = QLabel("- 秒")
-        countdown.setObjectName("countdown")
-        layout.addWidget(countdown)
+        betting_zone = QLabel("未同步")
+        betting_zone.setObjectName("countdown")
+        layout.addWidget(betting_zone)
         round_id = QLabel("局号：-")
         balance = QLabel("余额：-")
-        state_machine = QLabel("状态机：-")
-        pending = QLabel("待确认：-")
         room = QLabel("房间：-")
-        for item in (room, round_id, balance, state_machine, pending):
+        target_room = QLabel("目标：-")
+        room_progress = QLabel("进度：-")
+        room_progress.setObjectName("hint")
+        for item in (room, round_id, balance, target_room, room_progress):
             layout.addWidget(item)
 
         foot = QHBoxLayout()
-        primary = self._button("接管", "", self._protected_notice, enabled=False)
-        recapture = self._button("重采", "", self._protected_notice, enabled=False)
-        foot.addWidget(primary)
-        foot.addWidget(recapture)
+        restart = self._button("重启", "", lambda checked=False, account_id=account_id: self._on_account_restart(account_id))
+        handoff = self._button("接管", "", lambda checked=False, account_id=account_id: self._on_account_handoff(account_id))
+        enter_room = self._button("进房", "", lambda checked=False, account_id=account_id: self._on_account_enter_room(account_id))
+        foot.addWidget(restart)
+        foot.addWidget(handoff)
+        foot.addWidget(enter_room)
         layout.addLayout(foot)
         self.account_cards[account_id] = {
             "role": role,
             "state": state,
-            "countdown": countdown,
+            "betting_zone": betting_zone,
             "room": room,
             "round": round_id,
             "balance": balance,
-            "machine": state_machine,
-            "pending": pending,
-            "primary": primary,
+            "target_room": target_room,
+            "room_progress": room_progress,
+            "handoff": handoff,
         }
         return card
 
@@ -535,17 +579,24 @@ class LightweightDashboard(QMainWindow):
 
         self.amount_min_input = self._spin(1, 9999, 80)
         self.amount_max_input = self._spin(1, 9999, 150)
+        self.min_balance_input = self._spin(0, 99999, 0)
+        self.main_successor_input = QComboBox()
+        self.main_successor_input.addItem("余额最高自动继承", "")
+        for account_id in ACCOUNT_IDS:
+            self.main_successor_input.addItem(account_id, account_id)
         self.click_interval_input = self._spin(1, 3000, 200)
         self.min_countdown_input = self._spin(0, 300, 10)
         self.confirm_ms_input = self._spin(0, 5000, 1200)
         for widget in [
             self.amount_min_input,
             self.amount_max_input,
+            self.min_balance_input,
             self.click_interval_input,
             self.min_countdown_input,
             self.confirm_ms_input,
         ]:
             widget.valueChanged.connect(self._on_strategy_preview_changed)
+        self.main_successor_input.currentIndexChanged.connect(self._on_strategy_preview_changed)
         for label, widget, suffix in [
             ("主单金额下限", self.amount_min_input, "元"),
             ("主单金额上限", self.amount_max_input, "元"),
@@ -558,6 +609,15 @@ class LightweightDashboard(QMainWindow):
             row.addWidget(widget, 1)
             row.addWidget(self._pill(suffix, ""))
             layout.addLayout(row)
+        min_balance_row = QHBoxLayout()
+        min_balance_row.addWidget(QLabel("低余额剔除线"))
+        min_balance_row.addWidget(self.min_balance_input, 1)
+        min_balance_row.addWidget(self._pill("元", ""))
+        layout.addLayout(min_balance_row)
+        successor_row = QHBoxLayout()
+        successor_row.addWidget(QLabel("主号不足继承"))
+        successor_row.addWidget(self.main_successor_input, 1)
+        layout.addLayout(successor_row)
         layout.addWidget(self._button("应用高级参数", "primary", self._on_apply_advanced))
         return layout
 
@@ -568,14 +628,20 @@ class LightweightDashboard(QMainWindow):
         outer.setContentsMargins(12, 10, 12, 12)
         outer.setSpacing(10)
 
-        head = QHBoxLayout()
+        head_row = QFrame()
+        head_row.setObjectName("panelHeader")
+        head_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        head = QHBoxLayout(head_row)
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
         label = QLabel(title)
         label.setObjectName("panelTitle")
+        label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         head.addWidget(label)
         head.addStretch()
         if pill_text:
             head.addWidget(self._pill(pill_text, "info"))
-        outer.addLayout(head)
+        outer.addWidget(head_row)
 
         body = QVBoxLayout()
         body.setSpacing(8)
@@ -605,6 +671,9 @@ class LightweightDashboard(QMainWindow):
         label.setObjectName("pill")
         label.setProperty("tone", tone)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumHeight(22)
+        label.setMaximumHeight(24)
+        label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         return label
 
     def _metric_row(self, label: str, value: str) -> QWidget:
@@ -634,13 +703,110 @@ class LightweightDashboard(QMainWindow):
         layout.addWidget(hint)
         return item
 
-    def _health_box(self, value: str, label: str) -> QWidget:
+    def _turnover_item(self, account_id: str) -> QWidget:
+        item = QFrame()
+        item.setObjectName("turnoverItem")
+        layout = QVBoxLayout(item)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        title = QLabel(account_id)
+        title.setObjectName("metricTitle")
+        value = QLabel("0")
+        value.setObjectName("turnoverValue")
+        hint = QLabel("实际下注累计")
+        hint.setObjectName("hint")
+        layout.addWidget(title)
+        layout.addWidget(value)
+        layout.addWidget(hint)
+        self.turnover_labels[account_id] = {"title": title, "value": value}
+        return item
+
+    def _pnl_item(self, account_id: str) -> QWidget:
+        item = QFrame()
+        item.setObjectName("pnlRow")
+        layout = QVBoxLayout(item)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+
+        top = QHBoxLayout()
+        name = QLabel(account_id)
+        name.setObjectName("metricTitle")
+        profit = QLabel("盈亏 -")
+        profit.setObjectName("profitValue")
+        top.addWidget(name)
+        top.addStretch()
+        top.addWidget(profit)
+        layout.addLayout(top)
+
+        detail = QLabel("初始 -   当前 -")
+        detail.setObjectName("hint")
+        layout.addWidget(detail)
+
+        self.pnl_rows[account_id] = {"name": name, "profit": profit, "detail": detail}
+        return item
+
+    def _enrich_pnl_item(self, item: QWidget, account_id: str) -> None:
+        layout = item.layout()
+        if not isinstance(layout, QVBoxLayout):
+            return
+        row = self.pnl_rows.get(account_id)
+        if not row:
+            return
+        initial = QLabel("初始 -")
+        initial.setObjectName("hint")
+        current = QLabel("当前 -")
+        current.setObjectName("hint")
+        deposit = QLabel("累计充值 0.00")
+        deposit.setObjectName("hint")
+        withdraw = QLabel("累计提现 0.00")
+        withdraw.setObjectName("hint")
+        layout.addWidget(initial)
+        layout.addWidget(current)
+        layout.addWidget(deposit)
+        layout.addWidget(withdraw)
+
+        adjust_row = QHBoxLayout()
+        deposit_input = QLineEdit()
+        deposit_input.setPlaceholderText("充值金额")
+        deposit_btn = self._button("记充值", "", lambda checked=False, account_id=account_id: self._on_add_deposit(account_id))
+        adjust_row.addWidget(deposit_input, 1)
+        adjust_row.addWidget(deposit_btn)
+        layout.addLayout(adjust_row)
+
+        withdraw_row = QHBoxLayout()
+        withdraw_input = QLineEdit()
+        withdraw_input.setPlaceholderText("提现金额")
+        withdraw_btn = self._button(
+            "记提现",
+            "",
+            lambda checked=False, account_id=account_id: self._on_add_withdraw(account_id),
+        )
+        withdraw_row.addWidget(withdraw_input, 1)
+        withdraw_row.addWidget(withdraw_btn)
+        layout.addLayout(withdraw_row)
+
+        row.update(
+            {
+                "initial": initial,
+                "current": current,
+                "deposit": deposit,
+                "withdraw": withdraw,
+                "deposit_input": deposit_input,
+                "withdraw_input": withdraw_input,
+                "deposit_btn": deposit_btn,
+                "withdraw_btn": withdraw_btn,
+            }
+        )
+
+    def _health_box(self, value: str, label: str, key: str = "") -> QWidget:
         box = QFrame()
         box.setObjectName("healthBox")
         layout = QVBoxLayout(box)
         layout.setContentsMargins(10, 10, 10, 10)
         number = QLabel(value)
         number.setObjectName("healthValue")
+        if key:
+            self.health_labels[key] = number
         text = QLabel(label)
         text.setObjectName("hint")
         layout.addWidget(number)
@@ -741,6 +907,8 @@ class LightweightDashboard(QMainWindow):
         return table
 
     def _seed_round_table(self) -> None:
+        if self.round_table is None:
+            return
         rows = [
             ["#01", "-", "200ms", "-", "-", "-", "-", "-", "待测"],
             ["#02", "-", "250ms", "-", "-", "-", "-", "-", "待测"],
@@ -773,6 +941,8 @@ class LightweightDashboard(QMainWindow):
         self.controller.on("main_account_changed", self._on_main_account_changed)
         self.controller.on("error_banner_updated", self._on_error_banner)
         self.controller.on("gate_status_updated", self._on_gate_status)
+        self.controller.on("round_results_updated", self._on_round_results_updated)
+        self.controller.on("hedge_plan_updated", self._on_hedge_plan_updated)
 
     def _on_platform_summary_updated(self, payload: object) -> None:
         self._refresh_platform_summary()
@@ -815,13 +985,93 @@ class LightweightDashboard(QMainWindow):
         if self._sync_form_to_controller():
             self.controller.batch_fill_login_clicked()
 
+    def _on_start(self) -> None:
+        if self._sync_form_to_controller():
+            if self._run_started_at is None:
+                self._run_started_at = monotonic()
+            self._refresh_runtime_elapsed()
+            self.controller.start_clicked()
+
+    def _poll_runtime_events(self) -> None:
+        self.controller.poll_runtime_events()
+        self._refresh_runtime_elapsed()
+
+    def _refresh_runtime_elapsed(self) -> None:
+        label = self.health_labels.get("runtime")
+        if label is None:
+            return
+        if self._run_started_at is None:
+            label.setText("00:00:00")
+            return
+        elapsed = max(0, int(monotonic() - self._run_started_at))
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+
+    def _on_plan_state_action(self, account_id: str) -> None:
+        current = self._plan_account_states.get(account_id, "normal")
+        next_state = {
+            "normal": "pending_exclude",
+            "pending_exclude": "normal",
+            "excluded": "pending_restore",
+            "pending_restore": "excluded",
+            "restore_failed": "pending_restore",
+        }.get(current, "pending_exclude")
+        self._plan_account_states[account_id] = next_state
+        self._refresh_plan_account_state(account_id)
+
+    def _advance_plan_account_states(self) -> None:
+        for account_id, state in list(self._plan_account_states.items()):
+            if state == "pending_exclude":
+                self._plan_account_states[account_id] = "excluded"
+            elif state == "pending_restore":
+                self._plan_account_states[account_id] = "normal"
+            self._refresh_plan_account_state(account_id)
+
+    def _refresh_plan_account_state(self, account_id: str) -> None:
+        row = self.plan_rows.get(account_id)
+        if not row:
+            return
+        state = self._plan_account_states.get(account_id, "normal")
+        state_text, action_text = {
+            "normal": ("正常", "下局剔除"),
+            "pending_exclude": ("待剔除", "取消剔除"),
+            "excluded": ("已剔除", "下局恢复"),
+            "pending_restore": ("待恢复", "取消恢复"),
+            "restore_failed": ("恢复失败", "下局恢复"),
+        }.get(state, ("正常", "下局剔除"))
+        state_label = row.get("state")
+        action_button = row.get("action")
+        if isinstance(state_label, QLabel):
+            state_label.setText(state_text)
+            state_label.setProperty("tone", "warn" if state in {"pending_exclude", "pending_restore"} else "")
+            self._refresh_widget_style(state_label)
+        if isinstance(action_button, QPushButton):
+            action_button.setText(action_text)
+
     def _on_handoff(self) -> None:
         if self._sync_form_to_controller():
             self.controller.batch_handoff_clicked()
 
+    def _on_account_restart(self, account_id: str) -> None:
+        if self._sync_form_to_controller():
+            self.controller.restart_account_clicked(account_id)
+
+    def _on_account_handoff(self, account_id: str) -> None:
+        if self._sync_form_to_controller():
+            self.controller.handoff_account_clicked(account_id)
+
+    def _on_account_enter_room(self, account_id: str) -> None:
+        if self._sync_form_to_controller():
+            self.controller.enter_room_account_clicked(account_id, self._selected_room_index())
+
     def _on_enter_room(self) -> None:
         if self._sync_form_to_controller():
             self.controller.batch_enter_room_clicked(self._selected_room_index())
+
+    def _on_enter_room_all(self) -> None:
+        if self._sync_form_to_controller():
+            self.controller.enter_room_all_clicked(self._selected_room_index())
 
     def _on_refresh_headless(self) -> None:
         if self._sync_form_to_controller():
@@ -847,6 +1097,8 @@ class LightweightDashboard(QMainWindow):
         return {
             "amount_min": self.amount_min_input.value(),
             "amount_max": self.amount_max_input.value(),
+            "min_balance_yuan": self.min_balance_input.value(),
+            "main_successor_account": str(self.main_successor_input.currentData() or ""),
             "click_interval_ms": self.click_interval_input.value(),
             "min_countdown": self.min_countdown_input.value(),
             "confirm_ms": self.confirm_ms_input.value(),
@@ -893,6 +1145,10 @@ class LightweightDashboard(QMainWindow):
         config = self.controller.config
         self.amount_min_input.setValue(config.amount_min)
         self.amount_max_input.setValue(config.amount_max)
+        self.min_balance_input.setValue(config.min_balance_yuan)
+        successor = str(config.main_successor_account or "")
+        successor_index = self.main_successor_input.findData(successor)
+        self.main_successor_input.setCurrentIndex(successor_index if successor_index >= 0 else 0)
         self.click_interval_input.setValue(config.click_interval_ms)
         self.min_countdown_input.setValue(config.min_countdown)
         self.confirm_ms_input.setValue(config.confirm_ms)
@@ -920,6 +1176,8 @@ class LightweightDashboard(QMainWindow):
         self._sync_room_buttons()
         self._refresh_platform_summary()
         self._on_account_status_updated(self.controller.account_status)
+        self._on_hedge_plan_updated(self.controller.current_plan)
+        self._on_round_results_updated(self.controller.round_results)
 
     def _sync_main_account(self, main_account: str) -> None:
         self.main_summary.setText(f"当前主号 {main_account}")
@@ -941,8 +1199,6 @@ class LightweightDashboard(QMainWindow):
             card = self.account_cards.get(account_id, {})
             if card:
                 card["role"].setText("当前主号 · 有头观察" if is_main else "副号 · 无头执行")
-                if isinstance(card["primary"], QPushButton):
-                    card["primary"].setText("观察" if is_main else "接管")
 
     def _refresh_platform_summary(self) -> None:
         for slot in self.controller.platform_slots:
@@ -955,6 +1211,13 @@ class LightweightDashboard(QMainWindow):
             card["name"].setText(display_name)
             card["expire"].setText(f"代理到期：{expire}")
             card["account"].setText(f"平台账号：{account}")
+            title = f"{slot.account_id} · {display_name}" if display_name else slot.account_id
+            turnover = self.turnover_labels.get(slot.account_id)
+            if turnover:
+                turnover["title"].setText(title)
+            pnl = self.pnl_rows.get(slot.account_id)
+            if pnl:
+                pnl["name"].setText(title)
 
     def _refresh_plan(self, main_account: str) -> None:
         amount_min = self.amount_min_input.value()
@@ -972,6 +1235,9 @@ class LightweightDashboard(QMainWindow):
                 else f"等待主单后分摊 · 点击 {click_interval}ms"
             )
             labels["role"].setText("主" if is_main else "副")
+            labels["amount"].setProperty("role", "main" if is_main else "")
+            self._refresh_widget_style(labels["amount"])
+            self._refresh_plan_account_state(account_id)
 
     def _on_account_status_updated(self, payload: object) -> None:
         if not isinstance(payload, list):
@@ -981,23 +1247,347 @@ class LightweightDashboard(QMainWindow):
             card = self.account_cards.get(account_id)
             if not card:
                 continue
-            card["state"].setText(str(getattr(summary, "state_label", "等待") or "等待"))
+            state_label = str(getattr(summary, "state_label", "等待") or "等待")
+            card["state"].setText(state_label)
+            betting_text = state_label if state_label in {"可下注", "不可下注", "大厅", "异常"} else "不可下注"
+            if state_label.startswith("数据过期"):
+                betting_text = "数据过期"
+            card["betting_zone"].setText(betting_text)
+            betting_open = bool(getattr(summary, "betting_open", False))
             countdown = getattr(summary, "countdown", None)
-            card["countdown"].setText(f"{countdown} 秒" if countdown is not None else "- 秒")
+            if betting_open and isinstance(countdown, int):
+                card["betting_zone"].setText(f"可下注 {countdown}秒")
+            elif betting_open:
+                card["betting_zone"].setText("可下注")
+            elif state_label in {"大厅", "异常", "数据过期"} or state_label.startswith("数据过期"):
+                card["betting_zone"].setText(state_label)
+            else:
+                card["betting_zone"].setText("不可下注")
+            card["betting_zone"].setProperty("tone", "betting" if betting_open else "")
+            self._refresh_widget_style(card["betting_zone"])
             card["room"].setText(f"房间：{getattr(summary, 'room_label', '-') or '-'}")
             card["round"].setText(f"局号：{getattr(summary, 'round_id', '-') or '-'}")
             balance = getattr(summary, "balance", None)
-            pending = getattr(summary, "pending_amount", None)
             card["balance"].setText(f"余额：{balance if balance is not None else '-'}")
-            card["machine"].setText(f"状态机：{getattr(summary, 'state_machine_label', '-') or '-'}")
-            card["pending"].setText(f"待确认：{pending if pending is not None else '-'}")
+            if "target_room" in card:
+                card["target_room"].setText(f"目标：{getattr(summary, 'target_room_label', '-') or '-'}")
+            if "room_progress" in card:
+                card["room_progress"].setText(f"进度：{getattr(summary, 'room_entry_detail', '') or '-'}")
+            balance_value = self._decimal_or_none(balance)
+            if balance_value is not None:
+                self._current_balances[account_id] = balance_value
+                if self._profit_tracking_active and account_id not in self._initial_balances:
+                    self._initial_balances[account_id] = balance_value
+        self._refresh_profit_display()
+
+    def _format_money_value(self, value: object) -> str:
+        text = str(value if value is not None else "0").strip()
+        if text.endswith(".00"):
+            return text[:-3]
+        return text or "0"
+
+    def _status_text(self, status: object) -> str:
+        return {
+            "complete": "完整",
+            "incomplete": "缺口",
+            "error": "异常",
+            "empty": "无结果",
+            "unknown": "未知",
+        }.get(str(status or "").lower(), str(status or "-"))
+
+    def _decimal_or_none(self, value: object) -> Decimal | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, Decimal):
+            return value
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+
+    def _format_balance_value(self, value: Decimal | None) -> str:
+        if value is None:
+            return "-"
+        return f"{value.quantize(Decimal('0.01')):.2f}"
+
+    def _format_profit_value(self, value: Decimal | None) -> str:
+        if value is None:
+            return "盈亏 -"
+        sign = "+" if value >= 0 else ""
+        return f"盈亏 {sign}{self._format_balance_value(value)}"
+
+    def _refresh_widget_style(self, widget: QWidget) -> None:
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
+
+    def _reset_profit_tracking(self) -> None:
+        self._profit_tracking_active = True
+        self._refresh_profit_display()
+
+    def _refresh_profit_display_legacy(self) -> None:
+        for account_id in ACCOUNT_IDS:
+            row = self.pnl_rows.get(account_id)
+            if not row:
+                continue
+            initial = self._initial_balances.get(account_id)
+            current = self._current_balances.get(account_id)
+            profit = current - initial if initial is not None and current is not None else None
+            row["profit"].setText(self._format_profit_value(profit))
+            row["detail"].setText(
+                f"初始 {self._format_balance_value(initial)}   当前 {self._format_balance_value(current)}"
+            )
+
+    def _on_reset_turnover(self) -> None:
+        self._turnover_reset_index = len(self.controller.round_results)
+        self._refresh_turnover_display(self.controller.round_results)
+        self._append_log("下注流水已重置")
+
+    def _add_balance_adjustment(self, account_id: str, amount: Decimal, *, is_withdraw: bool) -> None:
+        table = self._withdraw_totals if is_withdraw else self._deposit_totals
+        if amount < 0:
+            amount = -amount
+        table[account_id] = table.get(account_id, Decimal("0")) + amount
+        self._refresh_profit_display()
+
+    def _on_add_deposit(self, account_id: str) -> None:
+        row = self.pnl_rows.get(account_id, {})
+        widget = row.get("deposit_input")
+        if not isinstance(widget, QLineEdit):
+            return
+        amount = self._decimal_or_none(widget.text())
+        if amount is None:
+            return
+        self._add_balance_adjustment(account_id, amount, is_withdraw=False)
+        widget.setText("")
+
+    def _on_add_withdraw(self, account_id: str) -> None:
+        row = self.pnl_rows.get(account_id, {})
+        widget = row.get("withdraw_input")
+        if not isinstance(widget, QLineEdit):
+            return
+        amount = self._decimal_or_none(widget.text())
+        if amount is None:
+            return
+        self._add_balance_adjustment(account_id, amount, is_withdraw=True)
+        widget.setText("")
+
+    def _refresh_profit_display(self) -> None:
+        for account_id in ACCOUNT_IDS:
+            row = self.pnl_rows.get(account_id)
+            if not row:
+                continue
+            initial = self._initial_balances.get(account_id)
+            current = self._current_balances.get(account_id)
+            deposit = self._deposit_totals.get(account_id, Decimal("0"))
+            withdraw = self._withdraw_totals.get(account_id, Decimal("0"))
+            profit = None
+            if initial is not None and current is not None:
+                profit = current - initial - deposit + withdraw
+            row["profit"].setText(self._format_profit_value(profit))
+            initial_text = self._format_balance_value(initial)
+            current_text = self._format_balance_value(current)
+            deposit_text = self._format_balance_value(deposit)
+            withdraw_text = self._format_balance_value(withdraw)
+            if "initial" in row:
+                row["initial"].setText(f"初始 {initial_text}")
+            if "current" in row:
+                row["current"].setText(f"当前 {current_text}")
+            if "deposit" in row:
+                row["deposit"].setText(f"累计充值 {deposit_text}")
+            if "withdraw" in row:
+                row["withdraw"].setText(f"累计提现 {withdraw_text}")
+            row["detail"].setText(
+                f"初始 {initial_text} | 当前 {current_text} | 充值 {deposit_text} | 提现 {withdraw_text}"
+            )
+            if profit is None:
+                row["profit"].setProperty("tone", "")
+            elif profit > 0:
+                row["profit"].setProperty("tone", "positive")
+            elif profit < 0:
+                row["profit"].setProperty("tone", "negative")
+            else:
+                row["profit"].setProperty("tone", "")
+            self._refresh_widget_style(row["profit"])
+
+    def _refresh_turnover_display(self, results: list[object]) -> None:
+        totals = {account_id: Decimal("0") for account_id in ACCOUNT_IDS}
+        start = min(self._turnover_reset_index, len(results))
+        for item in results[start:]:
+            for row in getattr(item, "results", []) or []:
+                if not isinstance(row, dict):
+                    continue
+                account_id = str(row.get("instance_id") or row.get("account_id") or "")
+                if account_id not in totals:
+                    continue
+                actual = self._decimal_or_none(row.get("actual_amount"))
+                if actual is not None:
+                    totals[account_id] += actual
+        for account_id, value in totals.items():
+            labels = self.turnover_labels.get(account_id)
+            if labels:
+                labels["value"].setText(self._format_money_value(value))
+
+    def _result_by_account(self, result: object) -> dict[str, dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
+        for item in getattr(result, "results", []) or []:
+            if isinstance(item, dict):
+                account_id = str(item.get("instance_id") or "")
+                if account_id:
+                    rows[account_id] = item
+        return rows
+
+    def _leg_by_account(self, payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
+        legs = payload.get("legs", [])
+        if isinstance(legs, list):
+            for leg in legs:
+                if isinstance(leg, dict):
+                    account_id = str(leg.get("account_id") or leg.get("instance_id") or "")
+                    if account_id:
+                        rows[account_id] = leg
+        return rows
+
+    def _round_account_text(self, result: object, account_id: str) -> str:
+        row = self._result_by_account(result).get(account_id)
+        if not row:
+            return "-"
+        actual = self._format_money_value(row.get("actual_amount", 0))
+        missing = self._format_money_value(row.get("missing_amount", 0))
+        elapsed = row.get("click_sequence_ms") or row.get("elapsed_ms") or "-"
+        status = str(row.get("status") or "").upper()
+        if status == "COMPLETE" and missing in {"0", "0.0"}:
+            return f"实{actual} · {elapsed}ms"
+        return f"实{actual}/缺{missing} · {elapsed}ms"
+
+    def _countdown_text(self, countdowns: object) -> str:
+        if not isinstance(countdowns, dict) or not countdowns:
+            return "-"
+        parts = []
+        for account_id in ACCOUNT_IDS:
+            if account_id in countdowns:
+                parts.append(f"{account_id}:{countdowns[account_id]}s")
+        return " ".join(parts) if parts else "-"
+
+    def _on_hedge_plan_updated(self, payload: object) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        self._advance_plan_account_states()
+        legs = self._leg_by_account(payload)
+        excluded = payload.get("excluded_accounts", {})
+        excluded_accounts = set(excluded.keys()) if isinstance(excluded, dict) else set()
+        click_interval = payload.get("click_interval_ms") or self.click_interval_input.value()
+        confirm_ms = payload.get("confirm_ms") or self.confirm_ms_input.value()
+        round_number = payload.get("round_number") or "-"
+        if hasattr(self, "plan_round_label"):
+            self.plan_round_label.setText(f"计划第 {round_number} 轮")
+        for account_id, labels in self.plan_rows.items():
+            leg = legs.get(account_id)
+            if not leg:
+                if account_id in excluded_accounts:
+                    labels["amount"].setText("剔除")
+                    labels["side"].setText(f"{account_id} · 余额不足剔除")
+                    labels["chips"].setText("本轮不参与")
+                    labels["role"].setText("-")
+                    labels["amount"].setProperty("role", "")
+                    self._refresh_widget_style(labels["amount"])
+                    self._refresh_plan_account_state(account_id)
+                    continue
+                labels["amount"].setText("-")
+                labels["side"].setText(f"{account_id} · 等待计划")
+                labels["chips"].setText("本轮未分配")
+                labels["role"].setText("副" if account_id != self.controller.main_account else "主")
+                labels["amount"].setProperty("role", "main" if account_id == self.controller.main_account else "")
+                self._refresh_widget_style(labels["amount"])
+                self._refresh_plan_account_state(account_id)
+                continue
+            amount = self._format_money_value(leg.get("amount", "-"))
+            raw_side = str(leg.get("side_text") or leg.get("side") or "-")
+            side = SIDE_TEXT_CN.get(raw_side, raw_side)
+            role = str(leg.get("role") or "")
+            chips = leg.get("chips", [])
+            chip_text = "+".join(str(item) for item in chips) if isinstance(chips, list) else str(chips or "-")
+            labels["amount"].setText(amount)
+            labels["side"].setText(f"{account_id} · {'主单方向' if role == 'main' else '副号对冲'} · {side}")
+            labels["chips"].setText(f"筹码 {chip_text} · 点击 {click_interval}ms · 确认 {confirm_ms}ms")
+            labels["role"].setText("主" if role == "main" else "副")
+            labels["amount"].setProperty("role", "main" if role == "main" else "")
+            self._refresh_widget_style(labels["amount"])
+            self._refresh_plan_account_state(account_id)
+
+    def _on_round_results_updated(self, payload: object) -> None:
+        if not isinstance(payload, list):
+            return
+        results = list(payload)
+        self._refresh_turnover_display(results)
+        if not results:
+            return
+        recent = list(reversed(results[-10:]))
+        round_rows: list[list[str]] = []
+        record_rows: list[list[str]] = []
+        total_missing = 0
+        max_round_ms = 0
+        max_click_ms = 0
+        for item in results:
+            try:
+                total_missing += int(getattr(item, "missing_total", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                max_round_ms = max(max_round_ms, int(getattr(item, "elapsed_ms", 0) or 0))
+                max_click_ms = max(max_click_ms, int(getattr(item, "max_elapsed_ms", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+        for item in recent:
+            round_no = f"#{int(getattr(item, 'round_number', 0) or 0):02d}"
+            countdown = self._countdown_text(getattr(item, "send_countdowns", {}))
+            interval = f"{getattr(item, 'click_interval_ms', '-') }ms"
+            elapsed = f"{getattr(item, 'elapsed_ms', '-') }ms"
+            missing = self._format_money_value(getattr(item, "missing_total", 0))
+            status = self._status_text(getattr(item, "status", ""))
+            round_rows.append(
+                [
+                    round_no,
+                    countdown,
+                    interval,
+                    self._round_account_text(item, "a1"),
+                    self._round_account_text(item, "a2"),
+                    self._round_account_text(item, "a3"),
+                    self._round_account_text(item, "a4"),
+                    elapsed,
+                    missing,
+                ]
+            )
+            record_rows.append(
+                [
+                    round_no,
+                    str(getattr(item, "room_label", "") or "-"),
+                    countdown,
+                    interval,
+                    elapsed,
+                    missing,
+                    status,
+                ]
+            )
+        if self.round_table is not None:
+            self._fill_table(self.round_table, round_rows)
+        self._fill_table(self.records_table, record_rows)
+        if "rounds" in self.health_labels:
+            self.health_labels["rounds"].setText(str(len(results)))
+        if "missing" in self.health_labels:
+            self.health_labels["missing"].setText(str(total_missing))
+        if "max_round_ms" in self.health_labels:
+            self.health_labels["max_round_ms"].setText(f"{max_round_ms}ms" if max_round_ms else "-")
+        if "max_click_ms" in self.health_labels:
+            self.health_labels["max_click_ms"].setText(f"{max_click_ms}ms" if max_click_ms else "-")
 
     def _append_log(self, message: str) -> None:
         self._ui_logs.append(message)
         if len(self._ui_logs) > 200:
             self._ui_logs = self._ui_logs[-200:]
-        self.log_view.setPlainText("\n".join(self._ui_logs))
-        self.log_view.moveCursor(self.log_view.textCursor().MoveOperation.End)
+        if hasattr(self, "log_view"):
+            self.log_view.setPlainText("\n".join(self._ui_logs))
+            self.log_view.moveCursor(self.log_view.textCursor().MoveOperation.End)
 
     def _on_error_banner(self, message: object) -> None:
         if isinstance(message, str):
@@ -1071,15 +1661,42 @@ class LightweightDashboard(QMainWindow):
                 background: #e6f1ff;
                 color: #175cd3;
             }
+            QLabel#pill[tone="warn"] {
+                background: #fff4d6;
+                color: #936600;
+            }
             QLabel#countdown {
                 font-size: 28px;
                 font-weight: 700;
                 color: #175cd3;
             }
+            QLabel#countdown[tone="betting"] {
+                color: #138a43;
+            }
             QLabel#amount, QLabel#healthValue {
                 font-size: 20px;
                 font-weight: 700;
                 color: #0f172a;
+            }
+            QLabel#metricTitle {
+                color: #0f172a;
+                font-weight: 700;
+            }
+            QLabel#turnoverValue {
+                color: #175cd3;
+                font-size: 22px;
+                font-weight: 800;
+            }
+            QLabel#profitValue {
+                color: #0f172a;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            QLabel#profitValue[tone="positive"] {
+                color: #1659D8;
+            }
+            QLabel#profitValue[tone="negative"] {
+                color: #D92F2F;
             }
             QLabel#planAmount {
                 background: #eef3f8;
@@ -1089,6 +1706,11 @@ class LightweightDashboard(QMainWindow):
                 font-size: 18px;
                 font-weight: 700;
                 min-height: 44px;
+            }
+            QLabel#planAmount[role="main"] {
+                background: #ead18a;
+                border-color: #c49a2c;
+                color: #3d2b00;
             }
             QLabel#planTitle {
                 color: #0f172a;
@@ -1194,7 +1816,7 @@ class LightweightDashboard(QMainWindow):
                 border-radius: 6px;
             }
             QFrame#summaryCard, QFrame#accountCard, QFrame#gateItem,
-            QFrame#planLine, QFrame#healthBox, QFrame#metricRow,
+            QFrame#turnoverItem, QFrame#pnlRow, QFrame#planLine, QFrame#healthBox, QFrame#metricRow,
             QFrame#batchStrip, QFrame#modeBanner, QFrame#roomSelector {
                 background: #f8fbfe;
                 border: 1px solid #d9e4ee;
