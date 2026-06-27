@@ -204,24 +204,42 @@ class LightweightDashboard(QMainWindow):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(12)
 
-        left = QVBoxLayout()
+        left_col = QWidget()
+        left_col.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        left_col.setMinimumWidth(380)
+        left_col.setMaximumWidth(440)
+        left = QVBoxLayout(left_col)
+        left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(12)
         left.addWidget(self._build_run_control_panel())
+        left.addWidget(self._build_rounds_panel())
+        left.addWidget(self._build_gate_panel())
         left.addWidget(self._build_advanced_panel())
         left.addStretch()
-        layout.addLayout(left, 1)
+        layout.addWidget(left_col)
 
-        center = QVBoxLayout()
+        center_col = QWidget()
+        center_col.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        center_col.setMinimumWidth(470)
+        center = QVBoxLayout(center_col)
+        center.setContentsMargins(0, 0, 0, 0)
         center.setSpacing(12)
         center.addWidget(self._build_account_status_panel())
         center.addWidget(self._build_log_panel())
-        layout.addLayout(center, 2)
+        center.addStretch()
+        layout.addWidget(center_col, 1)
 
-        right = QVBoxLayout()
+        right_col = QWidget()
+        right_col.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        right_col.setMinimumWidth(300)
+        right_col.setMaximumWidth(380)
+        right = QVBoxLayout(right_col)
+        right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(12)
         right.addWidget(self._build_plan_panel())
         right.addWidget(self._build_health_panel())
-        layout.addLayout(right, 1)
+        right.addStretch()
+        layout.addWidget(right_col)
         return page
 
     def _build_records_page(self) -> QWidget:
@@ -268,12 +286,13 @@ class LightweightDashboard(QMainWindow):
         note.setWordWrap(True)
         note.setObjectName("hint")
         body.addWidget(note)
-        room_entry_row = QHBoxLayout()
-        room_entry_row.addWidget(self._build_room_selector(), 1)
-        room_entry_row.addWidget(self._button("副号进房", "", self._on_enter_room))
-        room_entry_row.addWidget(self._button("全部进房", "", self._on_enter_room_all))
-        room_entry_row.addWidget(self._button("释放", "", self._on_release))
-        body.addLayout(room_entry_row)
+        body.addWidget(self._build_room_selector())
+        room_action_row = QHBoxLayout()
+        room_action_row.setSpacing(8)
+        room_action_row.addWidget(self._button("副号进房", "", self._on_enter_room))
+        room_action_row.addWidget(self._button("全部进房", "", self._on_enter_room_all))
+        room_action_row.addWidget(self._button("释放", "", self._on_release))
+        body.addLayout(room_action_row)
         body.addWidget(self._button("启动轻量控制", "success", self._on_start))
         body.addWidget(self._button("暂停", "warn", self.controller.pause_clicked))
         body.addWidget(self._button("急停", "danger", self.controller.stop_clicked))
@@ -327,8 +346,6 @@ class LightweightDashboard(QMainWindow):
         ]:
             content_layout.addWidget(self._metric_row(label, value))
 
-        content_layout.addWidget(self._build_rounds_panel())
-        content_layout.addWidget(self._build_gate_panel())
         wrapper.addWidget(content)
 
         def toggle(checked: bool) -> None:
@@ -341,8 +358,13 @@ class LightweightDashboard(QMainWindow):
 
     def _build_account_status_panel(self) -> QWidget:
         panel, body = self._panel("账号状态", "实时状态")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(8)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
         for index, account_id in enumerate(ACCOUNT_IDS):
             grid.addWidget(self._build_account_card(account_id), index // 2, index % 2)
         body.addLayout(grid)
@@ -350,6 +372,7 @@ class LightweightDashboard(QMainWindow):
 
     def _build_gate_panel(self) -> QWidget:
         panel, body = self._panel("下注流水累计", "")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         header = panel.layout().itemAt(0).layout()
         if header is not None:
             header.addWidget(self._button("重置流水", "", self._on_reset_turnover))
@@ -362,10 +385,15 @@ class LightweightDashboard(QMainWindow):
 
     def _build_rounds_panel(self) -> QWidget:
         panel, body = self._panel("执行轮次", "0/10")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.round_table = self._table(
             ["轮次", "倒计时", "间隔", "a1", "a2", "a3", "a4", "耗时", "缺口"],
             3,
         )
+        self.round_table.setMinimumHeight(108)
+        self.round_table.setMaximumHeight(118)
+        self.round_table.horizontalHeader().setMinimumSectionSize(24)
+        self.round_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body.addWidget(self.round_table)
         self._seed_round_table()
         return panel
@@ -379,19 +407,22 @@ class LightweightDashboard(QMainWindow):
         for account_id in ACCOUNT_IDS:
             row = QFrame()
             row.setObjectName("planLine")
-            layout = QHBoxLayout(row)
-            layout.setContentsMargins(8, 8, 8, 8)
-            layout.setSpacing(10)
-            row.setMinimumHeight(66)
+            row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            layout = QVBoxLayout(row)
+            layout.setContentsMargins(8, 6, 8, 6)
+            layout.setSpacing(4)
+            row.setMinimumHeight(68)
             amount = QLabel("-")
             amount.setObjectName("planAmount")
             amount.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            amount.setFixedWidth(78)
+            amount.setFixedWidth(68)
             side = QLabel(f"{account_id} · 等待")
             side.setObjectName("planTitle")
+            side.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             chips = QLabel("未计算")
             chips.setObjectName("planMeta")
             chips.setWordWrap(True)
+            chips.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             role = self._pill("副", "")
             state = self._pill("正常", "")
             action = self._button(
@@ -399,15 +430,19 @@ class LightweightDashboard(QMainWindow):
                 "",
                 lambda checked=False, account_id=account_id: self._on_plan_state_action(account_id),
             )
-            layout.addWidget(amount)
-            text_box = QVBoxLayout()
-            text_box.setSpacing(3)
-            text_box.addWidget(side)
-            text_box.addWidget(chips)
-            layout.addLayout(text_box, 1)
-            layout.addWidget(state)
-            layout.addWidget(action)
-            layout.addWidget(role)
+            action.setMinimumWidth(72)
+            top_line = QHBoxLayout()
+            top_line.setSpacing(8)
+            top_line.addWidget(amount)
+            top_line.addWidget(side, 1)
+            top_line.addWidget(role)
+            detail_line = QHBoxLayout()
+            detail_line.setSpacing(8)
+            detail_line.addWidget(chips, 1)
+            detail_line.addWidget(state)
+            detail_line.addWidget(action)
+            layout.addLayout(top_line)
+            layout.addLayout(detail_line)
             body.addWidget(row)
             self.plan_rows[account_id] = {
                 "row": row,
@@ -418,10 +453,13 @@ class LightweightDashboard(QMainWindow):
                 "state": state,
                 "action": action,
             }
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        body.addStretch()
         return panel
 
     def _build_health_panel(self) -> QWidget:
         panel, body = self._panel("运行摘要", "正常")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         grid = QGridLayout()
         grid.setSpacing(8)
         for index, (key, value, label) in enumerate([
@@ -431,16 +469,22 @@ class LightweightDashboard(QMainWindow):
             ("max_click_ms", "-", "最慢点击"),
             ("runtime", "00:00:00", "运行时间"),
         ]):
-            grid.addWidget(self._health_box(value, label, key), index // 2, index % 2)
+            grid.addWidget(self._health_box(value, label, key), index // 3, index % 3)
         body.addLayout(grid)
         return panel
 
     def _build_log_panel(self) -> QWidget:
         panel, body = self._panel("单账号盈亏", "启动后统计")
-        for account_id in ACCOUNT_IDS:
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        for index, account_id in enumerate(ACCOUNT_IDS):
             item = self._pnl_item(account_id)
             self._enrich_pnl_item(item, account_id)
-            body.addWidget(item)
+            grid.addWidget(item, index // 2, index % 2)
+        body.addLayout(grid)
         return panel
 
     def _build_platform_summary_card(self, account_id: str) -> QWidget:
@@ -517,9 +561,11 @@ class LightweightDashboard(QMainWindow):
     def _build_account_card(self, account_id: str) -> QWidget:
         card = QFrame()
         card.setObjectName("accountCard")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        card.setMaximumHeight(190)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(9, 7, 9, 7)
+        layout.setSpacing(5)
 
         top = QHBoxLayout()
         badge = self._badge(account_id)
@@ -536,6 +582,8 @@ class LightweightDashboard(QMainWindow):
 
         betting_zone = QLabel("未同步")
         betting_zone.setObjectName("countdown")
+        betting_zone.setMinimumHeight(30)
+        betting_zone.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(betting_zone)
         round_id = QLabel("局号：-")
         balance = QLabel("余额：-")
@@ -543,8 +591,17 @@ class LightweightDashboard(QMainWindow):
         target_room = QLabel("目标：-")
         room_progress = QLabel("进度：-")
         room_progress.setObjectName("hint")
-        for item in (room, round_id, balance, target_room, room_progress):
-            layout.addWidget(item)
+        info_grid = QGridLayout()
+        info_grid.setHorizontalSpacing(8)
+        info_grid.setVerticalSpacing(3)
+        info_grid.addWidget(room, 0, 0)
+        info_grid.addWidget(balance, 0, 1)
+        info_grid.addWidget(round_id, 1, 0, 1, 2)
+        info_grid.addWidget(target_room, 2, 0)
+        info_grid.addWidget(room_progress, 2, 1)
+        info_grid.setColumnStretch(0, 1)
+        info_grid.setColumnStretch(1, 1)
+        layout.addLayout(info_grid)
 
         foot = QHBoxLayout()
         restart = self._button("重启", "", lambda checked=False, account_id=account_id: self._on_account_restart(account_id))
@@ -625,8 +682,8 @@ class LightweightDashboard(QMainWindow):
         panel = QFrame()
         panel.setObjectName("panel")
         outer = QVBoxLayout(panel)
-        outer.setContentsMargins(12, 10, 12, 12)
-        outer.setSpacing(10)
+        outer.setContentsMargins(10, 8, 10, 10)
+        outer.setSpacing(8)
 
         head_row = QFrame()
         head_row.setObjectName("panelHeader")
@@ -644,7 +701,7 @@ class LightweightDashboard(QMainWindow):
         outer.addWidget(head_row)
 
         body = QVBoxLayout()
-        body.setSpacing(8)
+        body.setSpacing(6)
         outer.addLayout(body)
         return panel, body
 
@@ -652,7 +709,7 @@ class LightweightDashboard(QMainWindow):
         button = QPushButton(text)
         button.setProperty("tone", tone)
         button.setEnabled(enabled)
-        button.setMinimumHeight(32)
+        button.setMinimumHeight(30)
         button.clicked.connect(lambda checked=False, label=text: self._button_feedback(label))
         if handler is not None:
             button.clicked.connect(handler)  # type: ignore[arg-type]
@@ -706,9 +763,10 @@ class LightweightDashboard(QMainWindow):
     def _turnover_item(self, account_id: str) -> QWidget:
         item = QFrame()
         item.setObjectName("turnoverItem")
-        layout = QVBoxLayout(item)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
+        item.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QHBoxLayout(item)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
         title = QLabel(account_id)
         title.setObjectName("metricTitle")
         value = QLabel("0")
@@ -716,17 +774,19 @@ class LightweightDashboard(QMainWindow):
         hint = QLabel("实际下注累计")
         hint.setObjectName("hint")
         layout.addWidget(title)
+        layout.addWidget(hint, 1)
         layout.addWidget(value)
-        layout.addWidget(hint)
         self.turnover_labels[account_id] = {"title": title, "value": value}
         return item
 
     def _pnl_item(self, account_id: str) -> QWidget:
         item = QFrame()
         item.setObjectName("pnlRow")
+        item.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        item.setMinimumHeight(112)
         layout = QVBoxLayout(item)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
 
         top = QHBoxLayout()
         name = QLabel(account_id)
@@ -740,7 +800,7 @@ class LightweightDashboard(QMainWindow):
 
         detail = QLabel("初始 -   当前 -")
         detail.setObjectName("hint")
-        layout.addWidget(detail)
+        detail.setVisible(False)
 
         self.pnl_rows[account_id] = {"name": name, "profit": profit, "detail": detail}
         return item
@@ -760,20 +820,25 @@ class LightweightDashboard(QMainWindow):
         deposit.setObjectName("hint")
         withdraw = QLabel("累计提现 0.00")
         withdraw.setObjectName("hint")
-        layout.addWidget(initial)
-        layout.addWidget(current)
-        layout.addWidget(deposit)
-        layout.addWidget(withdraw)
+        metrics = QGridLayout()
+        metrics.setHorizontalSpacing(6)
+        metrics.setVerticalSpacing(2)
+        metrics.addWidget(initial, 0, 0)
+        metrics.addWidget(current, 0, 1)
+        metrics.addWidget(deposit, 1, 0)
+        metrics.addWidget(withdraw, 1, 1)
+        metrics.setColumnStretch(0, 1)
+        metrics.setColumnStretch(1, 1)
+        layout.addLayout(metrics)
 
         adjust_row = QHBoxLayout()
+        adjust_row.setSpacing(5)
         deposit_input = QLineEdit()
         deposit_input.setPlaceholderText("充值金额")
         deposit_btn = self._button("记充值", "", lambda checked=False, account_id=account_id: self._on_add_deposit(account_id))
+        deposit_btn.setMinimumWidth(56)
         adjust_row.addWidget(deposit_input, 1)
         adjust_row.addWidget(deposit_btn)
-        layout.addLayout(adjust_row)
-
-        withdraw_row = QHBoxLayout()
         withdraw_input = QLineEdit()
         withdraw_input.setPlaceholderText("提现金额")
         withdraw_btn = self._button(
@@ -781,9 +846,10 @@ class LightweightDashboard(QMainWindow):
             "",
             lambda checked=False, account_id=account_id: self._on_add_withdraw(account_id),
         )
-        withdraw_row.addWidget(withdraw_input, 1)
-        withdraw_row.addWidget(withdraw_btn)
-        layout.addLayout(withdraw_row)
+        withdraw_btn.setMinimumWidth(56)
+        adjust_row.addWidget(withdraw_input, 1)
+        adjust_row.addWidget(withdraw_btn)
+        layout.addLayout(adjust_row)
 
         row.update(
             {
@@ -802,7 +868,8 @@ class LightweightDashboard(QMainWindow):
         box = QFrame()
         box.setObjectName("healthBox")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(2)
         number = QLabel(value)
         number.setObjectName("healthValue")
         if key:
@@ -891,6 +958,7 @@ class LightweightDashboard(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(page)
         return scroll
 
@@ -902,8 +970,12 @@ class LightweightDashboard(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         table.setAlternatingRowColors(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setFixedHeight(26)
+        table.verticalHeader().setDefaultSectionSize(24)
         table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         table.setMinimumHeight(128)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
         return table
 
     def _seed_round_table(self) -> None:
@@ -1672,7 +1744,7 @@ class LightweightDashboard(QMainWindow):
                 color: #936600;
             }
             QLabel#countdown {
-                font-size: 28px;
+                font-size: 26px;
                 font-weight: 700;
                 color: #175cd3;
             }
@@ -1690,12 +1762,12 @@ class LightweightDashboard(QMainWindow):
             }
             QLabel#turnoverValue {
                 color: #175cd3;
-                font-size: 22px;
+                font-size: 20px;
                 font-weight: 800;
             }
             QLabel#profitValue {
                 color: #0f172a;
-                font-size: 18px;
+                font-size: 16px;
                 font-weight: 800;
             }
             QLabel#profitValue[tone="positive"] {
@@ -1709,9 +1781,9 @@ class LightweightDashboard(QMainWindow):
                 border: 1px solid #e3ebf3;
                 border-radius: 7px;
                 color: #0f172a;
-                font-size: 18px;
+                font-size: 17px;
                 font-weight: 700;
-                min-height: 44px;
+                min-height: 38px;
             }
             QLabel#planAmount[role="main"] {
                 background: #ead18a;
@@ -1730,7 +1802,7 @@ class LightweightDashboard(QMainWindow):
                 background: #eef4fa;
                 border: 1px solid #cbd8e5;
                 border-radius: 7px;
-                padding: 6px 12px;
+                padding: 4px 10px;
                 color: #172033;
                 font-weight: 600;
             }
@@ -1740,8 +1812,8 @@ class LightweightDashboard(QMainWindow):
             QPushButton:pressed {
                 background: #cbd8e5;
                 border-color: #9fb2c5;
-                padding-top: 8px;
-                padding-left: 14px;
+                padding-top: 6px;
+                padding-left: 12px;
             }
             QPushButton:disabled {
                 color: #8a98a8;
@@ -1813,7 +1885,7 @@ class LightweightDashboard(QMainWindow):
                 background: white;
                 border: 1px solid #ccd8e5;
                 border-radius: 6px;
-                min-height: 28px;
+                min-height: 24px;
                 padding: 2px 7px;
             }
             QTextEdit#logView, QTableWidget {
