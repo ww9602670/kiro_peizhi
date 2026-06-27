@@ -1675,16 +1675,58 @@ class LightweightProbeAdapter(BrowserControlAdapter):
             f"countdown_min={min(planned_countdowns) if planned_countdowns else 0} "
             f"planned_accounts={','.join(planned_ids)}"
         )
-        result = await probe.execute_round(
-            planned_accounts,
-            legs,
-            round_id,
-            planned_statuses,
-            int(click_interval_ms),
-            int(confirm_ms),
-            self._output_path,
-            room_index=int(room_index),
-            allow_countdown_window=True,
+        self._emit_event(
+            {
+                "event_type": "execution",
+                "instance_id": "",
+                "payload": {
+                    "phase": "click_start",
+                    "round_number": int(round_number),
+                    "round_id": round_id,
+                    "planned_accounts": list(planned_ids),
+                },
+                "timestamp_ms": probe.now_ms(),
+            }
+        )
+        try:
+            result = await probe.execute_round(
+                planned_accounts,
+                legs,
+                round_id,
+                planned_statuses,
+                int(click_interval_ms),
+                int(confirm_ms),
+                self._output_path,
+                room_index=int(room_index),
+                allow_countdown_window=True,
+            )
+        except Exception:
+            self._emit_event(
+                {
+                    "event_type": "execution",
+                    "instance_id": "",
+                    "payload": {
+                        "phase": "click_error",
+                        "round_number": int(round_number),
+                        "round_id": round_id,
+                        "planned_accounts": list(planned_ids),
+                    },
+                    "timestamp_ms": probe.now_ms(),
+                }
+            )
+            raise
+        self._emit_event(
+            {
+                "event_type": "execution",
+                "instance_id": "",
+                "payload": {
+                    "phase": "click_done",
+                    "round_number": int(round_number),
+                    "round_id": round_id,
+                    "planned_accounts": list(planned_ids),
+                },
+                "timestamp_ms": probe.now_ms(),
+            }
         )
         result_payload = dict(result)
         result_payload["round_number"] = int(round_number)

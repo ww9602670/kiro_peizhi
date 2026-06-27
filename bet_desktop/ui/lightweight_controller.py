@@ -287,8 +287,10 @@ class LightweightController:
         self._plan_account_states: dict[str, str] = {account_id: "normal" for account_id in ACCOUNT_IDS}
         self._room_entry_requested: dict[str, int] = {}
         self._room_entry_details: dict[str, str] = {}
+        self._room_entry_confirmed_accounts: set[str] = set()
         self._auto_reentry_cooldowns_ms: dict[str, int] = {}
         self._auto_reentry_enabled = True
+        self._click_execution_active = False
         self._update_platform_roles()
         self.adapter.refresh_runtime_environment(self.platform_slots)
         self._sync_participation_states_to_adapter()
@@ -945,6 +947,13 @@ class LightweightController:
         if event_type == "round":
             self._handle_round_event(payload)
             return
+        if event_type == "execution":
+            phase = str(payload.get("phase") or "")
+            if phase == "click_start":
+                self._click_execution_active = True
+            elif phase in {"click_done", "click_error"}:
+                self._click_execution_active = False
+            return
         if not instance_id:
             return
         if event_type == "error":
@@ -976,6 +985,7 @@ class LightweightController:
             safe_summary = _safe_summary_from(payload)
             if _payload_game_ready(payload, safe_summary):
                 self._runtime_status[instance_id] = "房间已打开"
+                self._room_entry_confirmed_accounts.add(instance_id)
                 self._room_entry_requested.setdefault(instance_id, self._room_index_from_payload(payload))
                 room_label = _runtime_room_label_from_summary(safe_summary)
                 if room_label:
@@ -1045,8 +1055,44 @@ class LightweightController:
             return room_index
         return max(1, int(self.config.room_index or 1))
 
+    def _current_plan_account_ids(self) -> set[str] | None:
+        planned = self._current_plan.get("planned_accounts")
+        if isinstance(planned, list):
+            return {str(account_id) for account_id in planned if str(account_id) in ACCOUNT_IDS}
+        legs = self._current_plan.get("legs")
+        if isinstance(legs, list):
+            return {
+                str(leg.get("account_id"))
+                for leg in legs
+                if isinstance(leg, dict) and str(leg.get("account_id") or "") in ACCOUNT_IDS
+            }
+        return None
+
+    def _auto_reentry_block_reason(self, account_id: str) -> str:
+        if self._click_execution_active:
+            return "真实点击执行中"
+        state = str(self._plan_account_states.get(account_id) or "normal")
+        if state in {"pending_exclude", "excluded", "pending_restore", "restore_failed"}:
+            return {
+                "pending_exclude": "待剔除",
+                "excluded": "已剔除",
+                "pending_restore": "待恢复",
+                "restore_failed": "恢复失败",
+            }[state]
+        excluded = self._current_plan.get("excluded_accounts", {})
+        if isinstance(excluded, dict) and account_id in excluded:
+            return str(excluded.get(account_id) or "当前计划已排除")
+        planned_ids = self._current_plan_account_ids()
+        if planned_ids is not None and account_id not in planned_ids:
+            return "不在当前计划池"
+        return ""
+
     def _maybe_auto_reenter_room(self, account_id: str, payload: dict[str, Any]) -> None:
         if not self._auto_reentry_enabled:
+            return
+        block_reason = self._auto_reentry_block_reason(account_id)
+        if block_reason:
+            self._room_entry_details[account_id] = f"自动回房跳过：{block_reason}"
             return
         room_index = int(self._room_entry_requested.get(account_id) or self._room_index_from_payload(payload))
         if room_index < 1:
@@ -1056,7 +1102,12 @@ class LightweightController:
             return
         self._auto_reentry_cooldowns_ms[account_id] = current_ms + AUTO_REENTRY_COOLDOWN_MS
         self._room_entry_requested[account_id] = room_index
-        self._append_log(f"自动回房: {account_id} 检测到大厅，重进 {room_index} 房")
+        if account_id in self._room_entry_confirmed_accounts:
+            detail = f"检测到回大厅，自动回 {room_index} 房"
+        else:
+            detail = f"首次大厅自动进 {room_index} 房"
+        self._room_entry_details[account_id] = detail
+        self._append_log(f"自动回房: {account_id} {detail}")
         self.adapter.enter_room([account_id], room_index=room_index)
         self._runtime_status[account_id] = "自动回房中"
 

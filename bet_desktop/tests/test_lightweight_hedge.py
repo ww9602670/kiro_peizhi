@@ -959,6 +959,185 @@ def test_runtime_state_auto_reenters_when_account_returns_to_hall(tmp_path: Path
     assert any("enter_room room_index" in item for item in adapter.commands)
 
 
+def test_runtime_state_auto_enters_first_hall_with_config_room(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+    controller.apply_execution_config({"room_index": 3})
+    adapter._commands.clear()
+
+    controller._handle_runtime_event(
+        "a1",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {
+                "hall_ready": True,
+                "game_ready": False,
+            },
+        },
+    )
+
+    assert adapter.commands == ["enter_room room_index=3 accounts=a1"]
+    summary = next(item for item in controller.account_status if item.account_id == "a1")
+    assert summary.room_entry_detail == "首次大厅自动进 3 房"
+
+
+def test_runtime_auto_reentry_prefers_previous_room_and_marks_return_to_hall(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller._handle_runtime_event(
+        "a2",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {
+                "game_ready": True,
+                "room_label": "T003",
+                "room_entry_expected_room_index": 3,
+            },
+        },
+    )
+    adapter._commands.clear()
+    controller.apply_execution_config({"room_index": 1})
+    controller._handle_runtime_event(
+        "a2",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {
+                "hall_ready": True,
+                "game_ready": False,
+                "room_entry_expected_room_index": 1,
+            },
+        },
+    )
+
+    assert adapter.commands == ["enter_room room_index=3 accounts=a2"]
+    summary = next(item for item in controller.account_status if item.account_id == "a2")
+    assert summary.room_entry_detail == "检测到回大厅，自动回 3 房"
+
+
+def test_runtime_auto_reentry_skips_excluded_failed_and_unplanned_accounts(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+    controller._handle_plan_event(
+        {
+            "round_number": 1,
+            "planned_accounts": ["a1", "a2", "a3"],
+            "excluded_accounts": {"a4": "余额不足"},
+            "legs": [
+                {"account_id": "a1"},
+                {"account_id": "a2"},
+                {"account_id": "a3"},
+            ],
+        }
+    )
+    adapter._commands.clear()
+
+    for account_id, state in (("a1", "pending_restore"), ("a2", "excluded"), ("a3", "restore_failed")):
+        controller.set_plan_account_state(account_id, state)
+        controller._handle_runtime_event(
+            account_id,
+            "state",
+            {
+                "timestamp_captured_ms": _now_ms(),
+                "safe_summary": {"hall_ready": True, "game_ready": False},
+            },
+        )
+
+    controller._handle_runtime_event(
+        "a4",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {"hall_ready": True, "game_ready": False},
+        },
+    )
+
+    assert adapter.commands == []
+    details = {item.account_id: item.room_entry_detail for item in controller.account_status}
+    assert details["a1"] == "自动回房跳过：待恢复"
+    assert details["a2"] == "自动回房跳过：已剔除"
+    assert details["a3"] == "自动回房跳过：恢复失败"
+    assert details["a4"] == "自动回房跳过：余额不足"
+
+
+def test_runtime_auto_reentry_skips_accounts_outside_current_plan_pool(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+    controller._handle_plan_event(
+        {
+            "round_number": 1,
+            "planned_accounts": ["a1", "a2", "a3"],
+            "excluded_accounts": {},
+            "legs": [
+                {"account_id": "a1"},
+                {"account_id": "a2"},
+                {"account_id": "a3"},
+            ],
+        }
+    )
+    adapter._commands.clear()
+
+    controller._handle_runtime_event(
+        "a4",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {"hall_ready": True, "game_ready": False},
+        },
+    )
+
+    assert adapter.commands == []
+    summary = next(item for item in controller.account_status if item.account_id == "a4")
+    assert summary.room_entry_detail == "自动回房跳过：不在当前计划池"
+
+
+def test_runtime_auto_reentry_skips_during_click_execution(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+
+    controller._handle_runtime_event("", "execution", {"phase": "click_start"})
+    controller._handle_runtime_event(
+        "a1",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {"hall_ready": True, "game_ready": False},
+        },
+    )
+    assert adapter.commands == []
+    summary = next(item for item in controller.account_status if item.account_id == "a1")
+    assert summary.room_entry_detail == "自动回房跳过：真实点击执行中"
+
+    controller._handle_runtime_event("", "execution", {"phase": "click_done"})
+    controller._handle_runtime_event(
+        "a1",
+        "state",
+        {
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {"hall_ready": True, "game_ready": False},
+        },
+    )
+    assert adapter.commands == ["enter_room room_index=1 accounts=a1"]
+
+
 def test_runtime_room_evidence_overrides_hall_marker(tmp_path: Path) -> None:
     controller = LightweightController(
         config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
@@ -1916,6 +2095,51 @@ def test_probe_round_executes_only_planned_accounts_when_one_is_excluded(tmp_pat
     payload = plan_events[-1]["payload"]
     assert payload["planned_accounts"] == ["a2", "a1", "a3"]
     assert set(payload["send_countdowns"]) == {"a2", "a1", "a3"}
+    execution_events = [event for event in adapter._events if event.get("event_type") == "execution"]
+    assert [event["payload"]["phase"] for event in execution_events] == ["click_start", "click_done"]
+    assert execution_events[0]["payload"]["planned_accounts"] == ["a2", "a1", "a3"]
+
+
+def test_headless_room_retry_respects_twelve_second_cooldown(tmp_path: Path, monkeypatch) -> None:
+    calls: list[tuple[int, str]] = []
+    accounts = {
+        "a1": {
+            "config": {},
+            "runtime": {"mode": "headless", "page": None},
+            "event_queue": [],
+            "state": {},
+        }
+    }
+    statuses = {"a1": {"hall_ready": True, "game_ready": False}}
+
+    async def fake_enter_headless_room(config, runtime, event_queue, room_index, state):
+        calls.append((room_index, runtime["mode"]))
+        return True
+
+    monkeypatch.setattr(probe.cw, "_enter_headless_room", fake_enter_headless_room)
+    monkeypatch.setattr(probe, "append_jsonl", lambda path, payload: None)
+    monkeypatch.setattr(probe, "print_event", lambda payload: None)
+
+    asyncio.run(
+        probe.retry_headless_room_entries(
+            accounts,
+            statuses,
+            tmp_path / "events.jsonl",
+            room_index=2,
+            account_ids=("a1",),
+        )
+    )
+    asyncio.run(
+        probe.retry_headless_room_entries(
+            accounts,
+            statuses,
+            tmp_path / "events.jsonl",
+            room_index=2,
+            account_ids=("a1",),
+        )
+    )
+
+    assert calls == [(2, "headless")]
 
 
 def test_probe_manual_exclude_does_not_block_same_room_gate(tmp_path: Path, monkeypatch) -> None:
