@@ -265,12 +265,14 @@ class LightweightController:
         self._runtime_errors: dict[str, str] = {}
         self._round_results: list[RoundResult] = []
         self._current_plan: dict[str, Any] = {}
+        self._plan_account_states: dict[str, str] = {account_id: "normal" for account_id in ACCOUNT_IDS}
         self._room_entry_requested: dict[str, int] = {}
         self._room_entry_details: dict[str, str] = {}
         self._auto_reentry_cooldowns_ms: dict[str, int] = {}
         self._auto_reentry_enabled = True
         self._update_platform_roles()
         self.adapter.refresh_runtime_environment(self.platform_slots)
+        self._sync_participation_states_to_adapter()
         self._emit_account_status()
 
     def _load_snapshot(self) -> LightweightConfigSnapshot:
@@ -315,6 +317,10 @@ class LightweightController:
     def current_plan(self) -> dict[str, Any]:
         return dict(self._current_plan)
 
+    @property
+    def plan_account_states(self) -> dict[str, str]:
+        return dict(self._plan_account_states)
+
     def _emit_account_status(self) -> None:
         self._emit("account_status_updated", self.account_status)
 
@@ -324,6 +330,9 @@ class LightweightController:
     def _emit_current_plan(self) -> None:
         self._emit("hedge_plan_updated", self.current_plan)
 
+    def _emit_plan_account_states(self) -> None:
+        self._emit("plan_account_states_updated", self.plan_account_states)
+
     def _emit_platform_summary(self) -> None:
         self._emit("platform_summary_updated", self.platform_slots)
 
@@ -332,6 +341,26 @@ class LightweightController:
 
     def _update_platform_roles(self) -> None:
         self.sub_account_ids = resolve_sub_accounts(self.main_account)
+
+    def _sync_participation_states_to_adapter(self) -> None:
+        self.adapter.set_account_participation_states(self._plan_account_states)
+
+    def set_plan_account_state(self, account_id: str, state: str) -> None:
+        if account_id not in ACCOUNT_IDS:
+            return
+        normalized = str(state or "normal").strip() or "normal"
+        self._plan_account_states[account_id] = normalized
+        self._sync_participation_states_to_adapter()
+        self._emit_plan_account_states()
+
+    def set_plan_account_states(self, states: dict[str, str]) -> None:
+        merged = {account_id: "normal" for account_id in ACCOUNT_IDS}
+        for account_id, state in dict(states or {}).items():
+            if account_id in merged:
+                merged[account_id] = str(state or "normal").strip() or "normal"
+        self._plan_account_states = merged
+        self._sync_participation_states_to_adapter()
+        self._emit_plan_account_states()
 
     def _normalize_account_ids(self, account_ids: list[str]) -> list[str]:
         return [account_id for account_id in account_ids if account_id in ACCOUNT_IDS]
@@ -485,6 +514,7 @@ class LightweightController:
             f"启动持续对冲: 主号={self.main_account} 副号={','.join(sub_accounts)} "
             f"金额={self.config.amount_min}-{self.config.amount_max} 间隔={self.config.click_interval_ms}ms"
         )
+        self._sync_participation_states_to_adapter()
         self.adapter.start_hedge(
             account_ids=account_ids,
             main_account=self.main_account,
@@ -692,6 +722,7 @@ class LightweightController:
             f"提交对冲测试: {rounds}轮 主号={self.main_account} 副号={','.join(sub_accounts)} "
             f"间隔={self.config.click_interval_ms}ms"
         )
+        self._sync_participation_states_to_adapter()
         self.adapter.execute_rounds(
             account_ids=account_ids,
             main_account=self.main_account,
@@ -816,8 +847,34 @@ class LightweightController:
             reason=str(payload.get("reason") or ""),
         )
 
+    def _reconcile_plan_account_states(self, payload: dict[str, Any]) -> None:
+        excluded = payload.get("excluded_accounts", {})
+        excluded_reasons = excluded if isinstance(excluded, dict) else {}
+        updated = dict(self._plan_account_states)
+        changed = False
+        for account_id in ACCOUNT_IDS:
+            state = updated.get(account_id, "normal")
+            reason = str(excluded_reasons.get(account_id) or "")
+            next_state = state
+            if state == "pending_exclude" and account_id in excluded_reasons:
+                next_state = "excluded"
+            elif state == "pending_restore":
+                next_state = "restore_failed" if account_id in excluded_reasons else "normal"
+            elif state == "restore_failed" and account_id not in excluded_reasons:
+                next_state = "normal"
+            if reason.startswith("恢复失败"):
+                next_state = "restore_failed"
+            if next_state != state:
+                updated[account_id] = next_state
+                changed = True
+        if changed:
+            self._plan_account_states = updated
+            self._sync_participation_states_to_adapter()
+            self._emit_plan_account_states()
+
     def _handle_plan_event(self, payload: dict[str, Any]) -> None:
         self._current_plan = dict(payload)
+        self._reconcile_plan_account_states(self._current_plan)
         self._emit_current_plan()
         round_number = payload.get("round_number") or "-"
         legs = payload.get("legs", [])

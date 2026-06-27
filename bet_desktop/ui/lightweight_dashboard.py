@@ -76,7 +76,7 @@ class LightweightDashboard(QMainWindow):
         self._profit_tracking_active = True
         self._turnover_reset_index = 0
         self._run_started_at: float | None = None
-        self._plan_account_states: dict[str, str] = {account_id: "normal" for account_id in ACCOUNT_IDS}
+        self._plan_account_states: dict[str, str] = self.controller.plan_account_states
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -943,6 +943,7 @@ class LightweightDashboard(QMainWindow):
         self.controller.on("gate_status_updated", self._on_gate_status)
         self.controller.on("round_results_updated", self._on_round_results_updated)
         self.controller.on("hedge_plan_updated", self._on_hedge_plan_updated)
+        self.controller.on("plan_account_states_updated", self._on_plan_account_states_updated)
 
     def _on_platform_summary_updated(self, payload: object) -> None:
         self._refresh_platform_summary()
@@ -1017,8 +1018,14 @@ class LightweightDashboard(QMainWindow):
             "pending_restore": "excluded",
             "restore_failed": "pending_restore",
         }.get(current, "pending_exclude")
-        self._plan_account_states[account_id] = next_state
-        self._refresh_plan_account_state(account_id)
+        self.controller.set_plan_account_state(account_id, next_state)
+
+    def _on_plan_account_states_updated(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        for account_id in ACCOUNT_IDS:
+            self._plan_account_states[account_id] = str(payload.get(account_id) or "normal")
+            self._refresh_plan_account_state(account_id)
 
     def _advance_plan_account_states(self) -> None:
         for account_id, state in list(self._plan_account_states.items()):
@@ -1472,7 +1479,6 @@ class LightweightDashboard(QMainWindow):
     def _on_hedge_plan_updated(self, payload: object) -> None:
         if not isinstance(payload, dict) or not payload:
             return
-        self._advance_plan_account_states()
         legs = self._leg_by_account(payload)
         excluded = payload.get("excluded_accounts", {})
         excluded_accounts = set(excluded.keys()) if isinstance(excluded, dict) else set()

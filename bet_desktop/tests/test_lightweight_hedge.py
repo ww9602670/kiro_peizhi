@@ -374,7 +374,7 @@ def test_dashboard_turnover_uses_actual_amount_and_reset_only_clear_turnover(tmp
     app.processEvents()
 
 
-def test_dashboard_plan_exclude_restore_buttons_are_ui_only(tmp_path: Path) -> None:
+def test_dashboard_plan_exclude_restore_buttons_update_participation_state(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     controller = LightweightController(
         config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
@@ -384,22 +384,33 @@ def test_dashboard_plan_exclude_restore_buttons_are_ui_only(tmp_path: Path) -> N
 
     dashboard._on_plan_state_action("a1")
     assert dashboard._plan_account_states["a1"] == "pending_exclude"
+    assert controller.plan_account_states["a1"] == "pending_exclude"
     assert dashboard.plan_rows["a1"]["state"].text() == "待剔除"
     assert dashboard.plan_rows["a1"]["action"].text() == "取消剔除"
 
-    dashboard._on_hedge_plan_updated({"round_number": 1, "legs": []})
+    controller._handle_plan_event({"round_number": 1, "legs": [], "excluded_accounts": {"a1": "人工剔除"}})
     assert dashboard._plan_account_states["a1"] == "excluded"
+    assert controller.plan_account_states["a1"] == "excluded"
     assert dashboard.plan_rows["a1"]["state"].text() == "已剔除"
     assert dashboard.plan_rows["a1"]["action"].text() == "下局恢复"
-    assert controller.current_plan == {}
 
     dashboard._on_plan_state_action("a1")
     assert dashboard._plan_account_states["a1"] == "pending_restore"
+    assert controller.plan_account_states["a1"] == "pending_restore"
     assert dashboard.plan_rows["a1"]["state"].text() == "待恢复"
     assert dashboard.plan_rows["a1"]["action"].text() == "取消恢复"
 
-    dashboard._on_hedge_plan_updated({"round_number": 2, "legs": []})
+    controller._handle_plan_event({"round_number": 2, "legs": [], "excluded_accounts": {"a1": "恢复失败：不在房间"}})
+    assert dashboard._plan_account_states["a1"] == "restore_failed"
+    assert controller.plan_account_states["a1"] == "restore_failed"
+    assert dashboard.plan_rows["a1"]["state"].text() == "恢复失败"
+
+    dashboard._on_plan_state_action("a1")
+    assert dashboard._plan_account_states["a1"] == "pending_restore"
+
+    controller._handle_plan_event({"round_number": 3, "legs": [{"account_id": "a1"}], "excluded_accounts": {}})
     assert dashboard._plan_account_states["a1"] == "normal"
+    assert controller.plan_account_states["a1"] == "normal"
     assert dashboard.plan_rows["a1"]["state"].text() == "正常"
     assert dashboard.plan_rows["a1"]["action"].text() == "下局剔除"
 
@@ -1461,6 +1472,175 @@ def test_probe_round_executes_only_planned_accounts_when_one_is_excluded(tmp_pat
     payload = plan_events[-1]["payload"]
     assert payload["planned_accounts"] == ["a2", "a1", "a3"]
     assert set(payload["send_countdowns"]) == {"a2", "a1", "a3"}
+
+
+def test_probe_manual_exclude_does_not_block_same_room_gate(tmp_path: Path, monkeypatch) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    adapter._accounts = {account_id: {"runtime": {}} for account_id in ACCOUNT_IDS}
+    adapter.set_account_participation_states({"a4": "excluded"})
+    statuses = {
+        "a1": _ready_game_status(900),
+        "a2": _ready_game_status(900),
+        "a3": _ready_game_status(900),
+        "a4": {
+            "display_balance_cents": 900 * 100,
+            "balance_cents": 900 * 100,
+            "game_ready": False,
+            "hall_ready": True,
+            "countdown": None,
+            "betting_open": False,
+        },
+    }
+    retried: list[tuple[str, ...]] = []
+
+    async def fake_write_status(accounts, status_path, output):
+        return statuses
+
+    async def fake_retry_room_entries(accounts, current_statuses, output, *, room_index, account_ids=None):
+        retried.append(tuple(account_ids or accounts.keys()))
+
+    monkeypatch.setattr(probe, "write_status", fake_write_status)
+    monkeypatch.setattr(probe, "retry_headless_room_entries", fake_retry_room_entries)
+
+    ready = asyncio.run(
+        adapter._wait_planned_betting_round(
+            account_ids=list(ACCOUNT_IDS),
+            main_account="a2",
+            sub_accounts=("a1", "a3", "a4"),
+            round_number=1,
+            room_index=1,
+            amount_min=84,
+            amount_max=84,
+            main_successor_account="",
+            min_balance_yuan=0,
+            min_countdown=10,
+            last_round="",
+            timeout_seconds=1,
+            allow_countdown_window=True,
+            coordinator_status_refresh_ms=200,
+            coordinator_poll_ms=50,
+        )
+    )
+
+    assert ready is not None
+    _round_id, _round_key, _statuses, plan = ready
+    assert plan["excluded_accounts"] == {"a4": "人工剔除"}
+    assert [leg["account_id"] for leg in plan["legs"]] == ["a2", "a1", "a3"]
+    assert retried
+    assert all("a4" not in account_ids for account_ids in retried)
+
+
+def test_probe_manual_restore_failure_does_not_block_three_account_plan(tmp_path: Path, monkeypatch) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    adapter._accounts = {account_id: {"runtime": {}} for account_id in ACCOUNT_IDS}
+    adapter.set_account_participation_states({"a4": "pending_restore"})
+    statuses = {
+        "a1": _ready_game_status(900),
+        "a2": _ready_game_status(900),
+        "a3": _ready_game_status(900),
+        "a4": {
+            "display_balance_cents": 900 * 100,
+            "balance_cents": 900 * 100,
+            "game_ready": False,
+            "hall_ready": True,
+            "countdown": None,
+            "betting_open": False,
+        },
+    }
+
+    async def fake_write_status(accounts, status_path, output):
+        return statuses
+
+    async def fake_retry_room_entries(accounts, current_statuses, output, *, room_index, account_ids=None):
+        return None
+
+    monkeypatch.setattr(probe, "write_status", fake_write_status)
+    monkeypatch.setattr(probe, "retry_headless_room_entries", fake_retry_room_entries)
+
+    ready = asyncio.run(
+        adapter._wait_planned_betting_round(
+            account_ids=list(ACCOUNT_IDS),
+            main_account="a2",
+            sub_accounts=("a1", "a3", "a4"),
+            round_number=1,
+            room_index=1,
+            amount_min=84,
+            amount_max=84,
+            main_successor_account="",
+            min_balance_yuan=0,
+            min_countdown=10,
+            last_round="",
+            timeout_seconds=1,
+            allow_countdown_window=True,
+            coordinator_status_refresh_ms=200,
+            coordinator_poll_ms=50,
+        )
+    )
+
+    assert ready is not None
+    _round_id, _round_key, _statuses, plan = ready
+    assert plan["excluded_accounts"] == {"a4": "恢复失败：不在房间"}
+    assert [leg["account_id"] for leg in plan["legs"]] == ["a2", "a1", "a3"]
+
+
+def test_probe_manual_restore_rejoins_only_when_status_is_ready(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {account_id: _ready_game_status(1000) for account_id in ACCOUNT_IDS}
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=84,
+        statuses=statuses,
+        manual_account_states={"a4": "pending_restore"},
+    )
+
+    assert plan["ok"] is True
+    assert "a4" in [leg["account_id"] for leg in plan["legs"]]
+    assert plan["excluded_accounts"] == {}
+
+
+def test_probe_manual_restore_unknown_balance_stays_excluded(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {account_id: _ready_game_status(1000) for account_id in ACCOUNT_IDS}
+    statuses["a4"] = dict(statuses["a4"])
+    statuses["a4"].pop("display_balance_cents", None)
+    statuses["a4"].pop("balance_cents", None)
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=84,
+        statuses=statuses,
+        manual_account_states={"a4": "pending_restore"},
+    )
+
+    assert plan["ok"] is True
+    assert plan["excluded_accounts"] == {"a4": "恢复失败：余额未知"}
+    assert [leg["account_id"] for leg in plan["legs"]] == ["a2", "a1", "a3"]
+
+
+def test_probe_less_than_three_manual_participants_stops_with_clear_reason(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {account_id: _ready_game_status(1000) for account_id in ACCOUNT_IDS}
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=84,
+        statuses=statuses,
+        manual_account_states={"a3": "excluded", "a4": "excluded"},
+    )
+
+    assert plan["ok"] is False
+    assert plan["reason"] == "少于 3 个账号，无法对冲"
+    assert plan["excluded_accounts"] == {"a3": "人工剔除", "a4": "人工剔除"}
 
 
 def test_delay_patch_ignores_removed_worker_delay_constants() -> None:

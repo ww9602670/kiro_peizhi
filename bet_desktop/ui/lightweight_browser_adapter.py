@@ -77,6 +77,9 @@ class BrowserControlAdapter:
     def stop_hedge(self) -> tuple[int, str, str]:
         return self.run_command(["stop_hedge"])
 
+    def set_account_participation_states(self, states: dict[str, str]) -> tuple[int, str, str]:
+        return 0, "ok", ""
+
     def refresh_runtime_environment(self, platform_slots) -> None:
         """Allow implementations to sync latest platform slot settings."""
         return None

@@ -30,6 +30,9 @@ DEFAULT_PROFILE_ROOT = DEFAULT_ARTIFACT_ROOT / "profiles"
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "dist" / "BetDesktop" / "live_logs"
 UI_REFERENCE_BETTING_COUNTDOWN_SECONDS = 12
 STABLE_BET_DENOMINATIONS = tuple(probe.DENOMINATIONS)
+MANUAL_EXCLUDE_STATES = {"pending_exclude", "excluded"}
+MANUAL_RESTORE_STATES = {"pending_restore"}
+PLAN_STATE_STALE_MS = 15_000
 
 
 class _MirroringEventQueue:
@@ -96,6 +99,72 @@ def _balance_covers(status: dict[str, Any] | None, amount: int, min_balance_yuan
         return True
     required_cents = max(int(amount), int(min_balance_yuan or 0)) * 100
     return balance >= required_cents
+
+
+def _status_fresh(status: dict[str, Any] | None, *, now_ms: int | None = None) -> bool:
+    if not isinstance(status, dict):
+        return False
+    timestamp_ms = _safe_int(
+        status.get("status_ts_ms")
+        or status.get("timestamp_captured_ms")
+        or status.get("timestamp_ms")
+    )
+    if timestamp_ms is None:
+        return True
+    current_ms = int(now_ms or probe.now_ms())
+    return max(0, current_ms - timestamp_ms) <= PLAN_STATE_STALE_MS
+
+
+def _status_game_ready(status: dict[str, Any] | None) -> bool:
+    return bool(isinstance(status, dict) and status.get("game_ready"))
+
+
+def _status_betting_open(status: dict[str, Any] | None) -> bool:
+    if not isinstance(status, dict):
+        return False
+    for key in (
+        "display_betting_open",
+        "betting_open",
+        "runtime_betting_open",
+        "runtime_is_can_betting",
+        "frontend_runtime_is_can_betting",
+    ):
+        value = status.get(key)
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "open", "can_bet", "betting"}:
+            return True
+    return False
+
+
+def _status_room_key(status: dict[str, Any] | None) -> str:
+    if not isinstance(status, dict):
+        return ""
+    return _first_text(
+        status.get("display_room_label"),
+        status.get("room_label"),
+        status.get("locked_room_label"),
+        status.get("runtime_room_label"),
+        status.get("frontend_room_label"),
+        status.get("room_id"),
+        status.get("locked_room_id"),
+    )
+
+
+def _status_round_key(status: dict[str, Any] | None) -> str:
+    if not isinstance(status, dict):
+        return ""
+    return _public_game_no(
+        _first_text(
+            status.get("display_game_no"),
+            status.get("game_no"),
+            status.get("round_id"),
+            status.get("batch_id"),
+            status.get("frontend_batch_id"),
+            status.get("runtime_memory_game_no"),
+        )
+    )
 
 
 def _first_text(*values: Any) -> str:
@@ -397,12 +466,29 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         self._hedge_kwargs: dict[str, Any] = {}
         self._hedge_paused = False
         self._hedge_stop_requested = False
+        self._participation_lock = threading.Lock()
+        self._participation_states: dict[str, str] = {}
         self._output_path = self.log_root / f"lightweight_ui_probe_{probe.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
         self._event_log_path = self.log_root / f"lightweight_ui_probe_events_{probe.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
         self._status_path = self.log_root / "lightweight_ui_probe.status.txt"
 
     def refresh_runtime_environment(self, platform_slots) -> None:
         self._platform_slots = {slot.account_id: slot for slot in platform_slots}
+
+    def set_account_participation_states(self, states: dict[str, str]) -> tuple[int, str, str]:
+        clean: dict[str, str] = {}
+        for account_id, state in dict(states or {}).items():
+            account_text = str(account_id or "").strip()
+            state_text = str(state or "normal").strip()
+            if account_text and state_text != "normal":
+                clean[account_text] = state_text
+        with self._participation_lock:
+            self._participation_states = clean
+        return 0, "ok", ""
+
+    def _participation_states_snapshot(self) -> dict[str, str]:
+        with self._participation_lock:
+            return dict(self._participation_states)
 
     def _emit_event(self, event: dict[str, Any]) -> None:
         with self._events_lock:
@@ -792,6 +878,80 @@ class LightweightProbeAdapter(BrowserControlAdapter):
             self._room_entry_targets.pop(account_id, None)
             self._append_probe_log(f"閲婃斁鏃犲ご: {account_id}", account_id=account_id)
 
+    def _restore_failure_reason(
+        self,
+        account_id: str,
+        status: dict[str, Any] | None,
+        reference_statuses: list[dict[str, Any]],
+        *,
+        min_balance_yuan: int,
+    ) -> str:
+        if not isinstance(status, dict):
+            return "状态缺失"
+        if not _status_fresh(status):
+            return "状态过期"
+        if not _status_game_ready(status):
+            return "不在房间"
+        if _status_balance_cents(status) is None:
+            return "余额未知"
+        if not _balance_covers(status, 0, int(min_balance_yuan)):
+            return "余额不足"
+        if not _status_betting_open(status):
+            return "等待可下注"
+
+        reference_rooms = {_status_room_key(item) for item in reference_statuses if _status_room_key(item)}
+        own_room = _status_room_key(status)
+        if reference_rooms and own_room not in reference_rooms:
+            return "房间不一致"
+
+        reference_rounds = {_status_round_key(item) for item in reference_statuses if _status_round_key(item)}
+        own_round = _status_round_key(status)
+        if reference_rounds and own_round not in reference_rounds:
+            return "局号不一致"
+
+        return ""
+
+    def _participation_pool(
+        self,
+        account_pool: list[str],
+        status_map: dict[str, dict[str, Any]],
+        manual_states: dict[str, str],
+        *,
+        min_balance_yuan: int,
+    ) -> tuple[list[str], dict[str, str]]:
+        excluded: dict[str, str] = {}
+        active_pool: list[str] = []
+        pending_restore: list[str] = []
+        for account_id in account_pool:
+            state = str(manual_states.get(account_id, "normal") or "normal")
+            if state in MANUAL_EXCLUDE_STATES:
+                excluded[account_id] = "人工剔除"
+            elif state in MANUAL_RESTORE_STATES:
+                pending_restore.append(account_id)
+            elif state == "restore_failed":
+                excluded[account_id] = "恢复失败"
+            else:
+                active_pool.append(account_id)
+
+        reference_statuses = [
+            status_map.get(account_id) or {}
+            for account_id in active_pool
+            if isinstance(status_map.get(account_id), dict)
+        ]
+        for account_id in pending_restore:
+            reason = self._restore_failure_reason(
+                account_id,
+                status_map.get(account_id),
+                reference_statuses,
+                min_balance_yuan=int(min_balance_yuan),
+            )
+            if reason:
+                excluded[account_id] = f"恢复失败：{reason}"
+            else:
+                active_pool.append(account_id)
+                reference_statuses.append(status_map.get(account_id) or {})
+        return active_pool, excluded
+
     def _build_plan(
         self,
         round_number: int,
@@ -803,6 +963,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         statuses: dict[str, dict[str, Any]] | None = None,
         main_successor_account: str = "",
         min_balance_yuan: int = 0,
+        manual_account_states: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         low = min(int(amount_min), int(amount_max))
         high = max(int(amount_min), int(amount_max))
@@ -824,15 +985,33 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         ordered_amounts = (*valid_amounts[offset:], *valid_amounts[:offset])
         account_pool = list(dict.fromkeys([main_account, *sub_accounts]))
         status_map = statuses or {}
+        manual_states = (
+            dict(manual_account_states)
+            if manual_account_states is not None
+            else self._participation_states_snapshot()
+        )
+        active_pool, base_excluded = self._participation_pool(
+            account_pool,
+            status_map,
+            manual_states,
+            min_balance_yuan=int(min_balance_yuan),
+        )
+        if len(active_pool) < 3:
+            return {
+                "ok": False,
+                "reason": "少于 3 个账号，无法对冲",
+                "legs": [],
+                "excluded_accounts": base_excluded,
+            }
         successor = str(main_successor_account or "").strip()
 
         for amount in ordered_amounts:
             main_side = "banker" if round_number % 2 else "player"
             sub_side = "player" if main_side == "banker" else "banker"
-            excluded: dict[str, str] = {}
+            excluded: dict[str, str] = dict(base_excluded)
             main_candidates = [
                 account_id
-                for account_id in account_pool
+                for account_id in active_pool
                 if _balance_covers(status_map.get(account_id), int(amount), int(min_balance_yuan))
             ]
             if not main_candidates:
@@ -840,7 +1019,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
             if main_account in main_candidates:
                 effective_main = main_account
             else:
-                if main_account in account_pool:
+                if main_account in active_pool:
                     excluded[main_account] = "余额不足"
                 if successor and successor in main_candidates:
                     effective_main = successor
@@ -852,7 +1031,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
 
             sub_pool = [
                 account_id
-                for account_id in account_pool
+                for account_id in active_pool
                 if account_id != effective_main and account_id not in excluded
             ]
             while True:
@@ -910,15 +1089,15 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                     excluded[account_id] = "余额不足"
                 sub_pool = [account_id for account_id in sub_pool if account_id not in insufficient]
 
+        final_excluded = dict(base_excluded)
+        for account_id in active_pool:
+            if not _balance_covers(status_map.get(account_id), low, int(min_balance_yuan)):
+                final_excluded[account_id] = "余额不足"
         return {
             "ok": False,
             "reason": "可用余额不足，无法组成1主2副",
             "legs": [],
-            "excluded_accounts": {
-                account_id: "余额不足"
-                for account_id in account_pool
-                if not _balance_covers(status_map.get(account_id), low, int(min_balance_yuan))
-            },
+            "excluded_accounts": final_excluded,
         }
 
     async def _wait_planned_betting_round(
@@ -967,7 +1146,12 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                     for leg in list(last_plan.get("legs", []))
                     if isinstance(leg, dict) and str(leg.get("account_id") or "") in self._accounts
                 )
-                retry_ids = planned_ids or tuple(account_id for account_id in account_ids if account_id in self._accounts)
+                excluded_ids = set((last_plan.get("excluded_accounts") or {}).keys())
+                retry_ids = planned_ids or tuple(
+                    account_id
+                    for account_id in account_ids
+                    if account_id in self._accounts and account_id not in excluded_ids
+                )
                 if retry_ids:
                     await probe.retry_headless_room_entries(
                         self._accounts,
