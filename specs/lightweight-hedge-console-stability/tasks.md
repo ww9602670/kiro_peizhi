@@ -736,13 +736,13 @@ V5 目标排版为：
 
 ### 任务
 
-- [ ] T11.1 采样单套 UI 空闲状态的 CPU、内存、浏览器进程数。
-- [ ] T11.2 采样单套 UI 4 账号进房后的 CPU、内存、浏览器进程数。
-- [ ] T11.3 采样单套 UI 启动下注控制后的 CPU、内存、浏览器进程数。
-- [ ] T11.4 分别记录 Python、Chromium、系统总量。
-- [ ] T11.5 按 CPU、内存、浏览器数量给出容量估算。
-- [ ] T11.6 使用最保守数值作为建议同时运行套数。
-- [ ] T11.7 确认没有新增常驻资源监测线程、定时器或主界面资源曲线。
+- [x] T11.1 采样单套 UI 空闲状态的 CPU、内存、浏览器进程数。
+- [x] T11.2 采样单套 UI 4 账号进房后的 CPU、内存、浏览器进程数。按阶段 11 硬约束，本项未由 agent 自动登录/进房，已在报告中标记为“未采集：最终人工 exe 测试时采集”。
+- [x] T11.3 采样单套 UI 启动下注控制后的 CPU、内存、浏览器进程数。按阶段 11 硬约束，本项未由 agent 自动启动下注控制，已在报告中标记为“未采集：最终人工 exe 测试时采集”。
+- [x] T11.4 分别记录 Python、Chromium、系统总量。
+- [x] T11.5 按 CPU、内存、浏览器数量给出容量估算。
+- [x] T11.6 使用最保守数值作为建议同时运行套数。
+- [x] T11.7 确认没有新增常驻资源监测线程、定时器或主界面资源曲线。
 
 ### 验收
 
@@ -750,6 +750,31 @@ V5 目标排版为：
 - 明确说明估算条件。
 - 明确说明瓶颈是 CPU、内存、网络还是浏览器实例。
 - 资源报告只在人工触发或验收时生成。
+
+### 阶段 11 完成记录
+
+- 完成时间：2026-06-27 11:56:07。
+- 变更文件：
+  - `scripts/lightweight_resource_diagnostics.py`
+  - `bet_desktop/tests/test_lightweight_resource_diagnostics.py`
+  - `artifacts/resource-diagnostics/stage11_resource_diagnostics_20260627_115607.md`
+  - `specs/lightweight-hedge-console-stability/stage-11-resource-diagnostics-task.md`
+  - `specs/lightweight-hedge-console-stability/tasks.md`
+- 最新 exe 相关源码复查结论：已有部分历史资源日志和监视脚本，但没有阶段 11 合规的一次性资源诊断工具；最新 exe 仍为 `dist/LightweightHedgeConsole/LightweightHedgeConsole.exe`，入口仍为 `LightweightHedgeConsole.spec` 指向 `bet_desktop\ui\run_lightweight_dashboard.py`。
+- 是否触碰保护链路：否。未修改余额、局号、状态机、倒计时、房间号、限红、坐标、下注前检查、真实点击执行器、接管、进房或下注控制逻辑。
+- 自动采样项：系统总内存/可用内存、系统 CPU、Python/PyInstaller/`LightweightHedgeConsole.exe` 进程、Chrome/Chromium 进程、空闲 exe smoke 资源。
+- 人工保留采样项：4 账号登录后资源、4 账号进房后资源、启动轻量控制后资源、真实平台页面长时间运行资源、真实下注闭环资源，均标记为“未采集：最终人工 exe 测试时采集”。
+- 资源报告路径：`artifacts/resource-diagnostics/stage11_resource_diagnostics_20260627_115607.md`。
+- 容量估算结论：空闲 smoke 合计约 315.9 MB，未启动浏览器；最终建议套数无法估算，临时建议套数为 23，必须等待最终人工 exe 测试补采 4 账号登录/进房/下注控制后的数据。
+- 自动测试：
+  - `python -m py_compile scripts\lightweight_resource_diagnostics.py bet_desktop\tests\test_lightweight_resource_diagnostics.py`
+  - `python -m pytest bet_desktop\tests\test_lightweight_resource_diagnostics.py -q`
+  - `python scripts\lightweight_resource_diagnostics.py --launch-smoke --duration 16 --interval 2`
+  - `python -m pytest bet_desktop\tests\test_lightweight_hedge.py -q`
+- 未验证项：未登录真实账号，未进房，未启动轻量下注控制，未执行真实下注。
+- 风险结论：只新增一次性命令行诊断和报告文件，不新增常驻监控、后台定时器、主界面资源曲线或资源刷新配置。
+- commit hash：提交后以最终回复为准。
+- 下一步：阶段 12 最终审核。
 
 ## 20. 阶段 12：最终审核
 
