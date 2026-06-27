@@ -654,6 +654,8 @@ V5 目标排版为：
 
 ### 任务
 
+说明：T9.1-T9.10 是最终打包 exe 后的人类现场验收清单。本次阶段 9 执行只完成源码准入复核、验收清单落盘和测试记录，不替代人工真实下注观察。
+
 - [ ] T9.1 启动新 UI。
 - [ ] T9.2 读取 4 个账号配置。
 - [ ] T9.3 打开登录页并填写登录信息。
@@ -672,6 +674,21 @@ V5 目标排版为：
 - 有头主号也能参与计划。
 - 真实点击耗时能显示。
 - 缺口能解释原因。
+
+### 阶段 9 完成记录
+
+- 完成时间：2026-06-27
+- 变更文件：
+  - `specs/lightweight-hedge-console-stability/stage-09-live-bet-readiness-task.md`
+  - `specs/lightweight-hedge-console-stability/tasks.md`
+- 最新 exe 相关源码复查结论：已有能力，任务改为准入验收记录；`LightweightHedgeConsole.spec` 仍指向 `bet_desktop\ui\run_lightweight_dashboard.py`，入口仍创建 `LightweightController(adapter=LightweightProbeAdapter())` 并加载 `LightweightDashboard`，adapter 仍绑定 `scripts.live_interval_acceptance_probe`。
+- 已复核 exe 路径：`dist/LightweightHedgeConsole/LightweightHedgeConsole.exe` 与 `release-candidates/LightweightHedgeConsole_20260626_three_account_gate_fix/LightweightHedgeConsole/LightweightHedgeConsole.exe`，修改时间均为 2026-06-26 16:19:01。
+- 是否触碰保护链路：否。未修改坐标、预检、真实点击执行器、状态采集、余额、局号、倒计时、房间号、限红或打包 spec。
+- 自动测试：`python -m pytest bet_desktop\tests\test_lightweight_hedge.py -q`，结果 83 passed。
+- 人工验证：未执行真实下注，未启动自动真实下注测试；T9.1-T9.10 保留为最终打包 exe 后的人类现场验收清单。
+- 未验证项：真实平台登录、真实房间页面动作、真实余额变化、真实局号变化、真实点击结果，以及最终打包 exe 与当前源码一致性。
+- 风险结论：当前代码具备进入人工真实下注前验收的条件；真实下注必须由人使用最终打包 exe 按阶段 9 清单逐项确认后执行。
+- 下一步：进入阶段 10 打包 exe 前，继续保持不修改核心下注链路；打包后交由人工执行阶段 9 现场验收清单。
 
 ## 18. 阶段 10：打包 exe
 
