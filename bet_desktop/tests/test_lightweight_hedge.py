@@ -1178,6 +1178,13 @@ def _ready_game_status(yuan: int) -> dict[str, object]:
     }
 
 
+def _ready_game_status_for_round(yuan: int, round_id: str, timestamp_ms: int = 1_000_000) -> dict[str, object]:
+    status = _ready_game_status(yuan)
+    status["game_no"] = round_id
+    status["status_ts_ms"] = timestamp_ms
+    return status
+
+
 def _ready_game_status_with_limit(yuan: int, limit_label: str = "4-250") -> dict[str, object]:
     status = _ready_game_status(yuan)
     status["limit_label"] = limit_label
@@ -1515,6 +1522,179 @@ def test_probe_plan_excludes_main_outside_existing_single_account_limit(tmp_path
     assert plan["effective_main_account"] == "a1"
     assert plan["excluded_accounts"] == {"a2": "超出限红"}
     assert [leg["account_id"] for leg in plan["legs"]] == ["a1", "a3", "a4"]
+
+
+def test_round_staleness_marks_account_without_new_refresh_actions(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    first_seen_ms = 1_000_000
+    adapter._annotate_round_staleness(
+        {
+            account_id: _ready_game_status_for_round(900, "50-1-2-9999", first_seen_ms)
+            for account_id in ACCOUNT_IDS
+        },
+        ACCOUNT_IDS,
+        now_ms=first_seen_ms,
+    )
+    statuses = {
+        "a1": _ready_game_status_for_round(900, "50-1-2-9999", first_seen_ms + 16_000),
+        "a2": _ready_game_status_for_round(900, "50-1-3-1001", first_seen_ms + 16_000),
+        "a3": _ready_game_status_for_round(900, "50-1-3-1002", first_seen_ms + 16_000),
+        "a4": _ready_game_status_for_round(900, "50-1-3-1003", first_seen_ms + 16_000),
+    }
+
+    annotated = adapter._annotate_round_staleness(statuses, ACCOUNT_IDS, now_ms=first_seen_ms + 16_000)
+
+    assert annotated["a1"]["round_stale"] is True
+    assert annotated["a1"]["round_stale_reason"] == "局号停更"
+    assert "round_sources" in annotated["a1"]
+    assert not any(annotated[account_id].get("round_stale") for account_id in ("a2", "a3", "a4"))
+
+
+def test_round_stale_account_is_excluded_and_three_accounts_continue(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {
+        "a1": _ready_game_status_for_round(900, "50-1-2-9999"),
+        "a2": _ready_game_status_for_round(900, "50-1-3-1001"),
+        "a3": _ready_game_status_for_round(900, "50-1-3-1002"),
+        "a4": _ready_game_status_for_round(900, "50-1-3-1003"),
+    }
+    statuses["a1"]["round_stale"] = True
+    statuses["a1"]["round_stale_reason"] = "局号停更"
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=84,
+        statuses=statuses,
+    )
+
+    assert plan["ok"] is True
+    assert plan["excluded_accounts"] == {"a1": "局号停更"}
+    assert [leg["account_id"] for leg in plan["legs"]] == ["a2", "a3", "a4"]
+
+
+def test_round_stale_accounts_below_three_keep_existing_stop_reason(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {
+        "a1": _ready_game_status_for_round(900, "50-1-2-9999"),
+        "a2": _ready_game_status_for_round(900, "50-1-3-1001"),
+        "a3": _ready_game_status_for_round(900, "50-1-2-9998"),
+        "a4": _ready_game_status_for_round(900, "50-1-3-1003"),
+    }
+    for account_id in ("a1", "a3"):
+        statuses[account_id]["round_stale"] = True
+        statuses[account_id]["round_stale_reason"] = "局号停更"
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=84,
+        statuses=statuses,
+    )
+
+    assert plan["ok"] is False
+    assert plan["reason"] == "少于 3 个账号，无法对冲"
+    assert plan["excluded_accounts"] == {"a1": "局号停更", "a3": "局号停更"}
+
+
+def test_round_stale_status_displays_reason_without_overall_data_stale(tmp_path: Path) -> None:
+    adapter = FakeBrowserControlAdapter()
+    controller = LightweightController(adapter=adapter)
+    status = _ready_game_status_for_round(900, "50-1-2-9999", _now_ms())
+    status["round_stale"] = True
+    status["round_stale_reason"] = "局号停更"
+    status["round_stale_age_ms"] = 16_000
+
+    event = status_to_state_event("a1", status)
+    controller._handle_runtime_event("a1", "state", event["payload"])
+    summary = next(item for item in controller.account_status if item.account_id == "a1")
+
+    assert summary.state_label == "局号停更"
+    assert summary.state_machine_label == "局号停更 16秒"
+    assert summary.betting_open is False
+    assert summary.stale is False
+
+
+def test_wait_round_excludes_stale_account_and_records_round_diagnostics(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    adapter._accounts = {account_id: {"config": {}, "runtime": {}} for account_id in ACCOUNT_IDS}
+    statuses = {
+        "a1": _ready_game_status_for_round(900, "50-1-2-9999"),
+        "a2": _ready_game_status_for_round(900, "50-1-3-1001"),
+        "a3": _ready_game_status_for_round(900, "50-1-3-1002"),
+        "a4": _ready_game_status_for_round(900, "50-1-3-1003"),
+    }
+    statuses["a1"]["round_stale"] = True
+    statuses["a1"]["round_stale_reason"] = "局号停更"
+    retry_calls: list[tuple[str, ...]] = []
+    jsonl_events: list[dict[str, object]] = []
+
+    async def fake_write_status(accounts, status_path, output_path):
+        return {account_id: dict(status) for account_id, status in statuses.items()}
+
+    async def fake_retry_room_entries(accounts, current_statuses, output, *, room_index, account_ids=None):
+        retry_calls.append(tuple(account_ids or ()))
+        return {}
+
+    monkeypatch.setattr(probe, "write_status", fake_write_status)
+    monkeypatch.setattr(probe, "retry_headless_room_entries", fake_retry_room_entries)
+    monkeypatch.setattr(probe, "append_jsonl", lambda path, payload: jsonl_events.append(payload))
+
+    ready = asyncio.run(
+        adapter._wait_planned_betting_round(
+            account_ids=list(ACCOUNT_IDS),
+            main_account="a2",
+            sub_accounts=("a1", "a3", "a4"),
+            round_number=1,
+            room_index=1,
+            amount_min=84,
+            amount_max=84,
+            main_successor_account="",
+            min_balance_yuan=0,
+            min_countdown=0,
+            last_round="50-1-2",
+            timeout_seconds=2,
+            allow_countdown_window=True,
+            coordinator_status_refresh_ms=200,
+            coordinator_poll_ms=50,
+        )
+    )
+
+    assert ready is not None
+    _round_id, round_key, _statuses, plan = ready
+    assert round_key == "50-1-3"
+    assert plan["excluded_accounts"] == {"a1": "局号停更"}
+    assert all("a1" not in call for call in retry_calls)
+    presend = next(item for item in jsonl_events if item.get("event") == "coordinator_presend_check")
+    assert presend["round_diagnostics"]["a1"]["round_stale"] is True
+    assert presend["round_diagnostics"]["a1"]["reason"] == "局号停更"
+
+
+def test_coordinator_round_match_ignores_account_suffixes() -> None:
+    accounts = {account_id: {} for account_id in ("a1", "a2", "a3")}
+    statuses = {
+        "a1": _ready_game_status_for_round(900, "50-1782380930-8541930580-1280"),
+        "a2": _ready_game_status_for_round(900, "50-1782380930-8541930580-11248"),
+        "a3": _ready_game_status_for_round(900, "50-1782380930-8541930580-2"),
+    }
+
+    decision = probe.coordinator_readiness(
+        accounts,
+        statuses,
+        min_countdown=0,
+        room_index=1,
+        allow_countdown_window=True,
+    )
+
+    assert decision["ok"] is True
+    assert decision["round_key"] == "50-1782380930-8541930580"
 
 
 def test_probe_wait_gate_ignores_low_balance_account_outside_room(tmp_path: Path, monkeypatch) -> None:

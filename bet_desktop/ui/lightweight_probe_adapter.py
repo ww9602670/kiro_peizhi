@@ -35,6 +35,8 @@ STABLE_BET_DENOMINATIONS = tuple(probe.DENOMINATIONS)
 MANUAL_EXCLUDE_STATES = {"pending_exclude", "excluded"}
 MANUAL_RESTORE_STATES = {"pending_restore"}
 PLAN_STATE_STALE_MS = 15_000
+ROUND_STALE_MS = PLAN_STATE_STALE_MS
+ROUND_STALE_REASON = "\u5c40\u53f7\u505c\u66f4"
 LIMIT_LABEL_KEYS = (
     "limit_label",
     "runtime_limit_label",
@@ -263,6 +265,44 @@ def _status_round_key(status: dict[str, Any] | None) -> str:
     )
 
 
+def _status_timestamp_ms(status: dict[str, Any] | None) -> int | None:
+    if not isinstance(status, dict):
+        return None
+    return _safe_int(
+        status.get("status_ts_ms")
+        or status.get("timestamp_captured_ms")
+        or status.get("timestamp_ms")
+    )
+
+
+def _status_round_stale(status: dict[str, Any] | None) -> bool:
+    return bool(isinstance(status, dict) and status.get("round_stale"))
+
+
+def _round_source_summary(status: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(status, dict):
+        return {}
+    keys = (
+        "display_game_no",
+        "game_no",
+        "snapshot_game_no",
+        "guard_game_no",
+        "canvas_game_no",
+        "round_id",
+        "batch_id",
+        "frontend_batch_id",
+        "runtime_memory_game_no",
+        "game_no_source",
+        "display_source",
+    )
+    summary: dict[str, str] = {}
+    for key in keys:
+        value = str(status.get(key) or "").strip()
+        if value and value.lower() not in {"none", "null", "-"}:
+            summary[key] = value
+    return summary
+
+
 def _first_text(*values: Any) -> str:
     for value in values:
         text = str(value or "").strip()
@@ -431,6 +471,8 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
             display_betting_open = bool(by_action)
     else:
         display_betting_open = bool(display_betting_open)
+    if _status_round_stale(status):
+        display_betting_open = False
     display_room_label = _first_text(
         status.get("display_room_label"),
         status.get("locked_room_label"),
@@ -453,7 +495,9 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         status.get("guard_phase"),
     )
     if not display_phase:
-        if display_betting_open:
+        if _status_round_stale(status):
+            display_phase = ROUND_STALE_REASON
+        elif display_betting_open:
             display_phase = "betting_open"
         elif bool(status.get("game_ready")):
             display_phase = "game_ready"
@@ -527,6 +571,11 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         "display_balance_cents": display_balance_cents,
         "display_betting_open": display_betting_open,
         "runtime_coordinates": display_coordinates,
+        "round_stale": bool(status.get("round_stale")),
+        "round_stale_reason": str(status.get("round_stale_reason") or ""),
+        "round_last_changed_ms": status.get("round_last_changed_ms"),
+        "round_stale_age_ms": status.get("round_stale_age_ms"),
+        "round_sources": status.get("round_sources") if isinstance(status.get("round_sources"), dict) else {},
     }
     payload = {
         "game_ready": bool(status.get("game_ready")),
@@ -539,6 +588,10 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         "safe_summary": safe_summary,
         "timestamp_captured_ms": status_ts_ms,
         "probe_status": dict(status),
+        "round_stale": bool(status.get("round_stale")),
+        "round_stale_reason": str(status.get("round_stale_reason") or ""),
+        "round_last_changed_ms": status.get("round_last_changed_ms"),
+        "round_stale_age_ms": status.get("round_stale_age_ms"),
     }
     return {
         "event_type": "state",
@@ -582,6 +635,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         self._hedge_stop_requested = False
         self._participation_lock = threading.Lock()
         self._participation_states: dict[str, str] = {}
+        self._round_freshness: dict[str, dict[str, Any]] = {}
         self._output_path = self.log_root / f"lightweight_ui_probe_{probe.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
         self._event_log_path = self.log_root / f"lightweight_ui_probe_events_{probe.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
         self._status_path = self.log_root / "lightweight_ui_probe.status.txt"
@@ -603,6 +657,98 @@ class LightweightProbeAdapter(BrowserControlAdapter):
     def _participation_states_snapshot(self) -> dict[str, str]:
         with self._participation_lock:
             return dict(self._participation_states)
+
+    def _annotate_round_staleness(
+        self,
+        statuses: dict[str, dict[str, Any]],
+        account_ids: list[str] | tuple[str, ...],
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        current_ms = int(now_ms or probe.now_ms())
+        annotated = {
+            account_id: dict(status)
+            for account_id, status in dict(statuses or {}).items()
+            if isinstance(status, dict)
+        }
+        scoped_ids = [account_id for account_id in account_ids if account_id in annotated]
+
+        for account_id in scoped_ids:
+            status = annotated.get(account_id) or {}
+            round_key = _status_round_key(status)
+            if not round_key:
+                self._round_freshness.pop(account_id, None)
+                continue
+            record = self._round_freshness.get(account_id)
+            if not record or str(record.get("round_key") or "") != round_key:
+                record = {
+                    "round_key": round_key,
+                    "changed_at_ms": current_ms,
+                    "sources": _round_source_summary(status),
+                }
+                self._round_freshness[account_id] = record
+            else:
+                record["sources"] = _round_source_summary(status)
+            status["round_last_changed_ms"] = int(record.get("changed_at_ms") or current_ms)
+            status["round_stale_age_ms"] = max(0, current_ms - int(record.get("changed_at_ms") or current_ms))
+            status["round_sources"] = dict(record.get("sources") or {})
+
+        ready_rounds: dict[str, str] = {}
+        for account_id in scoped_ids:
+            status = annotated.get(account_id) or {}
+            round_key = _status_round_key(status)
+            if round_key and _status_game_ready(status) and _status_fresh(status, now_ms=current_ms):
+                ready_rounds[account_id] = round_key
+
+        for account_id, own_round in ready_rounds.items():
+            record = self._round_freshness.get(account_id) or {}
+            own_changed_at = int(record.get("changed_at_ms") or current_ms)
+            stale_age_ms = max(0, current_ms - own_changed_at)
+            if stale_age_ms <= ROUND_STALE_MS:
+                continue
+            newer_round_counts: dict[str, int] = {}
+            newer_accounts: list[str] = []
+            for other_id, other_round in ready_rounds.items():
+                if other_id == account_id or other_round == own_round:
+                    continue
+                other_record = self._round_freshness.get(other_id) or {}
+                if int(other_record.get("changed_at_ms") or 0) <= own_changed_at:
+                    continue
+                newer_round_counts[other_round] = newer_round_counts.get(other_round, 0) + 1
+                newer_accounts.append(other_id)
+            if not any(count >= 2 for count in newer_round_counts.values()):
+                continue
+            status = annotated[account_id]
+            status["round_stale"] = True
+            status["round_stale_reason"] = ROUND_STALE_REASON
+            status["round_stale_age_ms"] = stale_age_ms
+            status["round_stale_peer_accounts"] = newer_accounts
+        return annotated
+
+    def _round_diagnostics(
+        self,
+        statuses: dict[str, dict[str, Any]],
+        account_ids: list[str] | tuple[str, ...],
+    ) -> dict[str, dict[str, Any]]:
+        now_ms = probe.now_ms()
+        diagnostics: dict[str, dict[str, Any]] = {}
+        for account_id in account_ids:
+            status = statuses.get(account_id) or {}
+            if not isinstance(status, dict):
+                continue
+            timestamp_ms = _status_timestamp_ms(status)
+            diagnostics[account_id] = {
+                "room": _status_room_key(status),
+                "round": _status_round_key(status),
+                "game_ready": bool(status.get("game_ready")),
+                "betting_open": _status_betting_open(status),
+                "status_age_ms": max(0, now_ms - timestamp_ms) if timestamp_ms is not None else None,
+                "round_stale": bool(status.get("round_stale")),
+                "reason": str(status.get("round_stale_reason") or ""),
+                "round_age_ms": status.get("round_stale_age_ms"),
+                "round_sources": status.get("round_sources") if isinstance(status.get("round_sources"), dict) else {},
+            }
+        return diagnostics
 
     def _emit_event(self, event: dict[str, Any]) -> None:
         with self._events_lock:
@@ -1004,6 +1150,8 @@ class LightweightProbeAdapter(BrowserControlAdapter):
             return "状态缺失"
         if not _status_fresh(status):
             return "状态过期"
+        if _status_round_stale(status):
+            return ROUND_STALE_REASON
         if not _status_game_ready(status):
             return "不在房间"
         if _status_balance_cents(status) is None:
@@ -1044,6 +1192,8 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                 pending_restore.append(account_id)
             elif state == "restore_failed":
                 excluded[account_id] = "恢复失败"
+            elif _status_round_stale(status_map.get(account_id)):
+                excluded[account_id] = ROUND_STALE_REASON
             else:
                 active_pool.append(account_id)
 
@@ -1098,7 +1248,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         offset = (int(round_number) - 1) % len(valid_amounts)
         ordered_amounts = (*valid_amounts[offset:], *valid_amounts[:offset])
         account_pool = list(dict.fromkeys([main_account, *sub_accounts]))
-        status_map = statuses or {}
+        status_map = self._annotate_round_staleness(statuses or {}, account_pool)
         manual_states = (
             dict(manual_account_states)
             if manual_account_states is not None
@@ -1269,6 +1419,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
             current = time.time()
             if current >= next_refresh_at or not last_statuses:
                 last_statuses = await probe.write_status(self._accounts, self._status_path, self._output_path)
+                last_statuses = self._annotate_round_staleness(last_statuses, account_ids)
                 last_plan = self._build_plan(
                     round_number,
                     main_account=main_account,
@@ -1337,10 +1488,12 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                         "decision": decision,
                         "planned_accounts": list(planned_ids),
                         "excluded_accounts": last_plan.get("excluded_accounts", {}),
+                        "round_diagnostics": self._round_diagnostics(last_statuses, account_ids),
                         "timestamp_ms": probe.now_ms(),
                     },
                 )
                 final_statuses = await probe.write_status(self._accounts, self._status_path, self._output_path)
+                final_statuses = self._annotate_round_staleness(final_statuses, account_ids)
                 final_plan = self._build_plan(
                     round_number,
                     main_account=main_account,
@@ -1378,6 +1531,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                             account_id: probe.compact_status(status, room_index=int(room_index))
                             for account_id, status in final_statuses.items()
                         },
+                        "round_diagnostics": self._round_diagnostics(final_statuses, account_ids),
                         "timestamp_ms": probe.now_ms(),
                     },
                 )
@@ -1679,6 +1833,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
             try:
                 if self._accounts:
                     statuses = await probe.collect_statuses(self._accounts)
+                    statuses = self._annotate_round_staleness(statuses, tuple(statuses.keys()))
                     for account_id, status in statuses.items():
                         self._emit_event(status_to_state_event(account_id, status))
                     for account_id, status in list(statuses.items()):

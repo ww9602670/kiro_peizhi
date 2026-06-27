@@ -74,6 +74,7 @@ def _truthy(value: Any) -> bool:
     return text in {"1", "true", "yes", "open", "can_bet", "betting"}
 
 
+ROUND_STALE_LABEL = "\u5c40\u53f7\u505c\u66f4"
 STATE_STALE_MS = 15_000
 AUTO_REENTRY_COOLDOWN_MS = 30_000
 
@@ -234,6 +235,24 @@ def _state_machine_label(safe_summary: dict[str, Any], *, betting_open: bool, st
     if load_type:
         parts.append(f"装载{load_type}")
     return " · ".join(parts) if parts else "等待状态"
+
+
+def _snapshot_round_stale(snapshot: dict[str, Any], safe_summary: dict[str, Any]) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    probe_status = snapshot.get("probe_status")
+    return bool(
+        snapshot.get("round_stale")
+        or safe_summary.get("round_stale")
+        or (isinstance(probe_status, dict) and probe_status.get("round_stale"))
+    )
+
+
+def _round_stale_age_ms(snapshot: dict[str, Any], safe_summary: dict[str, Any]) -> int | None:
+    value = snapshot.get("round_stale_age_ms") or safe_summary.get("round_stale_age_ms")
+    if value is None and isinstance(snapshot.get("probe_status"), dict):
+        value = snapshot["probe_status"].get("round_stale_age_ms")
+    return _as_int(value)
 
 
 class LightweightController:
@@ -410,6 +429,7 @@ class LightweightController:
             updated_at_ms = _snapshot_timestamp_ms(snapshot) if snapshot else current_ms
             age_ms = max(0, current_ms - updated_at_ms) if snapshot else 0
             stale = bool(snapshot and age_ms > STATE_STALE_MS)
+            round_stale = bool(snapshot and _snapshot_round_stale(snapshot, safe_summary) and not stale)
             raw_betting_open = _truthy(
                 safe_summary.get("runtime_betting_open")
                 if "runtime_betting_open" in safe_summary
@@ -420,13 +440,21 @@ class LightweightController:
                 and countdown is not None
                 and countdown <= 0
             )
-            betting_open = (not stale) and raw_betting_open and not countdown_expired
+            betting_open = (not stale) and (not round_stale) and raw_betting_open and not countdown_expired
             phase_label = _phase_label_from_summary(safe_summary)
             state_machine_label = _state_machine_label(safe_summary, betting_open=betting_open, stale=stale, age_ms=age_ms)
+            if round_stale:
+                round_age_ms = _round_stale_age_ms(snapshot, safe_summary)
+                if round_age_ms is not None:
+                    state_machine_label = f"{ROUND_STALE_LABEL} {max(1, int(round_age_ms / 1000))}秒"
+                else:
+                    state_machine_label = ROUND_STALE_LABEL
             state_label = runtime_status if runtime_status != "待命" else account_mode
             if snapshot:
                 if stale:
                     state_label = "数据过期"
+                elif round_stale:
+                    state_label = ROUND_STALE_LABEL
                 elif _payload_hall_without_game(snapshot, safe_summary):
                     state_label = "大厅"
                 elif betting_open:
