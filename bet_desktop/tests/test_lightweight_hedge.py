@@ -16,7 +16,7 @@ from bet_desktop.ui.lightweight_cluster_adapter import LightweightClusterAdapter
 from bet_desktop.ui.lightweight_controller import _payload_hall_without_game, LightweightController, _now_ms
 from bet_desktop.ui.lightweight_dashboard import LightweightDashboard
 from bet_desktop.ui.lightweight_models import ACCOUNT_IDS, PlatformSlot, parse_proxy_bundle_lines, resolve_sub_accounts
-from bet_desktop.ui.lightweight_probe_adapter import LightweightProbeAdapter, status_to_state_event
+from bet_desktop.ui.lightweight_probe_adapter import LightweightProbeAdapter, _stable_chip_sequence, status_to_state_event
 
 
 def test_lightweight_config_round_trip_and_legacy_adapter(tmp_path: Path) -> None:
@@ -1178,6 +1178,12 @@ def _ready_game_status(yuan: int) -> dict[str, object]:
     }
 
 
+def _ready_game_status_with_limit(yuan: int, limit_label: str = "4-250") -> dict[str, object]:
+    status = _ready_game_status(yuan)
+    status["limit_label"] = limit_label
+    return status
+
+
 def test_probe_plan_uses_configured_amount_and_chinese_side(tmp_path: Path) -> None:
     adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
     statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
@@ -1276,6 +1282,12 @@ def test_probe_plan_supports_four_yuan_chip_sequences(tmp_path: Path) -> None:
     adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
     statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
 
+    for amount in (4, 8, 14, 24, 44, 84):
+        chips = _stable_chip_sequence(amount)
+        assert sum(chips) == amount
+        assert 4 in chips or amount != 4
+        assert len(chips) <= 5
+
     plan = adapter._build_plan(
         1,
         main_account="a2",
@@ -1292,12 +1304,31 @@ def test_probe_plan_supports_four_yuan_chip_sequences(tmp_path: Path) -> None:
     assert sum(int(leg["amount"]) for leg in plan["legs"] if leg["role"] == "sub") == 84
 
 
+def test_probe_plan_skips_undecomposable_amounts_before_execution(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=83,
+        amount_max=84,
+        statuses=statuses,
+    )
+
+    assert plan["ok"] is True
+    assert plan["amount"] == 84
+    assert all(sum(leg["chips"]) == leg["amount"] for leg in plan["legs"])
+
+
 def test_probe_plan_sub_amounts_are_irregular_but_clickable(tmp_path: Path) -> None:
     adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
     statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
     seen: set[tuple[int, ...]] = set()
+    seen_by_account: dict[str, set[int]] = {"a1": set(), "a3": set(), "a4": set()}
 
-    for round_number in range(1, 7):
+    for round_number in range(1, 21):
         plan = adapter._build_plan(
             round_number,
             main_account="a2",
@@ -1313,16 +1344,43 @@ def test_probe_plan_sub_amounts_are_irregular_but_clickable(tmp_path: Path) -> N
         assert len(set(amounts)) > 1
         assert max(amounts) - min(amounts) >= 30
         assert all(len(leg["chips"]) <= 5 for leg in sub_legs)
+        for leg in sub_legs:
+            seen_by_account[str(leg["account_id"])].add(int(leg["amount"]))
 
     assert len(seen) >= 3
+    assert all(len(values) >= 2 for values in seen_by_account.values())
+
+
+def test_probe_plan_twenty_round_sub_amounts_are_irregular_in_four_account_mode(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
+    seen_by_account: dict[str, set[int]] = {"a1": set(), "a3": set(), "a4": set()}
+
+    for round_number in range(1, 21):
+        plan = adapter._build_plan(
+            round_number,
+            main_account="a2",
+            sub_accounts=("a1", "a3", "a4"),
+            amount_min=140,
+            amount_max=140,
+            statuses=statuses,
+        )
+        assert plan["ok"] is True
+        for leg in [item for item in plan["legs"] if item["role"] == "sub"]:
+            seen_by_account[str(leg["account_id"])].add(int(leg["amount"]))
+            assert sum(leg["chips"]) == leg["amount"]
+            assert len(leg["chips"]) <= 5
+
+    assert all(len(values) >= 2 for values in seen_by_account.values())
 
 
 def test_probe_plan_three_account_sub_amounts_are_irregular(tmp_path: Path) -> None:
     adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
     statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
     seen: set[tuple[int, ...]] = set()
+    seen_by_account: dict[str, set[int]] = {"a1": set(), "a3": set()}
 
-    for round_number in range(1, 7):
+    for round_number in range(1, 21):
         plan = adapter._build_plan(
             round_number,
             main_account="a2",
@@ -1337,8 +1395,126 @@ def test_probe_plan_three_account_sub_amounts_are_irregular(tmp_path: Path) -> N
         assert sum(amounts) == 140
         assert max(amounts) - min(amounts) >= 50
         assert all(len(leg["chips"]) <= 5 for leg in sub_legs)
+        for leg in sub_legs:
+            seen_by_account[str(leg["account_id"])].add(int(leg["amount"]))
 
     assert len(seen) >= 3
+    assert all(len(values) >= 2 for values in seen_by_account.values())
+
+
+def test_probe_plan_twenty_round_sub_amounts_are_irregular_in_three_account_mode(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
+    seen_by_account: dict[str, set[int]] = {"a1": set(), "a3": set()}
+
+    for round_number in range(1, 21):
+        plan = adapter._build_plan(
+            round_number,
+            main_account="a2",
+            sub_accounts=("a1", "a3"),
+            amount_min=140,
+            amount_max=140,
+            statuses=statuses,
+        )
+        assert plan["ok"] is True
+        for leg in [item for item in plan["legs"] if item["role"] == "sub"]:
+            seen_by_account[str(leg["account_id"])].add(int(leg["amount"]))
+            assert sum(leg["chips"]) == leg["amount"]
+            assert len(leg["chips"]) <= 5
+
+    assert all(len(values) >= 2 for values in seen_by_account.values())
+
+
+def test_probe_plan_uses_updated_amount_range_immediately(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=104,
+        amount_max=104,
+        statuses=statuses,
+    )
+
+    assert plan["ok"] is True
+    assert plan["amount"] == 104
+    assert next(leg for leg in plan["legs"] if leg["role"] == "main")["amount"] == 104
+
+
+def test_probe_plan_respects_single_account_amount_range_and_room_limit(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {
+        "a1": _ready_game_status_with_limit(1000, "4-84"),
+        "a2": _ready_game_status_with_limit(1000, "4-84"),
+        "a3": _ready_game_status_with_limit(1000, "4-84"),
+        "a4": _ready_game_status_with_limit(1000, "4-84"),
+    }
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=100,
+        statuses=statuses,
+    )
+
+    assert plan["ok"] is True
+    assert plan["amount"] == 84
+    assert all(4 <= int(leg["amount"]) <= 84 for leg in plan["legs"])
+    assert all(sum(leg["chips"]) == leg["amount"] for leg in plan["legs"])
+
+
+def test_probe_plan_respects_room_limit_after_low_balance_exclusion(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {
+        "a1": _ready_game_status_with_limit(1000, "4-84"),
+        "a2": _ready_game_status_with_limit(1000, "4-84"),
+        "a3": _ready_game_status_with_limit(1000, "4-84"),
+        "a4": _ready_game_status_with_limit(40, "4-84"),
+    }
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=100,
+        statuses=statuses,
+        min_balance_yuan=80,
+    )
+
+    assert plan["ok"] is True
+    assert plan["excluded_accounts"] == {"a4": "余额不足"}
+    assert [leg["account_id"] for leg in plan["legs"]] == ["a2", "a1", "a3"]
+    assert all(4 <= int(leg["amount"]) <= 84 for leg in plan["legs"])
+    assert all(len(leg["chips"]) <= 5 for leg in plan["legs"])
+
+
+def test_probe_plan_excludes_main_outside_existing_single_account_limit(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    statuses = {
+        "a1": _ready_game_status_with_limit(1000, "4-100"),
+        "a2": _ready_game_status_with_limit(1000, "4-80"),
+        "a3": _ready_game_status_with_limit(1000, "4-100"),
+        "a4": _ready_game_status_with_limit(1000, "4-100"),
+    }
+
+    plan = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=84,
+        amount_max=84,
+        statuses=statuses,
+    )
+
+    assert plan["ok"] is True
+    assert plan["effective_main_account"] == "a1"
+    assert plan["excluded_accounts"] == {"a2": "超出限红"}
+    assert [leg["account_id"] for leg in plan["legs"]] == ["a1", "a3", "a4"]
 
 
 def test_probe_wait_gate_ignores_low_balance_account_outside_room(tmp_path: Path, monkeypatch) -> None:

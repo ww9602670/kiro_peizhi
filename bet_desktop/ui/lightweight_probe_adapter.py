@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
 import sys
 import threading
 import time
@@ -33,6 +35,15 @@ STABLE_BET_DENOMINATIONS = tuple(probe.DENOMINATIONS)
 MANUAL_EXCLUDE_STATES = {"pending_exclude", "excluded"}
 MANUAL_RESTORE_STATES = {"pending_restore"}
 PLAN_STATE_STALE_MS = 15_000
+LIMIT_LABEL_KEYS = (
+    "limit_label",
+    "runtime_limit_label",
+    "frontend_limit_label",
+    "canvas_limit_label",
+    "label_limit_label",
+    "table_limit_label",
+    "runtime_table_limit",
+)
 
 
 class _MirroringEventQueue:
@@ -99,6 +110,91 @@ def _balance_covers(status: dict[str, Any] | None, amount: int, min_balance_yuan
         return True
     required_cents = max(int(amount), int(min_balance_yuan or 0)) * 100
     return balance >= required_cents
+
+
+def _positive_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        text = str(value).replace(",", "").strip()
+        if not text:
+            return None
+        parsed = float(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _parse_limit_label(value: Any) -> tuple[int, int] | None:
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[-_/~]\s*(\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    low = _positive_number(match.group(1))
+    high = _positive_number(match.group(2))
+    if low is None or high is None or high < low:
+        return None
+    return math.ceil(low), math.floor(high)
+
+
+def _status_limit_sources(status: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(status, dict):
+        return []
+    sources = [status]
+    for key in ("safe_summary", "summary", "runtime_frame", "display_summary"):
+        value = status.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+    return sources
+
+
+def _status_amount_bounds(status: dict[str, Any] | None) -> tuple[int, int] | None:
+    for source in _status_limit_sources(status):
+        for low_key, high_key in (
+            ("user_min_bet_cents", "user_max_bet_cents"),
+            ("runtime_user_min_bet_cents", "runtime_user_max_bet_cents"),
+            ("frontend_user_min_bet_cents", "frontend_user_max_bet_cents"),
+        ):
+            low_cents = _safe_int(source.get(low_key))
+            high_cents = _safe_int(source.get(high_key))
+            if low_cents is not None and high_cents is not None and high_cents >= low_cents > 0:
+                return ((low_cents + 99) // 100, high_cents // 100)
+
+        for low_key, high_key in (
+            ("table_min", "table_max"),
+            ("user_min_bet", "user_max_bet"),
+            ("min_bet", "max_bet"),
+        ):
+            low = _positive_number(source.get(low_key))
+            high = _positive_number(source.get(high_key))
+            if low is not None and high is not None and high >= low:
+                return (math.ceil(low), math.floor(high))
+
+        for key in LIMIT_LABEL_KEYS:
+            parsed = _parse_limit_label(source.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _status_amount_allowed(status: dict[str, Any] | None, amount: int) -> bool:
+    bounds = _status_amount_bounds(status)
+    if bounds is None:
+        return True
+    low, high = bounds
+    return low <= int(amount) <= high
+
+
+def _status_reject_reason(status: dict[str, Any] | None, amount: int, min_balance_yuan: int) -> str:
+    if not _balance_covers(status, amount, min_balance_yuan):
+        return "余额不足"
+    if not _status_amount_allowed(status, amount):
+        return "超出限红"
+    return ""
 
 
 def _status_fresh(status: dict[str, Any] | None, *, now_ms: int | None = None) -> bool:
@@ -210,13 +306,29 @@ def _stable_chip_sequence(amount: int) -> list[int]:
     return probe.decompose_value(int(amount), STABLE_BET_DENOMINATIONS, max_steps=5)
 
 
-def _split_stable_sub_amounts(amount: int, count: int, *, seed: int = 0) -> tuple[int, ...]:
+def _amount_matches_bounds(amount: int, bounds: tuple[int, int] | None) -> bool:
+    if bounds is None:
+        return True
+    low, high = bounds
+    return int(low) <= int(amount) <= int(high)
+
+
+def _split_stable_sub_amounts(
+    amount: int,
+    count: int,
+    *,
+    seed: int = 0,
+    amount_bounds: tuple[tuple[int, int] | None, ...] | None = None,
+) -> tuple[int, ...]:
     total = int(amount)
     slots = int(count)
     if slots <= 0:
         raise ValueError("sub account count must be positive")
     if total < slots * 4:
         raise ValueError(f"cannot split amount {total} into {slots} stable sub amounts")
+    bounds = tuple(amount_bounds or ())
+    if bounds and len(bounds) != slots:
+        raise ValueError("sub account bounds must match sub account count")
 
     candidates: list[tuple[int, int, float, tuple[int, ...]]] = []
 
@@ -228,6 +340,8 @@ def _split_stable_sub_amounts(amount: int, count: int, *, seed: int = 0) -> tupl
             except Exception:
                 return
             values = (*prefix, value)
+            if bounds and any(not _amount_matches_bounds(item, bound) for item, bound in zip(values, bounds)):
+                return
             target = total / slots
             spread = max(values) - min(values)
             step_span = max(len(item) for item in chips) - min(len(item) for item in chips)
@@ -1013,6 +1127,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                 account_id
                 for account_id in active_pool
                 if _balance_covers(status_map.get(account_id), int(amount), int(min_balance_yuan))
+                and _status_amount_allowed(status_map.get(account_id), int(amount))
             ]
             if not main_candidates:
                 continue
@@ -1020,7 +1135,11 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                 effective_main = main_account
             else:
                 if main_account in active_pool:
-                    excluded[main_account] = "余额不足"
+                    excluded[main_account] = _status_reject_reason(
+                        status_map.get(main_account),
+                        int(amount),
+                        int(min_balance_yuan),
+                    ) or "不可用"
                 if successor and successor in main_candidates:
                     effective_main = successor
                 else:
@@ -1042,17 +1161,22 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                         int(amount),
                         len(sub_pool),
                         seed=int(round_number) + len(sub_pool) * 17,
+                        amount_bounds=tuple(_status_amount_bounds(status_map.get(account_id)) for account_id in sub_pool),
                     )
                 except Exception:
                     break
-                if sub_amounts:
+                if sub_amounts and not any(_status_amount_bounds(status_map.get(account_id)) for account_id in sub_pool):
                     sub_offset = (int(round_number) - 1) % len(sub_amounts)
                     sub_amounts = (*sub_amounts[sub_offset:], *sub_amounts[:sub_offset])
                 paired = list(zip(sub_pool, sub_amounts))
                 insufficient = [
                     account_id
                     for account_id, sub_amount in paired
-                    if not _balance_covers(status_map.get(account_id), int(sub_amount), int(min_balance_yuan))
+                    if _status_reject_reason(
+                        status_map.get(account_id),
+                        int(sub_amount),
+                        int(min_balance_yuan),
+                    )
                 ]
                 if not insufficient:
                     legs = [
@@ -1086,16 +1210,30 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                         "amount": int(amount),
                     }
                 for account_id in insufficient:
-                    excluded[account_id] = "余额不足"
+                    sub_amount = next(
+                        int(amount)
+                        for paired_account, amount in paired
+                        if paired_account == account_id
+                    )
+                    excluded[account_id] = _status_reject_reason(
+                        status_map.get(account_id),
+                        sub_amount,
+                        int(min_balance_yuan),
+                    ) or "不可用"
                 sub_pool = [account_id for account_id in sub_pool if account_id not in insufficient]
 
         final_excluded = dict(base_excluded)
         for account_id in active_pool:
             if not _balance_covers(status_map.get(account_id), low, int(min_balance_yuan)):
                 final_excluded[account_id] = "余额不足"
+            elif _status_amount_bounds(status_map.get(account_id)) is not None and not any(
+                _status_amount_allowed(status_map.get(account_id), int(amount))
+                for amount in valid_amounts
+            ):
+                final_excluded[account_id] = "超出限红"
         return {
             "ok": False,
-            "reason": "可用余额不足，无法组成1主2副",
+            "reason": "可用余额或限红不足，无法组成1主2副",
             "legs": [],
             "excluded_accounts": final_excluded,
         }
