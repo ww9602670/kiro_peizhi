@@ -696,13 +696,13 @@ V5 目标排版为：
 
 ### 任务
 
-- [ ] T10.1 运行自动测试。
-- [ ] T10.2 启动源码版 UI 做 smoke test。
-- [ ] T10.3 使用 `LightweightHedgeConsole.spec` 打包。
-- [ ] T10.4 启动打包版 exe。
+- [x] T10.1 运行自动测试。
+- [x] T10.2 启动源码版 UI 做 smoke test。
+- [x] T10.3 使用 `LightweightHedgeConsole.spec` 打包。
+- [x] T10.4 启动打包版 exe。
 - [ ] T10.5 验证 exe 能读取配置、打开登录页、进入运行页。
-- [ ] T10.6 记录 exe 输出路径和打包时间。
-- [ ] T10.7 如果打包 exe 与源码运行行为不同，先停止交付，定位差异。
+- [x] T10.6 记录 exe 输出路径和打包时间。
+- [x] T10.7 如果打包 exe 与源码运行行为不同，先停止交付，定位差异。
 
 ### 验收
 
@@ -710,6 +710,25 @@ V5 目标排版为：
 - UI 关闭后，不残留黑色控制台窗口。
 - 浏览器进程随 UI 正确关闭或释放。
 - 交付路径清晰。
+
+### 阶段 10 完成记录
+
+- 完成时间：2026-06-27 11:39:41。
+- 来源 commit：`efdfbe768046ae4cd7a434180679749072cbd795`。
+- 变更文件：
+  - `specs/lightweight-hedge-console-stability/tasks.md`
+  - `specs/lightweight-hedge-console-stability/stage-10-package-exe-task.md`
+- 最新 exe 相关源码复查结论：`LightweightHedgeConsole.spec` 仍指向 `bet_desktop\ui\run_lightweight_dashboard.py`，输出名仍为 `LightweightHedgeConsole`。
+- 是否触碰保护链路：否。未修改余额、局号、状态机、倒计时、房间号、限红、坐标定位、下注前检查或真实点击执行链路。
+- 自动测试：`python -m pytest bet_desktop\tests\test_lightweight_hedge.py -q`，结果 83 passed。
+- 源码版 smoke test：启动 `python bet_desktop\ui\run_lightweight_dashboard.py`，只启动/关闭窗口，未登录、未下注、未启动持续运行，结果通过。
+- 打包命令：`pyinstaller --clean --noconfirm LightweightHedgeConsole.spec`，结果通过。
+- exe 路径：`H:\d\bocai_web\dist\LightweightHedgeConsole\LightweightHedgeConsole.exe`。
+- exe 文件大小：6,630,710 bytes（约 6.32 MB）。
+- exe 生成时间：2026-06-27 11:39:41。
+- exe 版 smoke test：只启动/关闭 `LightweightHedgeConsole.exe`，未登录、未下注、未启动持续运行，结果通过。
+- 未验证项：按本阶段执行硬约束，本次未打开登录页、未登录账号、未进入真实下注闭环；真实平台登录、进房和真实下注仍保留给人工现场验收。
+- 风险结论：目录版 exe 已生成并完成启动关闭验证；保留风险是 PyInstaller frozen 环境下登录页/运行页深层行为仍需人工现场确认。
 
 ## 19. 阶段 11：手动资源诊断和多套运行容量
 
