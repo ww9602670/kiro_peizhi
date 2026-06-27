@@ -952,7 +952,9 @@ class LightweightController:
             self._append_log(f"runtime error [{instance_id}]: {message}")
             self._runtime_status[instance_id] = "异常"
             self._runtime_errors[instance_id] = str(message)
-            if "enter room" in str(message).lower() or "进房" in str(message):
+            if any(token in str(message).lower() for token in ("enter room", "handoff")) or any(
+                token in str(message) for token in ("进房", "接管")
+            ):
                 self._room_entry_details[instance_id] = f"失败：{message}"
             return
         if event_type == "round":

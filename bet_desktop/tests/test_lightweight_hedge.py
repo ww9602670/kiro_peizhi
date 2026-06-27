@@ -147,6 +147,44 @@ def test_dashboard_open_login_syncs_current_form_fields(tmp_path: Path) -> None:
     app.processEvents()
 
 
+def test_dashboard_open_login_syncs_all_account_proxy_bundles_independently(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=adapter,
+    )
+    dashboard = LightweightDashboard(controller=controller)
+
+    proxy_lines = {
+        "a1": "117.68.75.161|8571|px1|pwd1|2026-07-11",
+        "a2": "117.68.75.162|8572|px2|pwd2|2026-07-12",
+        "a3": "117.68.75.163|8573|px3|pwd3|2026-07-13",
+        "a4": "117.68.75.164|8574|px4|pwd4|2026-07-14",
+    }
+    for account_id, line in proxy_lines.items():
+        dashboard.slot_cards[account_id]["login_url"].setText(f"{account_id}.login.example")
+        dashboard.slot_cards[account_id]["account_username"].setText(f"user-{account_id}")
+        dashboard.slot_cards[account_id]["account_password"].setText(f"pass-{account_id}")
+        dashboard.slot_cards[account_id]["proxy_bundle"].setText(line)
+
+    dashboard._on_open_login_pages()
+
+    slots = {slot.account_id: slot for slot in controller.platform_slots}
+    for index, account_id in enumerate(("a1", "a2", "a3", "a4"), start=1):
+        slot = slots[account_id]
+        assert slot.login_url == f"{account_id}.login.example"
+        assert slot.account_username == f"user-{account_id}"
+        assert slot.account_password == f"pass-{account_id}"
+        assert slot.proxy_host == f"117.68.75.16{index}"
+        assert slot.proxy_port == f"857{index}"
+        assert slot.proxy_username == f"px{index}"
+        assert slot.proxy_password == f"pwd{index}"
+    assert adapter.commands[-1] == "open_login_pages accounts=a1,a2,a3,a4"
+    dashboard.close()
+    app.processEvents()
+
+
 def test_dashboard_start_syncs_current_form_fields(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     adapter = FakeBrowserControlAdapter(max_log_entries=20)
@@ -186,6 +224,38 @@ def test_dashboard_enter_room_uses_selected_room(tmp_path: Path) -> None:
     assert controller.config.room_index == 3
     assert adapter.commands[-1] == "enter_room room_index=3 accounts=a1,a3,a4"
     dashboard.close()
+    app.processEvents()
+
+
+def test_dashboard_saved_room_selection_survives_reopen_and_handoff(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    config_path = tmp_path / "lightweight.json"
+    first_adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    first = LightweightController(
+        config_store=LightweightConfigStore(config_path),
+        adapter=first_adapter,
+    )
+    first_dashboard = LightweightDashboard(controller=first)
+
+    first_dashboard._set_room_index(3, log=False)
+    first_dashboard._on_save_config()
+    first_dashboard.close()
+    app.processEvents()
+
+    second_adapter = FakeBrowserControlAdapter(max_log_entries=20)
+    second = LightweightController(
+        config_store=LightweightConfigStore(config_path),
+        adapter=second_adapter,
+    )
+    second_dashboard = LightweightDashboard(controller=second)
+
+    second_dashboard._on_handoff()
+    second_dashboard._on_enter_room()
+
+    assert second.config.room_index == 3
+    assert second_adapter.commands[-2] == "handoff_to_headless accounts=a1,a3,a4"
+    assert second_adapter.commands[-1] == "enter_room room_index=3 accounts=a1,a3,a4"
+    second_dashboard.close()
     app.processEvents()
 
 
@@ -669,6 +739,24 @@ def test_room_entry_loading_detail_is_cleared_after_room_state(tmp_path: Path) -
 
     assert summary.room_entry_detail.startswith("进房完成")
     assert "visual_loading" not in summary.room_entry_detail
+
+
+def test_account_action_failures_show_clear_text_on_matching_account(tmp_path: Path) -> None:
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=FakeBrowserControlAdapter(max_log_entries=20),
+    )
+
+    controller.handoff_account_clicked("a2")
+    controller._handle_runtime_event("a2", "error", {"message": "无头接管失败: a2 TimeoutError"})
+    controller.enter_room_account_clicked("a3", 2)
+    controller._handle_runtime_event("a3", "error", {"message": "进房失败: a3 TimeoutError"})
+    statuses = {item.account_id: item for item in controller.account_status}
+
+    assert statuses["a2"].room_entry_detail == "失败：无头接管失败: a2 TimeoutError"
+    assert statuses["a3"].room_entry_detail == "失败：进房失败: a3 TimeoutError"
+    assert statuses["a1"].room_entry_detail == ""
+    assert statuses["a4"].room_entry_detail == ""
 
 
 def test_runtime_state_event_updates_account_cards(tmp_path: Path) -> None:
@@ -2066,6 +2154,92 @@ def test_normalize_login_url_adds_https_for_short_domains() -> None:
     assert normalize_login_url("72991.com") == "https://72991.com"
     assert normalize_login_url("https://72991.com") == "https://72991.com"
     assert normalize_login_url("") == ""
+
+
+def test_probe_adapter_open_login_navigates_current_url_not_blank(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "about:blank"
+            self.goto_calls: list[str] = []
+
+        async def goto(self, url: str, **_kwargs) -> None:
+            self.goto_calls.append(url)
+            self.url = url
+
+        async def wait_for_load_state(self, *_args, **_kwargs) -> None:
+            return None
+
+    page = FakePage()
+    launched_configs: list[object] = []
+
+    async def fake_launch_account(_playwright, config, _event_queue):
+        launched_configs.append(config)
+        return {
+            "runtime": {"context": object()},
+            "state": SimpleNamespace(),
+            "event_queue": SimpleNamespace(),
+            "ws_parser": SimpleNamespace(),
+        }
+
+    async def fake_active_page(_context):
+        return page
+
+    async def fake_ensure_playwright():
+        return object()
+
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    adapter.refresh_runtime_environment(
+        [
+            PlatformSlot(
+                account_id="a1",
+                login_url="stage7-login.example",
+                account_username="u1",
+                account_password="p1",
+                proxy_host="127.0.0.1",
+                proxy_port="8080",
+                proxy_username="px1",
+                proxy_password="pwd1",
+                proxy_expire_at="2026-07-11",
+            )
+        ]
+    )
+    monkeypatch.setattr(adapter, "_ensure_playwright", fake_ensure_playwright)
+    monkeypatch.setattr(probe, "launch_account", fake_launch_account)
+    monkeypatch.setattr(probe, "start_state_tasks", lambda _item: None)
+    monkeypatch.setattr(probe.cw, "_active_page", fake_active_page)
+
+    async def run_open_login() -> None:
+        adapter._account_lock = asyncio.Lock()
+        await adapter._open_login_pages(["a1"])
+
+    asyncio.run(run_open_login())
+
+    assert page.goto_calls == ["https://stage7-login.example"]
+    assert page.url != "about:blank"
+    assert getattr(launched_configs[0], "login_url") == ""
+    assert adapter._accounts["a1"]["config"].login_url == "https://stage7-login.example"
+
+
+def test_probe_adapter_enter_room_starts_accounts_in_parallel(tmp_path: Path, monkeypatch) -> None:
+    adapter = LightweightProbeAdapter(profile_root=tmp_path / "profiles", log_root=tmp_path)
+    started: list[str] = []
+    finished: list[str] = []
+    all_started = asyncio.Event()
+
+    async def fake_enter_room_one(account_id: str, room_index: int) -> None:
+        assert room_index == 2
+        started.append(account_id)
+        if len(started) == 3:
+            all_started.set()
+        await all_started.wait()
+        finished.append(account_id)
+
+    monkeypatch.setattr(adapter, "_enter_room_one", fake_enter_room_one)
+
+    asyncio.run(asyncio.wait_for(adapter._enter_room(["a1", "a2", "a3"], 2), timeout=1))
+
+    assert started == ["a1", "a2", "a3"]
+    assert sorted(finished) == ["a1", "a2", "a3"]
 
 
 def test_cluster_adapter_command_order(monkeypatch) -> None:
