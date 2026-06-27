@@ -811,7 +811,27 @@ V5 目标排版为：
 - 未执行项：未打包 exe，未运行真实登录、进房、接管或下注。
 - 下一步：允许进入阶段 13 封版记录；阶段 13 只做最终交付记录，不补改业务代码。
 
-## 21. Agent 分工
+## 21. 阶段 13：最终封版交付
+
+### 阶段 13 完成记录
+
+- 完成时间：2026-06-27 12:16:23 +08:00。
+- 来源 commit：`50ad9d81e5b9acc256cc56dc18ae40dfc658b977`。
+- 变更文件：
+  - `specs/lightweight-hedge-console-stability/stage-13-final-delivery-task.md`（执行前已存在未跟踪，本次纳入版本库）
+  - `specs/lightweight-hedge-console-stability/stage-13-final-delivery-record.md`
+  - `specs/lightweight-hedge-console-stability/tasks.md`
+- 最新 exe 相关源码复查结论：`LightweightHedgeConsole.spec` 仍指向 `bet_desktop\ui\run_lightweight_dashboard.py`，入口仍创建 `LightweightController(adapter=LightweightProbeAdapter())` 并加载 `LightweightDashboard`。
+- 是否触碰保护链路：否。未修改业务代码，未修改下注、坐标、余额、局号、状态机、倒计时/可下注、房间、限红、preflight 或真实点击链路。
+- 自动测试：`python -m pytest bet_desktop\tests\test_lightweight_hedge.py bet_desktop\tests\test_lightweight_resource_diagnostics.py -q`，结果 `86 passed in 29.16s`。
+- 打包命令：`pyinstaller --clean --noconfirm LightweightHedgeConsole.spec`，结果通过，退出码 `0`。
+- exe 检查：`H:\d\bocai_web\dist\LightweightHedgeConsole\LightweightHedgeConsole.exe` 存在，大小 `6,630,747 bytes`，生成时间 `2026-06-27 12:15:31`。
+- smoke 结果：非登录启动/关闭通过；未登录、未打开真实账号登录页、未进房、未接管、未下注；关闭后 `LightweightHedgeConsole.exe` 残留进程数为 `0`。
+- 人工验证：未执行真实平台人工测试，保留给人工使用最终 exe 验证。
+- 未验证项：真实登录、真实进房、真实接管、真实余额/局号/可下注变化、真实点击下注结果、真实资源采样。
+- 风险结论：阶段 13 仅完成最终记录、重新打包和非登录 smoke；允许交付人工最终测试。若人工发现真实流程阻塞，回到对应阶段做最小修复。
+
+## 22. Agent 分工
 
 ### gpt-5.5 审核 Agent
 
@@ -863,7 +883,7 @@ V5 目标排版为：
 5. 若阶段 N 完成，则自动进入阶段 N+1 审核流程。
 6. 阶段 13 完成后打包 exe，并把 exe 路径交给人类测试。
 
-## 22. 推荐提交顺序
+## 23. 推荐提交顺序
 
 建议按以下提交拆分：
 
@@ -879,7 +899,7 @@ V5 目标排版为：
 
 每个提交都必须可单独回退。
 
-## 23. 当前未立即执行项
+## 24. 当前未立即执行项
 
 以下事项在本任务文档生成时只编排，不直接修改代码：
 
