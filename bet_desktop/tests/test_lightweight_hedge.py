@@ -596,7 +596,8 @@ def test_probe_status_to_state_event_prefers_display_fields_and_runtime_action()
         "a2",
         {
             "hall_ready": True,
-            "game_ready": False,
+            "game_ready": True,
+            "scene": "BjlGameSceneView",
             "game_no": "legacy-game-no",
             "display_game_no": "50-1782342022-8540540455-1253",
             "display_room_label": "T001",
@@ -624,6 +625,40 @@ def test_probe_status_to_state_event_prefers_display_fields_and_runtime_action()
     assert safe_summary["display_betting_open"] is True
     assert safe_summary["runtime_coordinates"] == {"bet_regions": [1, 2]}
     assert safe_summary["runtime_phase"] == "betting_open"
+
+
+def test_probe_status_to_state_event_clears_hall_short_round_and_action_countdown() -> None:
+    event = status_to_state_event(
+        "a2",
+        {
+            "hall_ready": True,
+            "game_ready": False,
+            "hall_idle": True,
+            "scene": "BjlGameRoomHallSceneView",
+            "display_game_no": "8552596238",
+            "game_no": "8552596238",
+            "display_room_label": "T002",
+            "room_label": "T002",
+            "display_betting_open": True,
+            "runtime_action": "3",
+            "countdown": 12,
+            "display_balance_cents": 10682,
+            "status_ts_ms": 2000,
+        },
+    )
+
+    payload = event["payload"]
+    safe_summary = payload["safe_summary"]
+    assert payload["batch_id"] == ""
+    assert payload["exact_countdown"] is None
+    assert payload["backend_countdown"] is None
+    assert payload["ocr_balance"] == "106.82"
+    assert safe_summary["hall_idle"] is True
+    assert safe_summary["display_room_label"] == ""
+    assert safe_summary["display_game_no"] == ""
+    assert safe_summary["runtime_betting_open"] is False
+    assert safe_summary["display_phase"] == "hall"
+    assert safe_summary["ui_reference_countdown"] is False
 
 
 def test_mirroring_event_queue_logs_state_changes_only() -> None:
@@ -1640,7 +1675,7 @@ def test_hall_ready_with_runtime_coordinates_is_not_hall(tmp_path: Path) -> None
     summary = next(item for item in controller.account_status if item.account_id == "a2")
     assert summary.state_label != "澶у巺"
 
-def test_probe_status_uses_lightweight_room_evidence_for_bet_gate() -> None:
+def test_probe_status_ignores_hall_room_list_evidence_for_bet_gate() -> None:
     class FakeState:
         def snapshot(self):
             return SimpleNamespace(
@@ -1659,7 +1694,40 @@ def test_probe_status_uses_lightweight_room_evidence_for_bet_gate() -> None:
 
     status = probe.status_from_snapshot(
         {"id": "a2", "runtime": {"mode": "headless"}, "state": FakeState()},
-        SimpleNamespace(game_ready=False, hall_ready=True, scene_name="BjlGameRoomHallSceneView"),
+        SimpleNamespace(game_ready=False, hall_ready=True, scene_name="BjlGameRoomHallSceneView", room_count=16),
+        None,
+    )
+
+    assert status["game_ready"] is False
+    assert status["hall_ready"] is True
+    assert status["hall_idle"] is True
+    assert status["game_no"] == ""
+    assert status["display_game_no"] == ""
+    assert status["display_room_label"] == ""
+    assert status["countdown"] is None
+    assert status["betting_open"] is False
+
+
+def test_probe_status_uses_lightweight_room_evidence_when_scene_is_not_hall() -> None:
+    class FakeState:
+        def snapshot(self):
+            return SimpleNamespace(
+                exact_countdown=11,
+                safe_summary={
+                    "canvas_game_no": "50-1782377104-8541781943-1286",
+                    "runtime_room_label": "T001",
+                    "runtime_room_id": "182020001",
+                    "runtime_action": "3",
+                    "runtime_coordinates": {
+                        "bet_regions": {"bet_player": {"center": [224, 218]}},
+                        "chips": {"chip_10": {"center": [333, 489]}},
+                    },
+                },
+            )
+
+    status = probe.status_from_snapshot(
+        {"id": "a2", "runtime": {"mode": "headless"}, "state": FakeState()},
+        SimpleNamespace(game_ready=False, hall_ready=True, scene_name="UnknownScene", room_count=0),
         None,
     )
 

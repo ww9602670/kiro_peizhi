@@ -124,6 +124,18 @@ def _state_event_betting_open(payload: dict[str, Any]) -> bool | None:
     return None
 
 
+def _status_hall_without_game(status: dict[str, Any]) -> bool:
+    if bool(status.get("game_ready")):
+        return False
+    if bool(status.get("hall_idle")):
+        return True
+    if not bool(status.get("hall_ready")):
+        return False
+    scene_text = _first_text(status.get("scene"), status.get("scene_name"))
+    room_count = _safe_int(status.get("room_count")) or 0
+    return bool(re.search(r"RoomHall|Hall", scene_text, re.IGNORECASE) or room_count >= 4)
+
+
 class _StateEventLogGate:
     """Keep JSONL runtime logs to state changes instead of raw poll snapshots."""
 
@@ -579,6 +591,7 @@ def _looks_like_closed_browser_error(value: Any) -> bool:
 
 def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, Any]:
     """Convert interval-probe status into the UI controller's state payload."""
+    hall_without_game = _status_hall_without_game(status)
     display_game_no = _public_game_no(_first_text(
         status.get("display_game_no"),
         status.get("game_no"),
@@ -586,7 +599,11 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         status.get("guard_game_no"),
         status.get("canvas_game_no"),
     ))
+    if hall_without_game:
+        display_game_no = ""
     source_countdown = _safe_int(status.get("countdown")) or _safe_int(status.get("backend_countdown"))
+    if hall_without_game:
+        source_countdown = None
     display_betting_open = status.get("display_betting_open")
     if display_betting_open is None:
         display_betting_open = bool(status.get("betting_open"))
@@ -599,6 +616,8 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         display_betting_open = bool(display_betting_open)
     if _status_round_stale(status):
         display_betting_open = False
+    if hall_without_game:
+        display_betting_open = False
     display_room_label = _first_text(
         status.get("display_room_label"),
         status.get("locked_room_label"),
@@ -607,6 +626,8 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         status.get("frontend_room_label"),
         status.get("canvas_room_label"),
     )
+    if hall_without_game:
+        display_room_label = ""
     display_balance_cents = (
         status.get("display_balance_cents")
         if status.get("display_balance_cents") is not None
@@ -631,10 +652,14 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
             display_phase = "hall"
         else:
             display_phase = "unknown"
+    if hall_without_game:
+        display_phase = "hall"
     display_source = _first_text(
         status.get("display_source"),
         status.get("game_no_source"),
     )
+    if hall_without_game:
+        display_source = "hall"
     display_coordinates = status.get("runtime_coordinates")
     if display_coordinates is None:
         display_coordinates = status.get("runtime_coords")
@@ -656,11 +681,19 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         status.get("frontend_room_label"),
         status.get("canvas_room_label"),
     )
-    ui_countdown = UI_REFERENCE_BETTING_COUNTDOWN_SECONDS if display_betting_open else (0 if bool(status.get("game_ready")) else None)
+    if hall_without_game:
+        room_id = ""
+        room_label = ""
+        display_coordinates = None
+    ui_countdown = None if hall_without_game else (
+        UI_REFERENCE_BETTING_COUNTDOWN_SECONDS if display_betting_open else (0 if bool(status.get("game_ready")) else None)
+    )
     status_ts_ms = _safe_int(status.get("status_ts_ms")) or probe.now_ms()
     safe_summary = {
         "game_ready": bool(status.get("game_ready")),
         "hall_ready": bool(status.get("hall_ready")),
+        "hall_idle": hall_without_game,
+        "scene_name": str(status.get("scene") or status.get("scene_name") or ""),
         "room_id": room_id,
         "room_label": room_label,
         "locked_room_id": str(status.get("locked_room_id") or ""),
@@ -684,7 +717,7 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
         "runtime_timed": ui_countdown if ui_countdown is not None else "",
         "frontend_runtime_timed": ui_countdown if ui_countdown is not None else "",
         "runtime_current_load_type": str(status.get("runtime_current_load_type") or ""),
-        "ui_reference_countdown": True,
+        "ui_reference_countdown": not hall_without_game,
         "ui_countdown_started_ms": status_ts_ms if display_betting_open else "",
         "backend_countdown": source_countdown if source_countdown is not None else "",
         "runtime_phase": display_phase,
@@ -706,6 +739,7 @@ def status_to_state_event(account_id: str, status: dict[str, Any]) -> dict[str, 
     payload = {
         "game_ready": bool(status.get("game_ready")),
         "hall_ready": bool(status.get("hall_ready")),
+        "hall_idle": hall_without_game,
         "batch_id": display_game_no,
         "exact_countdown": ui_countdown,
         "ui_countdown_started_ms": status_ts_ms if display_betting_open else None,

@@ -2190,6 +2190,19 @@ def _diagnostic_page_url(page: Any) -> str:
     return f"{parts.scheme}://{parts.netloc}{path}"[:160]
 
 
+def _ready_is_explicit_hall_without_game(ready: Any) -> bool:
+    if bool(getattr(ready, "game_ready", False)):
+        return False
+    if not bool(getattr(ready, "hall_ready", False)):
+        return False
+    scene_name = str(getattr(ready, "scene_name", "") or "")
+    try:
+        room_count = int(getattr(ready, "room_count", 0) or 0)
+    except (TypeError, ValueError):
+        room_count = 0
+    return bool(re.search(r"RoomHall|Hall", scene_name, re.IGNORECASE) or room_count >= 4)
+
+
 def _emit_hall_clear_probe_audit(
     config: ClusterWorkerConfig,
     runtime: dict[str, Any],
@@ -2758,7 +2771,8 @@ async def _poll_frontend_state(config, runtime, state, event_queue, stop_event):
                         runtime.get("room_entry_pending")
                         or now_ms() < int(runtime.get("room_entry_loading_until_ms") or 0)
                     )
-                    would_clear = bool(ready.hall_ready and not ready.game_ready and not room_entry_loading)
+                    hall_without_game = _ready_is_explicit_hall_without_game(ready)
+                    would_clear = bool(hall_without_game)
                     _emit_hall_clear_probe_audit(
                         config,
                         runtime,
@@ -2772,7 +2786,7 @@ async def _poll_frontend_state(config, runtime, state, event_queue, stop_event):
                         page_index=page_index,
                         page_count=page_count,
                     )
-                    if ready.hall_ready and not ready.game_ready and not room_entry_loading:
+                    if hall_without_game:
                         continue
                 except Exception:
                     pass
@@ -2855,7 +2869,8 @@ async def _poll_runtime_state(config, runtime, state, event_queue, stop_event):
                 runtime.get("room_entry_pending")
                 or now_ms() < int(runtime.get("room_entry_loading_until_ms") or 0)
             )
-            would_clear = bool(ready.hall_ready and not ready.game_ready and not room_entry_loading)
+            hall_without_game = _ready_is_explicit_hall_without_game(ready)
+            would_clear = bool(hall_without_game)
             _emit_hall_clear_probe_audit(
                 config,
                 runtime,
@@ -2872,7 +2887,7 @@ async def _poll_runtime_state(config, runtime, state, event_queue, stop_event):
             if ready.game_ready:
                 state.room_absent_seen_count = 0
                 runtime["room_entry_loading_until_ms"] = 0
-            if ready.hall_ready and not ready.game_ready and not room_entry_loading:
+            if hall_without_game:
                 runtime_snapshot = (
                     await read_live_runtime_snapshot(active_page, instance_id=config.instance_id)
                     if config.enable_runtime_scan

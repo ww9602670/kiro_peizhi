@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
@@ -85,10 +86,15 @@ def _safe_summary_from(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _hall_idle_without_game(payload: dict[str, Any], safe_summary: dict[str, Any]) -> bool:
+    game_ready = _truthy(payload.get("game_ready")) or _truthy(safe_summary.get("game_ready"))
+    if game_ready:
+        return False
+    hall_ready = _truthy(payload.get("hall_ready")) or _truthy(safe_summary.get("hall_ready"))
+    scene_name = _first_text(payload.get("scene_name"), payload.get("scene"), safe_summary.get("scene_name"))
+    explicit_hall = bool(re.search(r"RoomHall|Hall", scene_name, re.IGNORECASE))
     return bool(
         _truthy(safe_summary.get("hall_idle"))
-        and not _truthy(payload.get("game_ready"))
-        and not _truthy(safe_summary.get("game_ready"))
+        or (hall_ready and explicit_hall)
     )
 
 

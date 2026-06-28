@@ -614,6 +614,13 @@ def status_from_snapshot(item: dict[str, Any], load: Any, snapshot: Any) -> dict
         betting_open = bool(betting_from_runtime)
     game_ready = bool(getattr(load, "game_ready", False))
     hall_ready = bool(getattr(load, "hall_ready", False))
+    scene_name = str(getattr(load, "scene_name", "") or "")
+    room_count = _first_int(getattr(load, "room_count", 0)) or 0
+    explicit_hall_without_game = bool(
+        hall_ready
+        and not game_ready
+        and (re.search(r"RoomHall|Hall", scene_name, re.IGNORECASE) or room_count >= 4)
+    )
     room_id = str(getattr(frame, "room_id", "") or summary.get("room_id") or "") if frame is not None else str(summary.get("room_id") or "")
     room_label = str(getattr(frame, "table_label", "") or summary.get("room_label") or "") if frame is not None else str(summary.get("room_label") or "")
     display_room_label = _first_text(
@@ -638,7 +645,11 @@ def status_from_snapshot(item: dict[str, Any], load: Any, snapshot: Any) -> dict
         or summary.get("runtime_room_id")
         or summary.get("frontend_room_id")
     )
-    in_game_evidence = bool(room_evidence and (display_game_no or coordinates_ready))
+    in_game_evidence = bool(
+        not explicit_hall_without_game
+        and room_evidence
+        and (display_game_no or coordinates_ready)
+    )
     effective_game_ready = bool(game_ready or in_game_evidence)
     effective_hall_ready = bool(hall_ready and not effective_game_ready)
     display_phase = _first_text(
@@ -658,6 +669,14 @@ def status_from_snapshot(item: dict[str, Any], load: Any, snapshot: Any) -> dict
             display_phase = "hall"
         else:
             display_phase = ""
+    if explicit_hall_without_game:
+        display_game_no = ""
+        display_room_label = ""
+        room_id = ""
+        room_label = ""
+        countdown = None
+        betting_open = False
+        display_phase = "hall"
     source_bits: list[str] = []
     if raw_display_game_no == raw_canvas_game_no and raw_canvas_game_no:
         source_bits.append("canvas_game_no")
@@ -671,7 +690,15 @@ def status_from_snapshot(item: dict[str, Any], load: Any, snapshot: Any) -> dict
         source_bits.append("runtime_action")
     if _action_is_betting(frontend_runtime_action) is True:
         source_bits.append("frontend_runtime_action")
-    display_source = "+".join(dict.fromkeys(source_bits)) if source_bits else "legacy"
+    display_source = "hall" if explicit_hall_without_game else (
+        "+".join(dict.fromkeys(source_bits)) if source_bits else "legacy"
+    )
+    public_game_no_value = "" if explicit_hall_without_game else (display_game_no or guard_game_no or snapshot_game_no)
+    frontend_betting_open = (
+        False
+        if explicit_hall_without_game
+        else (bool(_action_is_betting(frontend_runtime_action)) if frontend_runtime_action else bool(betting_open))
+    )
     display_balance_cents = getattr(frame, "balance_cents", None) if frame is not None else None
     if display_balance_cents is None:
         display_balance_cents = summary.get("balance_cents")
@@ -680,8 +707,9 @@ def status_from_snapshot(item: dict[str, Any], load: Any, snapshot: Any) -> dict
         "mode": str((item.get("runtime") or {}).get("mode") or ""),
         "game_ready": effective_game_ready,
         "hall_ready": effective_hall_ready,
-        "scene": str(getattr(load, "scene_name", "") or ""),
-        "game_no": display_game_no or guard_game_no or snapshot_game_no,
+        "hall_idle": explicit_hall_without_game,
+        "scene": scene_name,
+        "game_no": public_game_no_value,
         "display_game_no": display_game_no,
         "display_room_label": display_room_label,
         "display_balance_cents": display_balance_cents,
@@ -701,7 +729,7 @@ def status_from_snapshot(item: dict[str, Any], load: Any, snapshot: Any) -> dict
         "game_no_source": "guard" if guard_game_no else ("snapshot" if snapshot_game_no else ""),
         "countdown": countdown,
         "betting_open": betting_open,
-        "frontend_betting_open": bool(_action_is_betting(frontend_runtime_action)) if frontend_runtime_action else bool(betting_open),
+        "frontend_betting_open": frontend_betting_open,
         "room_id": room_id,
         "room_label": room_label,
         "locked_room_id": str(summary.get("locked_room_id") or ""),
