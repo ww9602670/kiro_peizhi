@@ -48,17 +48,143 @@ LIMIT_LABEL_KEYS = (
 )
 
 
+def _event_payload_first(payload: dict[str, Any], *keys: str) -> Any:
+    safe_summary = payload.get("safe_summary") if isinstance(payload.get("safe_summary"), dict) else {}
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+        value = safe_summary.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _state_event_room_key(payload: dict[str, Any]) -> str:
+    return _first_text(
+        _event_payload_first(
+            payload,
+            "display_room_label",
+            "locked_room_label",
+            "room_label",
+            "runtime_room_label",
+            "frontend_room_label",
+            "label_room_label",
+            "canvas_room_label",
+            "room_id",
+            "locked_room_id",
+            "runtime_room_id",
+            "frontend_room_id",
+        )
+    ) or "-"
+
+
+def _state_event_round_key(payload: dict[str, Any]) -> str:
+    return _public_game_no(
+        _first_text(
+            _event_payload_first(
+                payload,
+                "batch_id",
+                "display_game_no",
+                "round_id",
+                "game_no",
+                "runtime_memory_game_no",
+                "canvas_game_no",
+                "label_game_no",
+                "frontend_batch_id",
+                "frontend_short_batch_id",
+            )
+        )
+    ) or "-"
+
+
+def _state_event_betting_open(payload: dict[str, Any]) -> bool | None:
+    value = _event_payload_first(payload, "display_betting_open", "runtime_betting_open", "betting_open")
+    if value is not None:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n"}:
+            return False
+    action_open = _action_to_betting(_event_payload_first(payload, "runtime_action", "frontend_runtime_action"))
+    if action_open is not None:
+        return bool(action_open)
+    can_bet = _event_payload_first(payload, "runtime_is_can_betting", "frontend_runtime_is_can_betting")
+    if can_bet is None:
+        return None
+    if isinstance(can_bet, bool):
+        return can_bet
+    text = str(can_bet).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+class _StateEventLogGate:
+    """Keep JSONL runtime logs to state changes instead of raw poll snapshots."""
+
+    def __init__(self) -> None:
+        self._seen_rounds: set[tuple[str, str, str]] = set()
+        self._seen_betting_states: set[tuple[str, str, str, bool]] = set()
+        self._last_balance_by_account: dict[str, str] = {}
+        self._last_room_by_account: dict[str, str] = {}
+
+    def should_log(self, event_payload: dict[str, Any]) -> bool:
+        if str(event_payload.get("event_type") or "") != "state":
+            return True
+        payload = event_payload.get("payload")
+        if not isinstance(payload, dict):
+            return True
+        account_id = str(event_payload.get("instance_id") or payload.get("instance_id") or "")
+        room_key = _state_event_room_key(payload)
+        round_key = _state_event_round_key(payload)
+        balance = _first_text(
+            _event_payload_first(payload, "ocr_balance", "display_balance_cents", "balance_cents")
+        )
+        betting_open = _state_event_betting_open(payload)
+
+        changed = False
+        if room_key != "-" and self._last_room_by_account.get(account_id) != room_key:
+            self._last_room_by_account[account_id] = room_key
+            changed = True
+
+        if round_key != "-":
+            round_signature = (account_id, room_key, round_key)
+            if round_signature not in self._seen_rounds:
+                self._seen_rounds.add(round_signature)
+                changed = True
+
+        if betting_open is not None:
+            betting_signature = (account_id, room_key, round_key, bool(betting_open))
+            if betting_signature not in self._seen_betting_states:
+                self._seen_betting_states.add(betting_signature)
+                changed = True
+
+        if balance and self._last_balance_by_account.get(account_id) != balance:
+            self._last_balance_by_account[account_id] = balance
+            changed = True
+
+        return changed
+
+
 class _MirroringEventQueue:
     def __init__(self, base: Any, emit_event: Any) -> None:
         self._base = base
         self._emit_event = emit_event
+        self._state_log_gate = _StateEventLogGate()
 
     def put_nowait(self, event: Any) -> None:
-        self._base.put_nowait(event)
         try:
             payload = probe.event_to_json(event)
         except Exception:
+            self._base.put_nowait(event)
             return
+        if self._state_log_gate.should_log(payload):
+            self._base.put_nowait(event)
         if str(payload.get("event_type") or "") in {"health", "error", "log"}:
             self._emit_event(payload)
 

@@ -10,13 +10,21 @@ from types import SimpleNamespace
 from PyQt6.QtWidgets import QApplication
 
 from scripts import live_interval_acceptance_probe as probe
+from bet_desktop.backend import cluster_process_worker as cw
+from bet_desktop.browser.frontend_state_probe import FrontendStateEvent, parse_frontend_state_events
+from bet_desktop.browser.live_runtime_state import LiveRuntimeSnapshot, RuntimeFrameState
 from bet_desktop.ui.lightweight_browser_adapter import FakeBrowserControlAdapter
 from bet_desktop.ui.lightweight_config_store import LightweightConfigStore
 from bet_desktop.ui.lightweight_cluster_adapter import LightweightClusterAdapter, normalize_login_url, platform_slot_to_cluster_config
 from bet_desktop.ui.lightweight_controller import _payload_hall_without_game, LightweightController, _now_ms
 from bet_desktop.ui.lightweight_dashboard import LightweightDashboard
 from bet_desktop.ui.lightweight_models import ACCOUNT_IDS, PlatformSlot, parse_proxy_bundle_lines, resolve_sub_accounts
-from bet_desktop.ui.lightweight_probe_adapter import LightweightProbeAdapter, _stable_chip_sequence, status_to_state_event
+from bet_desktop.ui.lightweight_probe_adapter import (
+    LightweightProbeAdapter,
+    _MirroringEventQueue,
+    _stable_chip_sequence,
+    status_to_state_event,
+)
 
 
 def test_lightweight_config_round_trip_and_legacy_adapter(tmp_path: Path) -> None:
@@ -444,6 +452,45 @@ def test_dashboard_turnover_uses_actual_amount_and_reset_only_clear_turnover(tmp
     app.processEvents()
 
 
+def test_dashboard_outcome_stats_infer_banker_and_commission(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=FakeBrowserControlAdapter(max_log_entries=20),
+    )
+    dashboard = LightweightDashboard(controller=controller)
+    controller.set_main_account("a1")
+
+    dashboard._on_account_status_updated([SimpleNamespace(account_id="a1", balance=Decimal("90"), round_id="50-1-1")])
+    controller._handle_runtime_event(
+        "",
+        "round",
+        {
+            "round_number": 1,
+            "round_id": "50-1-1-10001",
+            "legs": [
+                {"account_id": "a1", "side": "banker"},
+                {"account_id": "a2", "side": "banker"},
+                {"account_id": "a3", "side": "player"},
+            ],
+            "results": [
+                {"instance_id": "a1", "actual_amount": 10, "missing_amount": 0, "status": "COMPLETE"},
+                {"instance_id": "a2", "actual_amount": 20, "missing_amount": 0, "status": "COMPLETE"},
+                {"instance_id": "a3", "actual_amount": 10, "missing_amount": 0, "status": "COMPLETE"},
+            ],
+        },
+    )
+    dashboard._on_account_status_updated([SimpleNamespace(account_id="a1", balance=Decimal("109.50"), round_id="50-1-2")])
+
+    assert dashboard.outcome_labels["banker"].text() == "1"
+    assert dashboard.outcome_labels["player"].text() == "0"
+    assert dashboard.outcome_labels["tie"].text() == "0"
+    assert dashboard.outcome_labels["commission"].text() == "1.50"
+
+    dashboard.close()
+    app.processEvents()
+
+
 def test_dashboard_plan_exclude_restore_buttons_update_participation_state(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     controller = LightweightController(
@@ -579,6 +626,83 @@ def test_probe_status_to_state_event_prefers_display_fields_and_runtime_action()
     assert safe_summary["runtime_phase"] == "betting_open"
 
 
+def test_mirroring_event_queue_logs_state_changes_only() -> None:
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.events: list[dict] = []
+
+        def put_nowait(self, event) -> None:
+            self.events.append(event)
+
+    base = FakeQueue()
+    emitted: list[dict] = []
+    queue = _MirroringEventQueue(base, emitted.append)
+
+    def state_event(countdown: int, *, betting_open: bool = False, balance: str = "100.00") -> dict:
+        return {
+            "event_type": "state",
+            "instance_id": "a1",
+            "payload": {
+                "batch_id": "50-1782574032-8549052865-1996",
+                "exact_countdown": countdown,
+                "ocr_balance": balance,
+                "safe_summary": {
+                    "room_label": "T002",
+                    "display_game_no": "50-1782574032-8549052865-1996",
+                    "runtime_betting_open": betting_open,
+                },
+            },
+        }
+
+    queue.put_nowait(state_event(1))
+    queue.put_nowait(state_event(1))
+    queue.put_nowait(state_event(1))
+    queue.put_nowait(state_event(12, betting_open=True))
+    queue.put_nowait(state_event(11, betting_open=True))
+    queue.put_nowait(state_event(10, betting_open=True, balance="101.00"))
+
+    assert len(base.events) == 3
+    assert [event["payload"]["exact_countdown"] for event in base.events] == [1, 12, 10]
+
+
+def test_visible_canvas_round_can_replace_misleading_label_family_code() -> None:
+    misleading_label_no = "65-26061051-595200-19"
+    visible_canvas_no = "50-1782581151-8549369881-1611"
+    state = cw._RuntimeState("a4")
+
+    assert cw._batch_rank_from_id(visible_canvas_no) > cw._batch_rank_from_id(misleading_label_no)
+
+    state.update(
+        batch_id=misleading_label_no,
+        room_id="182020001",
+        room_label="T001",
+        countdown=0,
+        source="label_runtime_resolved",
+        safe_summary={
+            "label_game_no": misleading_label_no,
+            "label_countdown": 0,
+            "runtime_room_id": "182020001",
+            "runtime_room_label": "T001",
+        },
+    )
+    snapshot = state.update(
+        batch_id=visible_canvas_no,
+        room_id="182020001",
+        room_label="T001",
+        countdown=-1,
+        source="canvas_text_runtime",
+        safe_summary={
+            "canvas_game_no": visible_canvas_no,
+            "canvas_records": [{"text": visible_canvas_no}],
+            "runtime_room_id": "182020001",
+            "runtime_room_label": "T001",
+        },
+    )
+
+    assert snapshot.batch_id == visible_canvas_no
+    assert snapshot.safe_summary["canvas_game_no"] == visible_canvas_no
+
+
 def test_display_betting_closed_when_runtime_action_is_5() -> None:
     event = status_to_state_event(
         "a1",
@@ -595,6 +719,293 @@ def test_display_betting_closed_when_runtime_action_is_5() -> None:
     assert event["payload"]["batch_id"] == "2026-xx-yy"
     assert event["payload"]["exact_countdown"] is None
     assert event["payload"]["safe_summary"]["display_betting_open"] is False
+
+
+def test_room2_same_round_low_authority_action_supplements_phase() -> None:
+    state = cw._RuntimeState("a1")
+    display_game_no = "50-1782574032-8549052865-1996"
+    state.update(
+        batch_id=display_game_no,
+        room_id="182020002",
+        room_label="T002",
+        countdown=1,
+        source="label_runtime_resolved",
+        confidence=0.9,
+        safe_summary={
+            "label_countdown": 1,
+            "label_room_label": "T002",
+            "frontend_short_batch_id": "8549052865",
+        },
+    )
+    state.runtime_authority = 90
+    state.runtime_authority_ms = cw.now_ms()
+
+    snapshot = cw._update_from_frontend_state(
+        state,
+        FrontendStateEvent(
+            timestamp_ms=cw.now_ms(),
+            event_type="timed_context",
+            short_batch_id="8549052865",
+            countdown=12,
+            action=3,
+            room_id="182020002",
+            room_label="T002",
+            context_path="JSON.parse.1.bonusInfo",
+            matched_paths=["JSON.parse.1.bonusInfo.action"],
+            confidence=0.6,
+        ),
+    )
+
+    assert snapshot.batch_id == display_game_no
+    assert snapshot.exact_countdown == 12
+    assert snapshot.safe_summary["runtime_action"] == 3
+    assert snapshot.safe_summary["frontend_runtime_action"] == 3
+    assert "ignored_low_authority_source" not in snapshot.safe_summary
+
+
+def test_runtime_room_conflict_switches_after_repeated_active_page_state() -> None:
+    state = cw._RuntimeState("a2")
+    cw._switch_room_lock_for_entry(state, room_index=3, room_id="182020003", room_label="T003")
+
+    def runtime_snapshot() -> LiveRuntimeSnapshot:
+        return LiveRuntimeSnapshot(
+            timestamp_ms=cw.now_ms(),
+            instance_id="a2",
+            frame=RuntimeFrameState(
+                page_index=0,
+                frame_index=0,
+                game_no="50-1782597239-8549923977-1594",
+                action=3,
+                timed=12,
+                balance_cents=9000,
+                room_id="182020002",
+                table_label="T002",
+                user_min_bet_cents=400,
+                user_max_bet_cents=25000,
+            ),
+            game_visible=True,
+            layout_confidence=0.8,
+            viewport={"width": 960, "height": 620},
+            phase_key="betting_open",
+            phase_label="betting open",
+            betting_open=True,
+            coordinates={},
+        )
+
+    first = cw._update_from_page_runtime_state(state, runtime_snapshot())
+    assert first.safe_summary["locked_room_label"] == "T003"
+
+    second = cw._update_from_page_runtime_state(state, runtime_snapshot())
+    assert second.safe_summary["locked_room_label"] == "T002"
+    assert second.batch_id == "50-1782597239-8549923977-1594"
+    assert second.exact_countdown == 12
+
+
+def test_absent_room_clears_stale_room_lock_after_stable_samples() -> None:
+    state = cw._RuntimeState("a2")
+    cw._switch_room_lock_for_entry(state, room_index=3, room_id="182020003", room_label="T003")
+    state.update(batch_id="50-1782597239-8549923977-1594", source="canvas_text_runtime")
+
+    assert cw._clear_room_state_if_room_absent(state, ready_summary={"game_ready": False}) is None
+    assert cw._clear_room_state_if_room_absent(state, ready_summary={"game_ready": False}) is None
+    snapshot = cw._clear_room_state_if_room_absent(state, ready_summary={"game_ready": False})
+
+    assert snapshot is not None
+    assert snapshot.batch_id == ""
+    assert snapshot.safe_summary["locked_room_label"] == ""
+    assert snapshot.safe_summary["room_absent_clear"] is True
+
+
+def test_absent_room_clear_waits_when_probe_still_sees_live_round() -> None:
+    canvas = SimpleNamespace(
+        game_no="50-1782599417-8549978084-1630",
+        countdown_seconds=None,
+        phase_text="",
+    )
+
+    assert cw._runtime_probe_has_live_game_state(canvas_snapshot=canvas) is True
+    assert cw._runtime_probe_has_live_game_state() is False
+
+
+def test_passive_current_scene_analytics_does_not_overwrite_canvas_round() -> None:
+    state = cw._RuntimeState("a2")
+    visible_canvas_no = "50-1782599441-8549978672-1630"
+    stale_analytics_no = "50-1782599318-8549975603-1626"
+    state.update(
+        batch_id=visible_canvas_no,
+        room_id="182020002",
+        room_label="T002",
+        countdown=9,
+        source="canvas_text_runtime",
+        confidence=0.9,
+        safe_summary={"canvas_game_no": visible_canvas_no},
+    )
+
+    snapshot = cw._update_from_frontend_state(
+        state,
+        FrontendStateEvent(
+            timestamp_ms=cw.now_ms(),
+            event_type="object_scan",
+            batch_id=stale_analytics_no,
+            batch_id_is_full=True,
+            short_batch_id="8549975603",
+            batch_rank=cw._batch_rank_from_id(stale_analytics_no),
+            room_id="182020002",
+            room_label="T002",
+            context_path="application.currentScene.analyticsData",
+            matched_paths=[
+                "application.currentScene.analyticsData.gameNo",
+                "application.currentScene.analyticsData.sn",
+                "application.currentScene.analyticsData.roomId",
+            ],
+            confidence=0.55,
+        ),
+    )
+
+    assert snapshot.batch_id == visible_canvas_no
+    assert snapshot.exact_countdown == 9
+    assert snapshot.safe_summary["frontend_runtime_ignored_reason"] == "passive_analytics_profile"
+    assert snapshot.safe_summary["frontend_ignored_game_no"] == stale_analytics_no
+
+
+def test_five_digit_tail_display_batch_accepts_room2_frontend_action() -> None:
+    state = cw._RuntimeState("a1")
+    display_game_no = "50-1782592089-8549782342-11012"
+
+    assert cw._display_batch_id_or_empty(display_game_no) == display_game_no
+
+    snapshot = state.update(
+        batch_id=display_game_no,
+        room_id="182020002",
+        room_label="T002",
+        countdown=-1,
+        source="canvas_text_runtime",
+        confidence=0.9,
+        safe_summary={
+            "canvas_game_no": display_game_no,
+            "runtime_room_id": "182020002",
+            "runtime_room_label": "T002",
+        },
+    )
+
+    assert snapshot.batch_id == display_game_no
+
+    snapshot = cw._update_from_frontend_state(
+        state,
+        FrontendStateEvent(
+            timestamp_ms=cw.now_ms(),
+            event_type="bound_room_object",
+            batch_id=display_game_no,
+            batch_id_is_full=True,
+            short_batch_id="8549782342",
+            batch_rank=cw._batch_rank_from_id(display_game_no),
+            countdown=12,
+            action=3,
+            room_id="182020002",
+            room_label="T002",
+            context_path="application._prevScene.gameList.1.0",
+            matched_paths=["application._prevScene.gameList.1.0.action"],
+            confidence=0.9,
+        ),
+    )
+
+    assert snapshot.batch_id == display_game_no
+    assert snapshot.exact_countdown == 12
+    assert snapshot.safe_summary["frontend_runtime_action"] == 3
+
+
+def test_same_first_three_round_ignores_tail_mismatch_for_room_action() -> None:
+    state = cw._RuntimeState("a1")
+    display_game_no = "50-1782592089-8549782342-11012"
+    room_action_game_no = "50-1782592089-8549782342-1554"
+    state.update(
+        batch_id=display_game_no,
+        room_id="182020002",
+        room_label="T002",
+        countdown=-1,
+        source="canvas_text_runtime",
+        confidence=0.9,
+        safe_summary={"canvas_game_no": display_game_no},
+    )
+    cw._promote_visible_batch_lock(state, display_game_no)
+
+    snapshot = cw._update_from_frontend_state(
+        state,
+        FrontendStateEvent(
+            timestamp_ms=cw.now_ms(),
+            event_type="bound_room_object",
+            batch_id=room_action_game_no,
+            batch_id_is_full=True,
+            short_batch_id="8549782342",
+            batch_rank=cw._batch_rank_from_id(room_action_game_no),
+            countdown=12,
+            action=3,
+            room_id="182020002",
+            room_label="T002",
+            context_path="application._prevScene.gameList.1.0",
+            matched_paths=["application._prevScene.gameList.1.0.action"],
+            confidence=0.9,
+        ),
+    )
+
+    assert snapshot.batch_id == display_game_no
+    assert snapshot.exact_countdown == 12
+    assert snapshot.safe_summary["frontend_runtime_action"] == 3
+
+
+def test_bound_room_object_parses_multiple_room_runtime_contexts() -> None:
+    t001_batch = "50-1782574031-8549052864-1995"
+    t002_batch = "50-1782574032-8549052865-1996"
+    raw = {
+        "event": "bound_room_object",
+        "ts": cw.now_ms(),
+        "contexts": [
+            {
+                "path": "application._prevScene.gameList.0.0",
+                "fields": [
+                    {"path": "application._prevScene.gameList.0.0.sn", "key": "sn", "value": "182020001"},
+                    {"path": "application._prevScene.gameList.0.0.gameNo", "key": "gameNo", "value": t001_batch},
+                    {"path": "application._prevScene.gameList.0.0.countdown", "key": "countdown", "value": 12},
+                    {"path": "application._prevScene.gameList.0.0.action", "key": "action", "value": 3},
+                ],
+            },
+            {
+                "path": "application._prevScene.gameList.1.0",
+                "fields": [
+                    {"path": "application._prevScene.gameList.1.0.sn", "key": "sn", "value": "182020002"},
+                    {"path": "application._prevScene.gameList.1.0.gameNo", "key": "gameNo", "value": t002_batch},
+                    {"path": "application._prevScene.gameList.1.0.countdown", "key": "countdown", "value": 12},
+                    {"path": "application._prevScene.gameList.1.0.action", "key": "action", "value": 3},
+                ],
+            },
+        ],
+    }
+
+    events = parse_frontend_state_events(raw)
+    by_room = {event.room_label: event for event in events}
+    assert {"T001", "T002"}.issubset(by_room)
+    assert by_room["T002"].action == 3
+    assert by_room["T002"].countdown == 12
+
+    state = cw._RuntimeState("a2")
+    cw._switch_room_lock_for_entry(state, room_index=2, room_id="182020002", room_label="T002")
+    state.update(
+        batch_id=t002_batch,
+        room_id="182020002",
+        room_label="T002",
+        countdown=-1,
+        source="canvas_text_runtime",
+        confidence=0.9,
+        safe_summary={
+            "canvas_game_no": t002_batch,
+            "runtime_room_id": "182020002",
+            "runtime_room_label": "T002",
+        },
+    )
+    selected = cw._select_frontend_state_events(state, events)
+
+    assert any(event.room_label == "T002" and event.action == 3 for event in selected)
+    assert all(event.room_label != "T001" for event in selected)
 
 
 def test_controller_start_trigger_and_status_change(tmp_path: Path) -> None:
@@ -788,6 +1199,42 @@ def test_runtime_state_event_updates_account_cards(tmp_path: Path) -> None:
     assert str(summary.balance) == "1234.50"
     assert summary.state_label != ""
     assert "betting_open" in summary.state_machine_label
+
+
+def test_hall_idle_clears_residual_room_round_and_betting_display(tmp_path: Path) -> None:
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=FakeBrowserControlAdapter(max_log_entries=20),
+    )
+
+    controller._handle_runtime_event(
+        "a2",
+        "state",
+        {
+            "batch_id": "",
+            "exact_countdown": 12,
+            "timestamp_captured_ms": _now_ms(),
+            "safe_summary": {
+                "hall_idle": True,
+                "hall_ready": True,
+                "game_ready": False,
+                "room_label": "T002",
+                "locked_room_label": "T002",
+                "frontend_room_label": "T002",
+                "frontend_short_batch_id": "8552422477",
+                "label_internal_game_no": "50-1782665414-8552415788-11409",
+                "runtime_action": 3,
+                "runtime_betting_open": True,
+                "runtime_countdown": 12,
+            },
+        },
+    )
+
+    summary = next(item for item in controller.account_status if item.account_id == "a2")
+    assert summary.room_label == "-"
+    assert summary.round_id == "-"
+    assert summary.countdown is None
+    assert summary.betting_open is False
 
 
 def test_runtime_state_countdown_decays_and_marks_stale(tmp_path: Path) -> None:

@@ -23,6 +23,11 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Avoid bundling an external JDK copy of ucrtbase.dll. Windows provides this
+# runtime library system-wide, and some local security policies block writing
+# that DLL name during COLLECT.
+a.binaries = [item for item in a.binaries if item[0].lower() != 'ucrtbase.dll']
+
 exe = EXE(
     pyz,
     a.scripts,

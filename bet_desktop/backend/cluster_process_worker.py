@@ -14,12 +14,13 @@ from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from bet_desktop.browser.frontend_state_probe import (
     FRONTEND_BOUND_ROOM_SCAN_JS,
     FRONTEND_OBJECT_SCAN_JS,
     FRONTEND_STATE_PROBE_JS,
-    parse_frontend_state_event,
+    parse_frontend_state_events,
     FrontendStateEvent,
 )
 from bet_desktop.browser.login_flow import fill_login_form_when_visible
@@ -58,6 +59,8 @@ except Exception:  # pragma: no cover - diagnostic screenshots are optional.
 LOG_MAX_MESSAGE_LENGTH = 1000
 DEFAULT_POLL_INTERVAL_MS = 120
 MAX_QUEUE_RETRIES = 3
+ROOM_CONFLICT_SWITCH_SAMPLES = 2
+ROOM_ABSENT_CLEAR_SAMPLES = 3
 BaccaratCoordinateSize = tuple[int, int]
 BACCARAT_COORDINATE_BASE_SIZE: BaccaratCoordinateSize = (960, 620)
 BACCARAT_COORDINATE_TOLERANCE_PX = 2
@@ -149,6 +152,9 @@ class _RuntimeState:
         self.frontend_locked_context_path = ""
         self.locked_room_id = ""
         self.locked_room_label = ""
+        self.room_conflict_identity = ""
+        self.room_conflict_seen_count = 0
+        self.room_absent_seen_count = 0
 
     def update(
         self,
@@ -171,9 +177,12 @@ class _RuntimeState:
         """
         original_batch_id = batch_id
         incoming_batch_rank = _batch_rank_from_id(batch_id)
+        same_round_as_locked = _is_same_round_batch(batch_id, self.locked_frontend_batch_id)
+        same_round_as_current = _is_same_round_batch(batch_id, self.batch_id)
         stale_batch_update = bool(
             incoming_batch_rank != (0, 0, 0, 0)
             and self.locked_frontend_batch_rank
+            and not same_round_as_locked
             and incoming_batch_rank < self.locked_frontend_batch_rank
         )
         runtime_signal_summary = dict(safe_summary) if safe_summary is not None else None
@@ -185,12 +194,23 @@ class _RuntimeState:
             or _safe_summary_has_structured_phase_signal(runtime_signal_summary)
         )
         incoming_authority = _runtime_update_authority(source, runtime_signal_summary, runtime_state)
+        lower_authority_phase_supplement = _lower_authority_phase_supplement_allowed(
+            self,
+            runtime_signal_summary,
+            runtime_state,
+            room_id=room_id,
+            room_label=room_label,
+            batch_id=batch_id,
+        )
         current_batch_rank = _batch_rank_from_id(self.batch_id)
         is_newer_display_batch = bool(
             incoming_batch_rank != (0, 0, 0, 0)
-            and (current_batch_rank == (0, 0, 0, 0) or incoming_batch_rank > current_batch_rank)
+            and (
+                current_batch_rank == (0, 0, 0, 0)
+                or (incoming_batch_rank > current_batch_rank and not same_round_as_current)
+            )
         )
-        is_same_runtime_batch = not batch_id or not self.batch_id or batch_id == self.batch_id
+        is_same_runtime_batch = not batch_id or not self.batch_id or batch_id == self.batch_id or same_round_as_current
 
         if stale_batch_update:
             batch_id = ""
@@ -225,6 +245,7 @@ class _RuntimeState:
             and not is_newer_display_batch
             and self.runtime_authority
             and incoming_authority < self.runtime_authority
+            and not lower_authority_phase_supplement
             and now_ms() - self.runtime_authority_ms <= _RUNTIME_AUTHORITY_HOLD_MS
             and not (countdown is not None and countdown >= 0 and self.countdown < 0)
         ):
@@ -238,6 +259,9 @@ class _RuntimeState:
                 safe_summary["ignored_low_authority_source"] = source
                 safe_summary["ignored_runtime_authority"] = incoming_authority
                 safe_summary["active_runtime_authority"] = self.runtime_authority
+
+        if batch_id and same_round_as_current:
+            batch_id = self.batch_id
 
         if batch_id and batch_id != self.batch_id:
             self.batch_id = batch_id
@@ -315,7 +339,11 @@ class _RuntimeState:
             self.runtime_state = dict(runtime_state)
             _apply_runtime_snapshot_to_state(self, self.runtime_state)
 
-        if incoming_has_runtime_signal:
+        if incoming_has_runtime_signal and not (
+            lower_authority_phase_supplement
+            and self.runtime_authority
+            and incoming_authority < self.runtime_authority
+        ):
             self.runtime_authority = incoming_authority
             self.runtime_authority_ms = now_ms()
             
@@ -661,6 +689,131 @@ def _runtime_state_has_structured_phase_signal(runtime_state: dict[str, Any] | N
     return any(frame.get(key) is not None for key in ("action", "current_load_type", "is_can_betting"))
 
 
+def _summary_first(summary: Mapping[str, Any] | None, *keys: str) -> Any:
+    if not summary:
+        return None
+    for key in keys:
+        value = summary.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _summary_room_id(summary: Mapping[str, Any] | None) -> str:
+    return str(
+        _summary_first(
+            summary,
+            "frontend_room_id",
+            "runtime_room_id",
+            "ws_room_id",
+            "room_id",
+            "locked_room_id",
+        )
+        or ""
+    ).strip()
+
+
+def _summary_room_label(summary: Mapping[str, Any] | None) -> str:
+    return _normalized_room_label(
+        _summary_first(
+            summary,
+            "frontend_room_label",
+            "runtime_room_label",
+            "ws_room_label",
+            "room_label",
+            "locked_room_label",
+        )
+    )
+
+
+def _phase_signal_room_matches_current(
+    state: _RuntimeState,
+    summary: Mapping[str, Any] | None,
+    *,
+    room_id: object = "",
+    room_label: object = "",
+) -> bool:
+    incoming_id = str(room_id or _summary_room_id(summary) or "").strip()
+    incoming_label = _normalized_room_label(room_label) or _summary_room_label(summary) or _room_label_hint_from_id(incoming_id)
+    current_id = str(state.locked_room_id or state.room_id or "").strip()
+    current_label = (
+        _normalized_room_label(state.locked_room_label)
+        or _normalized_room_label(state.room_label)
+        or _room_label_hint_from_id(current_id)
+    )
+    if current_label and incoming_label and incoming_label != current_label:
+        return False
+    if current_id and incoming_id and incoming_id != current_id:
+        if not (current_label and incoming_label and current_label == incoming_label):
+            return False
+    return bool(incoming_label or incoming_id or current_label or current_id)
+
+
+def _summary_short_batch_ids(summary: Mapping[str, Any] | None) -> set[str]:
+    values = {
+        str(
+            _summary_first(
+                summary,
+                "frontend_short_batch_id",
+                "runtime_short_batch_id",
+                "ws_short_batch_id",
+            )
+            or ""
+        ).strip()
+    }
+    for key in (
+        "frontend_batch_id",
+        "runtime_memory_game_no",
+        "display_game_no",
+        "round_id",
+        "canvas_game_no",
+        "label_game_no",
+    ):
+        text = str((summary.get(key) if summary else "") or "").strip()
+        if text:
+            values.add(_short_batch_from_display_batch(text) or text)
+    return {value for value in values if value}
+
+
+def _phase_signal_batch_matches_current(
+    state: _RuntimeState,
+    summary: Mapping[str, Any] | None,
+    *,
+    batch_id: object = "",
+) -> bool:
+    incoming_batch = str(batch_id or "").strip()
+    if incoming_batch and state.batch_id and incoming_batch == state.batch_id:
+        return True
+    incoming_shorts = _summary_short_batch_ids(summary)
+    if incoming_batch:
+        incoming_shorts.add(_short_batch_from_display_batch(incoming_batch) or incoming_batch)
+    current_shorts = {_short_batch_from_display_batch(state.batch_id)}
+    current_shorts.update(_summary_short_batch_ids(state.safe_summary))
+    current_shorts = {value for value in current_shorts if value}
+    if incoming_shorts and current_shorts and incoming_shorts.intersection(current_shorts):
+        return True
+    return bool(not state.batch_id and incoming_shorts)
+
+
+def _lower_authority_phase_supplement_allowed(
+    state: _RuntimeState,
+    summary: Mapping[str, Any] | None,
+    runtime_state: Mapping[str, Any] | None,
+    *,
+    room_id: object = "",
+    room_label: object = "",
+    batch_id: object = "",
+) -> bool:
+    if not (
+        _safe_summary_has_structured_phase_signal(dict(summary or {}))
+        or _runtime_state_has_structured_phase_signal(dict(runtime_state or {}))
+    ):
+        return False
+    if not _phase_signal_room_matches_current(state, summary, room_id=room_id, room_label=room_label):
+        return False
+    return _phase_signal_batch_matches_current(state, summary, batch_id=batch_id)
+
+
 def _first_present(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
     for key in keys:
         value = mapping.get(key)
@@ -749,7 +902,10 @@ def _apply_runtime_snapshot_to_state(state: _RuntimeState, runtime_state: Mappin
 
 
 _FULL_BATCH_ID_RE = re.compile(r"(?<![\d-])\d{2,}-\d{6,}-\d{6,}-\d+(?!\d)")
-_DISPLAY_BATCH_ID_RE = re.compile(r"(?<![\d-])\d{2,}-\d{6,}-\d{6,}-\d{1,4}(?!\d)")
+_DISPLAY_BATCH_TAIL_MAX_WIDTH = 5
+_DISPLAY_BATCH_ID_RE = re.compile(
+    rf"(?<![\d-])\d{{2,}}-\d{{6,}}-\d{{6,}}-\d{{1,{_DISPLAY_BATCH_TAIL_MAX_WIDTH}}}(?!\d)"
+)
 
 
 def _batch_rank_from_id(value: str) -> tuple[int, int, int, int]:
@@ -762,7 +918,28 @@ def _batch_rank_from_id(value: str) -> tuple[int, int, int, int]:
             parsed.append(int(part))
         except Exception:
             parsed.append(0)
-    return tuple(parsed)  # type: ignore[return-value]
+    # The first segment is a game/table family code on some platforms, not a
+    # monotonic round counter. Rank by the changing round segments first so a
+    # platform-specific family code cannot lock out the visible baccarat round.
+    return (parsed[1], parsed[2], parsed[3], parsed[0])
+
+
+def _batch_round_key_from_id(value: str) -> tuple[int, int, int]:
+    text = str(value or "").strip()
+    if not _FULL_BATCH_ID_RE.fullmatch(text):
+        return (0, 0, 0)
+    parsed: list[int] = []
+    for part in text.split("-")[:3]:
+        try:
+            parsed.append(int(part))
+        except Exception:
+            parsed.append(0)
+    return (parsed[0], parsed[1], parsed[2])
+
+
+def _is_same_round_batch(left: str, right: str) -> bool:
+    left_key = _batch_round_key_from_id(left)
+    return left_key != (0, 0, 0) and left_key == _batch_round_key_from_id(right)
 
 
 def _is_display_batch_id(value: str) -> bool:
@@ -825,7 +1002,7 @@ def _is_trusted_display_batch_id(
 ) -> bool:
     if not _is_display_batch_id(value):
         return False
-    if _batch_tail_width(value) <= 4:
+    if _batch_tail_width(value) <= _DISPLAY_BATCH_TAIL_MAX_WIDTH:
         return True
     return _has_batch_corrobating_context(
         room_id=room_id,
@@ -851,7 +1028,7 @@ def _is_untrusted_zero_countdown(
     trusted_display_game_no = bool(
         display_game_no
         and (
-            _batch_tail_width(display_game_no) <= 4
+            _batch_tail_width(display_game_no) <= _DISPLAY_BATCH_TAIL_MAX_WIDTH
             or _has_batch_corrobating_context(
                 room_label=room_label,
                 limit_label=limit_label,
@@ -867,11 +1044,15 @@ def _is_untrusted_zero_countdown(
 
 
 def _is_stale_locked_batch(state: _RuntimeState, batch_id: str) -> bool:
+    if _is_same_round_batch(batch_id, state.locked_frontend_batch_id):
+        return False
     rank = _batch_rank_from_id(batch_id)
     return bool(rank != (0, 0, 0, 0) and state.locked_frontend_batch_rank and rank < state.locked_frontend_batch_rank)
 
 
 def _is_stale_current_batch(state: _RuntimeState, batch_id: str) -> bool:
+    if _is_same_round_batch(batch_id, state.batch_id):
+        return False
     rank = _batch_rank_from_id(batch_id)
     current_rank = _batch_rank_from_id(state.batch_id)
     return bool(rank != (0, 0, 0, 0) and current_rank != (0, 0, 0, 0) and rank < current_rank)
@@ -925,6 +1106,91 @@ def _promote_room_lock(state: _RuntimeState, *, room_id: object = "", room_label
         state.locked_room_id = incoming_id
     if incoming_label and not state.locked_room_label:
         state.locked_room_label = incoming_label
+
+
+def _reset_room_observation_counters(state: _RuntimeState) -> None:
+    state.room_conflict_identity = ""
+    state.room_conflict_seen_count = 0
+    state.room_absent_seen_count = 0
+
+
+def _reset_runtime_room_fields(state: _RuntimeState) -> None:
+    state.batch_id = ""
+    state.phase_text = ""
+    state.countdown = -1
+    state.countdown_anchor_ms = 0
+    state.locked_frontend_batch_id = ""
+    state.locked_frontend_batch_rank = (0, 0, 0, 0)
+    state.frontend_locked_context_path = ""
+    state.runtime_state = {}
+    state.runtime_action = None
+    state.runtime_timed = None
+    state.runtime_selected_bet = None
+    state.runtime_pending_chip_cents = None
+    state.runtime_current_load_type = None
+    state.runtime_is_can_betting = None
+    state.runtime_authority = 0
+    state.runtime_authority_ms = 0
+
+
+def _room_identity_key(*, room_id: object = "", room_label: object = "") -> str:
+    incoming_id = str(room_id or "").strip()
+    incoming_label = _normalized_room_label(room_label) or _room_label_hint_from_id(incoming_id)
+    return incoming_label or incoming_id
+
+
+def _room_conflict_confirmed(state: _RuntimeState, *, room_id: object = "", room_label: object = "") -> bool:
+    key = _room_identity_key(room_id=room_id, room_label=room_label)
+    if not key.strip("|"):
+        state.room_conflict_identity = ""
+        state.room_conflict_seen_count = 0
+        return False
+    if key == state.room_conflict_identity:
+        state.room_conflict_seen_count += 1
+    else:
+        state.room_conflict_identity = key
+        state.room_conflict_seen_count = 1
+    return state.room_conflict_seen_count >= ROOM_CONFLICT_SWITCH_SAMPLES
+
+
+def _switch_room_lock_for_observed_room(
+    state: _RuntimeState,
+    *,
+    room_id: object = "",
+    room_label: object = "",
+    source: str,
+) -> bool:
+    incoming_id = str(room_id or "").strip()
+    incoming_label = _normalized_room_label(room_label) or _room_label_hint_from_id(incoming_id)
+    if not incoming_id and not incoming_label:
+        return False
+    previous_room_id = state.locked_room_id or state.room_id
+    previous_room_label = state.locked_room_label or state.room_label
+    state.locked_room_id = incoming_id
+    state.locked_room_label = incoming_label
+    state.room_id = incoming_id
+    state.room_label = incoming_label
+    _reset_runtime_room_fields(state)
+    state.source = source
+    state.safe_summary = {
+        key: value
+        for key, value in _drop_volatile_safe_summary(state.safe_summary).items()
+        if key not in _ROOM_SWITCH_SAFE_SUMMARY_KEYS
+    }
+    state.safe_summary.update(
+        {
+            "observed_room_switch": True,
+            "previous_room_id": previous_room_id,
+            "previous_room_label": previous_room_label,
+            "room_id": incoming_id,
+            "room_label": incoming_label,
+            "locked_room_id": incoming_id,
+            "locked_room_label": incoming_label,
+        }
+    )
+    _reset_room_observation_counters(state)
+    state.frame_id += 1
+    return True
 
 
 _ROOM_SWITCH_SAFE_SUMMARY_KEYS = {
@@ -981,24 +1247,10 @@ def _switch_room_lock_for_entry(
     state.locked_room_label = incoming_label
     state.room_id = incoming_id
     state.room_label = incoming_label
-    state.batch_id = ""
-    state.phase_text = ""
-    state.countdown = -1
-    state.countdown_anchor_ms = 0
+    _reset_runtime_room_fields(state)
     state.balance = ""
     state.source = "room_entry_lock_switch"
-    state.locked_frontend_batch_id = ""
-    state.locked_frontend_batch_rank = (0, 0, 0, 0)
-    state.frontend_locked_context_path = ""
-    state.runtime_state = {}
-    state.runtime_action = None
-    state.runtime_timed = None
-    state.runtime_selected_bet = None
-    state.runtime_pending_chip_cents = None
-    state.runtime_current_load_type = None
-    state.runtime_is_can_betting = None
-    state.runtime_authority = 0
-    state.runtime_authority_ms = 0
+    _reset_room_observation_counters(state)
     state.safe_summary = {
         key: value
         for key, value in _drop_volatile_safe_summary(state.safe_summary).items()
@@ -1025,27 +1277,14 @@ def _clear_room_state_for_hall(
     state.room_id = ""
     state.room_label = ""
     state.limit_label = ""
-    state.phase_text = ""
-    state.countdown = -1
-    state.countdown_anchor_ms = 0
+    _reset_runtime_room_fields(state)
     balance_text = str(balance or "").strip()
     if balance_text:
         state.balance = balance_text
     state.source = "hall_idle"
-    state.locked_frontend_batch_id = ""
-    state.locked_frontend_batch_rank = (0, 0, 0, 0)
-    state.frontend_locked_context_path = ""
     state.locked_room_id = ""
     state.locked_room_label = ""
-    state.runtime_state = {}
-    state.runtime_action = None
-    state.runtime_timed = None
-    state.runtime_selected_bet = None
-    state.runtime_pending_chip_cents = None
-    state.runtime_current_load_type = None
-    state.runtime_is_can_betting = None
-    state.runtime_authority = 0
-    state.runtime_authority_ms = 0
+    _reset_room_observation_counters(state)
     summary = dict(ready_summary or {})
     summary.update(
         {
@@ -1059,6 +1298,48 @@ def _clear_room_state_for_hall(
     state.safe_summary = summary
     state.frame_id += 1
     return state.snapshot()
+
+
+def _clear_room_state_if_room_absent(
+    state: _RuntimeState,
+    *,
+    balance: object = "",
+    ready_summary: Mapping[str, Any] | None = None,
+) -> TemporalStateSnapshot | None:
+    has_room_state = bool(
+        state.batch_id
+        or state.room_id
+        or state.room_label
+        or state.locked_room_id
+        or state.locked_room_label
+    )
+    if not has_room_state:
+        state.room_absent_seen_count = 0
+        return None
+    state.room_absent_seen_count += 1
+    if state.room_absent_seen_count < ROOM_ABSENT_CLEAR_SAMPLES:
+        return None
+    summary = dict(ready_summary or {})
+    summary["room_absent_clear"] = True
+    return _clear_room_state_for_hall(state, balance=balance, ready_summary=summary)
+
+
+def _runtime_probe_has_live_game_state(
+    *,
+    runtime_snapshot: LiveRuntimeSnapshot | None = None,
+    label_snapshot: LiveLabelRuntimeSnapshot | None = None,
+    canvas_snapshot: CanvasTextSnapshot | None = None,
+) -> bool:
+    for snapshot in (runtime_snapshot, label_snapshot, canvas_snapshot):
+        if snapshot is None:
+            continue
+        if str(getattr(snapshot, "game_no", "") or "").strip():
+            return True
+        if getattr(snapshot, "countdown_seconds", None) is not None:
+            return True
+        if str(getattr(snapshot, "phase_text", "") or "").strip():
+            return True
+    return False
 
 
 def _limit_label_from_cents(low: object, high: object) -> str:
@@ -1144,6 +1425,15 @@ def _frontend_event_is_unbound_root_runtime_noise(event: FrontendStateEvent) -> 
     if event.room_label or event.room_id or event.limit_label or event.phase_text:
         return False
     return bool(event.batch_id or event.countdown is not None or event.action is not None)
+
+
+def _frontend_event_is_passive_analytics_profile(event: FrontendStateEvent) -> bool:
+    path = str(event.context_path or "").strip().lower()
+    if path != "application.currentscene.analyticsdata":
+        return False
+    if _frontend_event_updates_runtime_values(event):
+        return False
+    return bool(event.batch_id or event.room_id or event.room_label or event.limit_label or event.balance)
 
 
 def _frontend_event_runtime_authority(event: FrontendStateEvent) -> int:
@@ -1240,7 +1530,15 @@ def _select_frontend_state_event(state: _RuntimeState, events: list[FrontendStat
     ]
     if state.locked_frontend_batch_id:
         # If we have a lock, only allow full batches that are >= current lock
-        candidates = [e for e in candidates if not e.batch_id_is_full or e.batch_rank >= state.locked_frontend_batch_rank]
+        candidates = [
+            e
+            for e in candidates
+            if (
+                not e.batch_id_is_full
+                or e.batch_rank >= state.locked_frontend_batch_rank
+                or _is_same_round_batch(e.batch_id, state.locked_frontend_batch_id)
+            )
+        ]
         if not candidates:
             return None
 
@@ -1277,17 +1575,26 @@ def _select_frontend_state_events(state: _RuntimeState, events: list[FrontendSta
             is_newer_full_batch = bool(
                 e.batch_id_is_full
                 and e.batch_rank != (0, 0, 0, 0)
+                and not _is_same_round_batch(e.batch_id, state.locked_frontend_batch_id)
                 and e.batch_rank > state.locked_frontend_batch_rank
             )
             if not _is_bindable_frontend_source(e.context_path) and not is_newer_full_batch:
                 # Generic runtime hints without room identity are only accepted when they
                 # move the full game number forward.
                 continue
-            if e.batch_id_is_full and e.batch_rank < state.locked_frontend_batch_rank:
+            if (
+                e.batch_id_is_full
+                and e.batch_rank < state.locked_frontend_batch_rank
+                and not _is_same_round_batch(e.batch_id, state.locked_frontend_batch_id)
+            ):
                 # Reject stale batches
                 continue
         elif state.locked_frontend_batch_id:
-            if e.batch_id_is_full and e.batch_rank < state.locked_frontend_batch_rank:
+            if (
+                e.batch_id_is_full
+                and e.batch_rank < state.locked_frontend_batch_rank
+                and not _is_same_round_batch(e.batch_id, state.locked_frontend_batch_id)
+            ):
                 continue
         valid.append(e)
     
@@ -1350,12 +1657,57 @@ def _update_from_frontend_state(state: _RuntimeState, event: FrontendStateEvent)
     if _frontend_event_is_unbound_root_runtime_noise(event):
         return state.snapshot()
     if _frontend_event_conflicts_room_lock(state, event):
-        return state.snapshot()
+        trusted_room_runtime = bool(
+            event.batch_id_is_full
+            and _frontend_event_updates_runtime_values(event)
+            and (
+                _is_current_room_list_runtime_context(event.context_path)
+                or (
+                    _is_bindable_frontend_source(event.context_path)
+                    and not _is_room_list_cache_context(event.context_path)
+                )
+            )
+        )
+        if not trusted_room_runtime or not _room_conflict_confirmed(
+            state,
+            room_id=event.room_id,
+            room_label=event.room_label,
+        ):
+            return state.snapshot()
+        _switch_room_lock_for_observed_room(
+            state,
+            room_id=event.room_id,
+            room_label=event.room_label,
+            source="frontend_room_switch",
+        )
     if _frontend_event_lacks_expected_room_identity(state, event):
         return state.snapshot()
+    if _frontend_event_is_passive_analytics_profile(event):
+        summary = {
+            "frontend_room_label": event.room_label,
+            "frontend_room_id": event.room_id,
+            "frontend_limit_label": event.limit_label,
+            "frontend_context_path": event.context_path,
+            "frontend_matched_paths": event.matched_paths,
+            "frontend_event_type": event.event_type,
+            "frontend_runtime_ignored_reason": "passive_analytics_profile",
+        }
+        if event.batch_id:
+            summary["frontend_ignored_game_no"] = event.batch_id
+        summary = {k: v for k, v in summary.items() if v is not None}
+        return state.update(
+            room_id=event.room_id,
+            room_label=event.room_label,
+            limit_label=event.limit_label,
+            balance=event.balance,
+            source="frontend_analytics_profile",
+            confidence=event.confidence,
+            safe_summary=summary,
+        )
     was_newer_full_batch = bool(
         event.batch_id_is_full
         and event.batch_rank != (0, 0, 0, 0)
+        and not _is_same_round_batch(event.batch_id, state.locked_frontend_batch_id)
         and event.batch_rank > state.locked_frontend_batch_rank
     )
     _lock_frontend_source_if_needed(state, event)
@@ -1396,7 +1748,16 @@ def _update_from_frontend_state(state: _RuntimeState, event: FrontendStateEvent)
     event_is_can_betting = event.is_can_betting
     if ignore_json_runtime:
         source_tag = "frontend_json_parse_runtime_ignored"
-        event_countdown = -1 if event.batch_id_is_full and event.batch_id and event.batch_id != state.batch_id else None
+        event_countdown = (
+            -1
+            if (
+                event.batch_id_is_full
+                and event.batch_id
+                and event.batch_id != state.batch_id
+                and not _is_same_round_batch(event.batch_id, state.batch_id)
+            )
+            else None
+        )
         event_phase_text = ""
         event_action = None
         event_timed = None
@@ -1535,7 +1896,7 @@ def _update_from_label_runtime_state(state: _RuntimeState, snapshot: LiveLabelRu
     )
     if (
         display_game_no
-        and _batch_tail_width(display_game_no) > 4
+        and _batch_tail_width(display_game_no) > _DISPLAY_BATCH_TAIL_MAX_WIDTH
         and not label_visible_context
         and not _has_batch_corrobating_context(
             room_label=snapshot.room_label,
@@ -1551,7 +1912,19 @@ def _update_from_label_runtime_state(state: _RuntimeState, snapshot: LiveLabelRu
             display_game_no = ""
         else:
             _promote_visible_batch_lock(state, display_game_no)
-    _promote_room_lock(state, room_label=snapshot.room_label)
+    if snapshot.room_label and _room_identity_conflicts(state, room_label=snapshot.room_label):
+        if not display_game_no or not _room_conflict_confirmed(state, room_label=snapshot.room_label):
+            return state.snapshot()
+        _switch_room_lock_for_observed_room(
+            state,
+            room_label=snapshot.room_label,
+            source="label_runtime_room_switch",
+        )
+    else:
+        if snapshot.room_label:
+            state.room_conflict_identity = ""
+            state.room_conflict_seen_count = 0
+        _promote_room_lock(state, room_label=snapshot.room_label)
             
     summary = {
         "label_game_no": display_game_no,
@@ -1610,7 +1983,7 @@ def _update_from_canvas_text_state(state: _RuntimeState, snapshot: CanvasTextSna
     )
     if (
         display_game_no
-        and _batch_tail_width(display_game_no) > 4
+        and _batch_tail_width(display_game_no) > _DISPLAY_BATCH_TAIL_MAX_WIDTH
         and not canvas_visible_context
         and not _has_batch_corrobating_context(
             room_label=snapshot.room_label,
@@ -1626,7 +1999,19 @@ def _update_from_canvas_text_state(state: _RuntimeState, snapshot: CanvasTextSna
             display_game_no = ""
         else:
             _promote_visible_batch_lock(state, display_game_no)
-    _promote_room_lock(state, room_label=snapshot.room_label)
+    if snapshot.room_label and _room_identity_conflicts(state, room_label=snapshot.room_label):
+        if not display_game_no or not _room_conflict_confirmed(state, room_label=snapshot.room_label):
+            return state.snapshot()
+        _switch_room_lock_for_observed_room(
+            state,
+            room_label=snapshot.room_label,
+            source="canvas_text_room_switch",
+        )
+    else:
+        if snapshot.room_label:
+            state.room_conflict_identity = ""
+            state.room_conflict_seen_count = 0
+        _promote_room_lock(state, room_label=snapshot.room_label)
     summary = {
         "canvas_game_no": display_game_no,
         "canvas_countdown": snapshot.countdown_seconds,
@@ -1676,11 +2061,6 @@ def _update_from_page_runtime_state(state: _RuntimeState, runtime: LiveRuntimeSn
     runtime_room_label = str(runtime_frame.get("table_label") or "") or _room_label_hint_from_id(runtime_room_id)
     if not runtime_room_label:
         runtime_room_label = str(state.safe_summary.get("room_entry_expected_room_label") or "")
-    if runtime_room_id or runtime_room_label:
-        if _room_identity_conflicts(state, room_id=runtime_room_id, room_label=runtime_room_label):
-            return state.snapshot()
-        _promote_room_lock(state, room_id=runtime_room_id, room_label=runtime_room_label)
-
     runtime_limit_label = _limit_label_from_cents(
         runtime_frame.get("user_min_bet_cents"),
         runtime_frame.get("user_max_bet_cents"),
@@ -1702,6 +2082,24 @@ def _update_from_page_runtime_state(state: _RuntimeState, runtime: LiveRuntimeSn
             or runtime.phase_key not in ("", "unknown")
         )
     )
+    if runtime_room_id or runtime_room_label:
+        if _room_identity_conflicts(state, room_id=runtime_room_id, room_label=runtime_room_label):
+            if not runtime_has_state or not _room_conflict_confirmed(
+                state,
+                room_id=runtime_room_id,
+                room_label=runtime_room_label,
+            ):
+                return state.snapshot()
+            _switch_room_lock_for_observed_room(
+                state,
+                room_id=runtime_room_id,
+                room_label=runtime_room_label,
+                source="page_runtime_room_switch",
+            )
+        else:
+            state.room_conflict_identity = ""
+            state.room_conflict_seen_count = 0
+            _promote_room_lock(state, room_id=runtime_room_id, room_label=runtime_room_label)
 
     summary = {
         "runtime_memory_game_no": runtime_game_no if runtime_has_state else "",
@@ -1779,6 +2177,74 @@ def _emit(event_queue: mp.Queue, instance_id: str, event_type: WorkerEventType, 
 def _emit_state(event_queue: mp.Queue, snapshot: TemporalStateSnapshot) -> None:
     """Emit a game state update event."""
     _emit(event_queue, snapshot.instance_id, "state", snapshot.to_safe_dict())
+
+
+def _diagnostic_page_url(page: Any) -> str:
+    try:
+        parts = urlsplit(str(getattr(page, "url", "") or ""))
+    except Exception:
+        return ""
+    if not parts.scheme or not parts.netloc:
+        return str(getattr(page, "url", "") or "")[:160]
+    path = parts.path or "/"
+    return f"{parts.scheme}://{parts.netloc}{path}"[:160]
+
+
+def _emit_hall_clear_probe_audit(
+    config: ClusterWorkerConfig,
+    runtime: dict[str, Any],
+    state: "_RuntimeState",
+    event_queue: mp.Queue,
+    *,
+    location: str,
+    page: Any,
+    ready: Any,
+    room_entry_loading: bool,
+    would_clear: bool,
+    page_index: int = -1,
+    page_count: int = 0,
+) -> None:
+    payload = {
+        "audit_type": "hall_clear_probe",
+        "location": location,
+        "page_index": page_index,
+        "page_count": page_count,
+        "page_url": _diagnostic_page_url(page),
+        "ready": ready.safe_summary() if hasattr(ready, "safe_summary") else {},
+        "room_entry_loading": bool(room_entry_loading),
+        "would_clear": bool(would_clear),
+        "state": {
+            "batch_id": str(getattr(state, "batch_id", "") or ""),
+            "room_id": str(getattr(state, "room_id", "") or ""),
+            "room_label": str(getattr(state, "room_label", "") or ""),
+        },
+    }
+    signature = json.dumps(
+        {
+            "location": payload["location"],
+            "page_index": payload["page_index"],
+            "page_url": payload["page_url"],
+            "ready": payload["ready"],
+            "room_entry_loading": payload["room_entry_loading"],
+            "would_clear": payload["would_clear"],
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+        default=str,
+    )
+    current_ms = now_ms()
+    last_by_location = runtime.setdefault("hall_clear_probe_last", {})
+    throttle_key = f"{location}:{page_index}"
+    last = last_by_location.get(throttle_key) if isinstance(last_by_location, dict) else None
+    if (
+        isinstance(last, dict)
+        and last.get("signature") == signature
+        and current_ms - int(last.get("timestamp_ms") or 0) < 1000
+    ):
+        return
+    if isinstance(last_by_location, dict):
+        last_by_location[throttle_key] = {"signature": signature, "timestamp_ms": current_ms}
+    _emit(event_queue, config.instance_id, "audit", payload)
 
 
 def _runtime_v2_shadow_enabled(config: ClusterWorkerConfig) -> bool:
@@ -2282,13 +2748,29 @@ async def _poll_frontend_state(config, runtime, state, event_queue, stop_event):
             include_object_scan = captured_ms - last_object_scan_ms >= 500
             if include_object_scan:
                 last_object_scan_ms = captured_ms
-            for page in list(context.pages):
+            pages = list(context.pages)
+            page_count = len(pages)
+            for page_index, page in enumerate(pages):
                 if page.is_closed(): continue
                 try:
                     ready = await read_baccarat_load_state(page)
                     room_entry_loading = bool(
                         runtime.get("room_entry_pending")
                         or now_ms() < int(runtime.get("room_entry_loading_until_ms") or 0)
+                    )
+                    would_clear = bool(ready.hall_ready and not ready.game_ready and not room_entry_loading)
+                    _emit_hall_clear_probe_audit(
+                        config,
+                        runtime,
+                        state,
+                        event_queue,
+                        location="frontend_poll",
+                        page=page,
+                        ready=ready,
+                        room_entry_loading=room_entry_loading,
+                        would_clear=would_clear,
+                        page_index=page_index,
+                        page_count=page_count,
                     )
                     if ready.hall_ready and not ready.game_ready and not room_entry_loading:
                         continue
@@ -2297,7 +2779,9 @@ async def _poll_frontend_state(config, runtime, state, event_queue, stop_event):
                 raw_events = await _collect_frontend_events_from_page(config, page, include_object_scan=include_object_scan)
                 if raw_events:
                     _emit_bet_confirmation_audits(config, runtime, state, event_queue, raw_events, captured_ms)
-                    parsed_events = [parse_frontend_state_event(ev) for ev in raw_events]
+                    parsed_events: list[FrontendStateEvent] = []
+                    for raw_event in raw_events:
+                        parsed_events.extend(parse_frontend_state_events(raw_event))
                     parsed_events = [e for e in parsed_events if e and e.has_state]
                     _cache_runtime_v2_frontend_events(runtime, parsed_events)
                     selected = _select_frontend_state_events(state, parsed_events)
@@ -2359,11 +2843,34 @@ async def _poll_runtime_state(config, runtime, state, event_queue, stop_event):
             active_page = await _active_page(context)
             runtime["page"] = active_page
             ready = await read_baccarat_load_state(active_page)
+            try:
+                pages = [page for page in list(context.pages) if not page.is_closed()]
+            except Exception:
+                pages = []
+            try:
+                page_index = pages.index(active_page)
+            except ValueError:
+                page_index = -1
             room_entry_loading = bool(
                 runtime.get("room_entry_pending")
                 or now_ms() < int(runtime.get("room_entry_loading_until_ms") or 0)
             )
+            would_clear = bool(ready.hall_ready and not ready.game_ready and not room_entry_loading)
+            _emit_hall_clear_probe_audit(
+                config,
+                runtime,
+                state,
+                event_queue,
+                location="runtime_poll",
+                page=active_page,
+                ready=ready,
+                room_entry_loading=room_entry_loading,
+                would_clear=would_clear,
+                page_index=page_index,
+                page_count=len(pages),
+            )
             if ready.game_ready:
+                state.room_absent_seen_count = 0
                 runtime["room_entry_loading_until_ms"] = 0
             if ready.hall_ready and not ready.game_ready and not room_entry_loading:
                 runtime_snapshot = (
@@ -2396,6 +2903,23 @@ async def _poll_runtime_state(config, runtime, state, event_queue, stop_event):
                 if canvas:
                     snapshot = _update_from_canvas_text_state(state, canvas)
                     _emit_state(event_queue, snapshot)
+            if not ready.game_ready and not room_entry_loading:
+                if _runtime_probe_has_live_game_state(
+                    runtime_snapshot=runtime_snapshot,
+                    label_snapshot=labels,
+                    canvas_snapshot=canvas,
+                ):
+                    state.room_absent_seen_count = 0
+                else:
+                    snapshot = _clear_room_state_if_room_absent(
+                        state,
+                        balance=runtime_snapshot.balance_text if runtime_snapshot else "",
+                        ready_summary=ready.safe_summary(),
+                    )
+                    if snapshot:
+                        _emit_state(event_queue, snapshot)
+                        await asyncio.sleep(0.5)
+                        continue
             _emit_runtime_v2_shadow(
                 config=config,
                 runtime=runtime,
@@ -3158,15 +3682,22 @@ async def _wait_for_hall_entry_click_confirmation(
         raw_events = await _drain_frontend_probe_raw_events(page)
         seen_events += len(raw_events)
         for raw in raw_events:
-            event = parse_frontend_state_event(raw)
-            if event and _frontend_event_matches_hall_entry_room(event, room_index, expected_identity):
+            matching_event = next(
+                (
+                    event
+                    for event in parse_frontend_state_events(raw)
+                    if _frontend_event_matches_hall_entry_room(event, room_index, expected_identity)
+                ),
+                None,
+            )
+            if matching_event:
                 return {
                     "confirmed": True,
                     "reason": "room_identity_packet",
-                    "room_id": event.room_id,
-                    "room_label": event.room_label,
-                    "context_path": event.context_path,
-                    "event_type": event.event_type,
+                    "room_id": matching_event.room_id,
+                    "room_label": matching_event.room_label,
+                    "context_path": matching_event.context_path,
+                    "event_type": matching_event.event_type,
                     "ready": last_ready.safe_summary(),
                     "seen_events": seen_events,
                 }

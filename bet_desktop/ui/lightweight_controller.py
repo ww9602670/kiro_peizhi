@@ -84,11 +84,21 @@ def _safe_summary_from(payload: dict[str, Any]) -> dict[str, Any]:
     return safe_summary if isinstance(safe_summary, dict) else {}
 
 
+def _hall_idle_without_game(payload: dict[str, Any], safe_summary: dict[str, Any]) -> bool:
+    return bool(
+        _truthy(safe_summary.get("hall_idle"))
+        and not _truthy(payload.get("game_ready"))
+        and not _truthy(safe_summary.get("game_ready"))
+    )
+
+
 def _snapshot_timestamp_ms(snapshot: dict[str, Any]) -> int:
     return _as_int(snapshot.get("timestamp_captured_ms")) or _now_ms()
 
 
 def _decayed_countdown(snapshot: dict[str, Any], safe_summary: dict[str, Any], *, current_ms: int) -> int | None:
+    if _hall_idle_without_game(snapshot, safe_summary):
+        return None
     countdown = _as_int(snapshot.get("exact_countdown"))
     if countdown is None:
         countdown = _as_int(
@@ -113,6 +123,8 @@ def _decayed_countdown(snapshot: dict[str, Any], safe_summary: dict[str, Any], *
 
 
 def _runtime_room_label_from_summary(safe_summary: dict[str, Any]) -> str:
+    if _hall_idle_without_game({}, safe_summary):
+        return ""
     return _first_text(
         safe_summary.get("display_room_label"),
         safe_summary.get("room_label"),
@@ -125,6 +137,8 @@ def _runtime_room_label_from_summary(safe_summary: dict[str, Any]) -> str:
 
 
 def _round_id_from_snapshot(snapshot: dict[str, Any], safe_summary: dict[str, Any]) -> str:
+    if _hall_idle_without_game(snapshot if isinstance(snapshot, dict) else {}, safe_summary):
+        return "-"
     return _public_round_id(_first_text(
         snapshot.get("batch_id") if isinstance(snapshot, dict) else "",
         safe_summary.get("display_game_no"),
@@ -152,6 +166,8 @@ def _phase_label_from_summary(safe_summary: dict[str, Any]) -> str:
 
 
 def _has_room_runtime_evidence(payload: dict[str, Any], safe_summary: dict[str, Any]) -> bool:
+    if _hall_idle_without_game(payload, safe_summary):
+        return False
     if _runtime_room_label_from_summary(safe_summary):
         return True
     if _round_id_from_snapshot(payload, safe_summary) != "-":
@@ -177,6 +193,8 @@ def _has_room_runtime_evidence(payload: dict[str, Any], safe_summary: dict[str, 
 
 def _payload_game_ready(payload: dict[str, Any], safe_summary: dict[str, Any] | None = None) -> bool:
     summary = safe_summary if safe_summary is not None else _safe_summary_from(payload)
+    if _hall_idle_without_game(payload, summary):
+        return False
     return (
         _truthy(payload.get("game_ready"))
         or _truthy(summary.get("game_ready"))
@@ -437,6 +455,8 @@ class LightweightController:
                 if "runtime_betting_open" in safe_summary
                 else safe_summary.get("runtime_is_can_betting")
             )
+            if _hall_idle_without_game(snapshot if isinstance(snapshot, dict) else {}, safe_summary):
+                raw_betting_open = False
             countdown_expired = (
                 _truthy(safe_summary.get("ui_reference_countdown"))
                 and countdown is not None

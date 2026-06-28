@@ -68,6 +68,7 @@ class LightweightDashboard(QMainWindow):
         self.health_labels: dict[str, QLabel] = {}
         self.turnover_labels: dict[str, dict[str, QLabel]] = {}
         self.pnl_rows: dict[str, dict[str, QLabel]] = {}
+        self.outcome_labels: dict[str, QLabel] = {}
         self.round_table = None
         self._current_balances: dict[str, Decimal] = {}
         self._initial_balances: dict[str, Decimal] = {}
@@ -75,6 +76,11 @@ class LightweightDashboard(QMainWindow):
         self._withdraw_totals: dict[str, Decimal] = {}
         self._profit_tracking_active = True
         self._turnover_reset_index = 0
+        self._outcome_pending: list[dict[str, Any]] = []
+        self._outcome_recorded_rounds: set[str] = set()
+        self._outcome_counts: dict[str, int] = {"banker": 0, "player": 0, "tie": 0}
+        self._outcome_commission_total = Decimal("0")
+        self._account_round_ids: dict[str, str] = {}
         self._run_started_at: float | None = None
         self._plan_account_states: dict[str, str] = self.controller.plan_account_states
 
@@ -238,6 +244,7 @@ class LightweightDashboard(QMainWindow):
         right.setSpacing(12)
         right.addWidget(self._build_plan_panel())
         right.addWidget(self._build_health_panel())
+        right.addWidget(self._build_outcome_panel())
         right.addStretch()
         layout.addWidget(right_col)
         return page
@@ -471,6 +478,21 @@ class LightweightDashboard(QMainWindow):
         ]):
             grid.addWidget(self._health_box(value, label, key), index // 3, index % 3)
         body.addLayout(grid)
+        return panel
+
+    def _build_outcome_panel(self) -> QWidget:
+        panel, body = self._panel("开奖统计", "启动后")
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self._outcome_metric_box("0.00", "抽成累计", "commission"), 1)
+        counts = QVBoxLayout()
+        counts.setSpacing(6)
+        counts.addWidget(self._outcome_count_row("庄次数", "0", "banker"))
+        counts.addWidget(self._outcome_count_row("闲次数", "0", "player"))
+        counts.addWidget(self._outcome_count_row("和次数", "0", "tie"))
+        row.addLayout(counts, 1)
+        body.addLayout(row)
         return panel
 
     def _build_log_panel(self) -> QWidget:
@@ -879,6 +901,39 @@ class LightweightDashboard(QMainWindow):
         layout.addWidget(number)
         layout.addWidget(text)
         return box
+
+    def _outcome_metric_box(self, value: str, label: str, key: str) -> QWidget:
+        box = QFrame()
+        box.setObjectName("outcomeBox")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(3)
+        number = QLabel(value)
+        number.setObjectName("outcomeValue")
+        number.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        text = QLabel(label)
+        text.setObjectName("hint")
+        text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(number, 1)
+        layout.addWidget(text)
+        self.outcome_labels[key] = number
+        return box
+
+    def _outcome_count_row(self, label: str, value: str, key: str) -> QWidget:
+        row = QFrame()
+        row.setObjectName("outcomeCountRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 5, 8, 5)
+        layout.setSpacing(6)
+        title = QLabel(label)
+        title.setObjectName("hint")
+        number = QLabel(value)
+        number.setObjectName("metricValue")
+        number.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(title, 1)
+        layout.addWidget(number)
+        self.outcome_labels[key] = number
+        return row
 
     def _advanced_title(self, title: str, pill: str) -> QWidget:
         row = QFrame()
@@ -1348,6 +1403,9 @@ class LightweightDashboard(QMainWindow):
             card["round"].setText(f"局号：{getattr(summary, 'round_id', '-') or '-'}")
             balance = getattr(summary, "balance", None)
             card["balance"].setText(f"余额：{balance if balance is not None else '-'}")
+            round_id = self._public_round_key(getattr(summary, "round_id", ""))
+            if round_id:
+                self._account_round_ids[account_id] = round_id
             if "target_room" in card:
                 card["target_room"].setText(f"目标：{getattr(summary, 'target_room_label', '-') or '-'}")
             if "room_progress" in card:
@@ -1357,6 +1415,7 @@ class LightweightDashboard(QMainWindow):
                 self._current_balances[account_id] = balance_value
                 if self._profit_tracking_active and account_id not in self._initial_balances:
                     self._initial_balances[account_id] = balance_value
+                self._settle_outcome_pending(account_id, balance_value, current_round_id=round_id)
         self._refresh_profit_display()
 
     def _format_money_value(self, value: object) -> str:
@@ -1489,6 +1548,166 @@ class LightweightDashboard(QMainWindow):
                 row["profit"].setProperty("tone", "")
             self._refresh_widget_style(row["profit"])
 
+    def _public_round_key(self, value: object) -> str:
+        text = str(value or "").strip()
+        if not text or text in {"-", "None", "none", "null"}:
+            return ""
+        parts = text.split("-")
+        if len(parts) >= 4 and parts[-1].strip().isdigit():
+            return "-".join(part.strip() for part in parts[:3] if part.strip())
+        return text
+
+    def _outcome_round_key(self, result: object) -> str:
+        round_id = self._public_round_key(getattr(result, "round_id", ""))
+        round_number = str(getattr(result, "round_number", "") or "")
+        return f"{round_number}:{round_id}" if round_id or round_number else str(id(result))
+
+    def _round_leg_by_account(self, result: object) -> dict[str, dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
+        for item in getattr(result, "legs", []) or []:
+            if isinstance(item, dict):
+                account_id = str(item.get("account_id") or item.get("instance_id") or "")
+                if account_id:
+                    rows[account_id] = item
+        return rows
+
+    def _normalized_side(self, value: object) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"banker", "庄", "庄家"}:
+            return "banker"
+        if text in {"player", "闲", "闲家"}:
+            return "player"
+        if text in {"tie", "和"}:
+            return "tie"
+        return ""
+
+    def _track_outcome_rounds(self, results: list[object]) -> None:
+        for result in results:
+            key = self._outcome_round_key(result)
+            if key in self._outcome_recorded_rounds:
+                continue
+            self._outcome_recorded_rounds.add(key)
+            result_rows = self._result_by_account(result)
+            leg_rows = self._round_leg_by_account(result)
+            main_account = self.controller.main_account
+            main_result = result_rows.get(main_account)
+            main_leg = leg_rows.get(main_account, {})
+            if not main_result:
+                continue
+            main_side = self._normalized_side(
+                main_leg.get("side") or main_leg.get("side_text") or main_result.get("side") or main_result.get("side_text")
+            )
+            main_actual = self._decimal_or_none(main_result.get("actual_amount"))
+            if main_side not in {"banker", "player"} or main_actual is None or main_actual <= 0:
+                continue
+            banker_total = Decimal("0")
+            for account_id, row in result_rows.items():
+                leg = leg_rows.get(account_id, {})
+                side = self._normalized_side(
+                    leg.get("side") or leg.get("side_text") or row.get("side") or row.get("side_text")
+                )
+                if side != "banker":
+                    continue
+                actual = self._decimal_or_none(row.get("actual_amount"))
+                if actual is not None and actual > 0:
+                    banker_total += actual
+            self._outcome_pending.append(
+                {
+                    "key": key,
+                    "round_id": self._public_round_key(getattr(result, "round_id", "")),
+                    "account_id": main_account,
+                    "main_side": main_side,
+                    "main_actual": main_actual,
+                    "banker_total": banker_total,
+                    "post_balance": self._current_balances.get(main_account),
+                }
+            )
+        for account_id, balance in list(self._current_balances.items()):
+            self._settle_outcome_pending(
+                account_id,
+                balance,
+                current_round_id=self._account_round_ids.get(account_id, ""),
+            )
+        self._refresh_outcome_display()
+
+    def _money_close(self, value: Decimal, target: Decimal, amount: Decimal | None = None) -> bool:
+        tolerance = Decimal("0.06")
+        if amount is not None:
+            tolerance = max(tolerance, abs(amount) * Decimal("0.005"))
+        return abs(value - target) <= tolerance
+
+    def _infer_outcome_from_main_delta(
+        self,
+        *,
+        side: str,
+        amount: Decimal,
+        delta: Decimal,
+        round_changed: bool,
+    ) -> str:
+        if side == "banker":
+            if self._money_close(delta, amount * Decimal("1.95"), amount) or self._money_close(
+                delta,
+                amount * Decimal("2"),
+                amount,
+            ):
+                return "banker"
+            if self._money_close(delta, amount, amount):
+                return "tie"
+            if round_changed and self._money_close(delta, Decimal("0"), amount):
+                return "player"
+        elif side == "player":
+            if self._money_close(delta, amount * Decimal("2"), amount):
+                return "player"
+            if self._money_close(delta, amount, amount):
+                return "tie"
+            if round_changed and self._money_close(delta, Decimal("0"), amount):
+                return "banker"
+        return ""
+
+    def _settle_outcome_pending(self, account_id: str, balance: Decimal, *, current_round_id: str = "") -> None:
+        current_round = self._public_round_key(current_round_id)
+        for pending in list(self._outcome_pending):
+            if pending.get("account_id") != account_id:
+                continue
+            amount = pending.get("main_actual")
+            if not isinstance(amount, Decimal) or amount <= 0:
+                self._outcome_pending.remove(pending)
+                continue
+            post_balance = pending.get("post_balance")
+            if not isinstance(post_balance, Decimal):
+                pending["post_balance"] = balance
+                continue
+            delta = balance - post_balance
+            if delta < 0 and self._money_close(delta, -amount, amount):
+                pending["post_balance"] = balance
+                continue
+            round_id = self._public_round_key(pending.get("round_id"))
+            round_changed = bool(current_round and round_id and current_round != round_id)
+            outcome = self._infer_outcome_from_main_delta(
+                side=str(pending.get("main_side") or ""),
+                amount=amount,
+                delta=delta,
+                round_changed=round_changed,
+            )
+            if not outcome:
+                continue
+            self._outcome_counts[outcome] = self._outcome_counts.get(outcome, 0) + 1
+            if outcome == "banker":
+                banker_total = pending.get("banker_total")
+                if isinstance(banker_total, Decimal) and banker_total > 0:
+                    self._outcome_commission_total += banker_total * Decimal("0.05")
+            self._outcome_pending.remove(pending)
+        self._refresh_outcome_display()
+
+    def _refresh_outcome_display(self) -> None:
+        commission = self.outcome_labels.get("commission")
+        if commission:
+            commission.setText(self._format_balance_value(self._outcome_commission_total))
+        for key in ("banker", "player", "tie"):
+            label = self.outcome_labels.get(key)
+            if label:
+                label.setText(str(self._outcome_counts.get(key, 0)))
+
     def _refresh_turnover_display(self, results: list[object]) -> None:
         totals = {account_id: Decimal("0") for account_id in ACCOUNT_IDS}
         start = min(self._turnover_reset_index, len(results))
@@ -1511,7 +1730,7 @@ class LightweightDashboard(QMainWindow):
         rows: dict[str, dict[str, Any]] = {}
         for item in getattr(result, "results", []) or []:
             if isinstance(item, dict):
-                account_id = str(item.get("instance_id") or "")
+                account_id = str(item.get("instance_id") or item.get("account_id") or "")
                 if account_id:
                     rows[account_id] = item
         return rows
@@ -1598,6 +1817,7 @@ class LightweightDashboard(QMainWindow):
             return
         results = list(payload)
         self._refresh_turnover_display(results)
+        self._track_outcome_rounds(results)
         if not results:
             return
         recent = list(reversed(results[-10:]))
@@ -1776,6 +1996,11 @@ class LightweightDashboard(QMainWindow):
             QLabel#profitValue[tone="negative"] {
                 color: #D92F2F;
             }
+            QLabel#outcomeValue {
+                color: #0f172a;
+                font-size: 20px;
+                font-weight: 800;
+            }
             QLabel#planAmount {
                 background: #eef3f8;
                 border: 1px solid #e3ebf3;
@@ -1895,6 +2120,7 @@ class LightweightDashboard(QMainWindow):
             }
             QFrame#summaryCard, QFrame#accountCard, QFrame#gateItem,
             QFrame#turnoverItem, QFrame#pnlRow, QFrame#planLine, QFrame#healthBox, QFrame#metricRow,
+            QFrame#outcomeBox, QFrame#outcomeCountRow,
             QFrame#batchStrip, QFrame#modeBanner, QFrame#roomSelector {
                 background: #f8fbfe;
                 border: 1px solid #d9e4ee;

@@ -271,7 +271,7 @@ FRONTEND_BOUND_ROOM_SCAN_JS = r"""
   try { if (window.application && window.application._prevScene) visit("application._prevScene", window.application._prevScene, 0); } catch (_) {}
   try { if (window.application && window.application._currentScene) visit("application._currentScene", window.application._currentScene, 0); } catch (_) {}
   candidates.sort((a, b) => b.score - a.score);
-  return { event: "bound_room_object", ts: Date.now(), source: "bound_room_object", contexts: candidates.slice(0, 12) };
+  return { event: "bound_room_object", ts: Date.now(), source: "bound_room_object", contexts: candidates.slice(0, 40) };
 }
 """
 
@@ -360,13 +360,18 @@ class FrontendStateEvent:
 
 
 def parse_frontend_state_event(raw: dict[str, Any]) -> FrontendStateEvent | None:
+    events = parse_frontend_state_events(raw)
+    return events[0] if events else None
+
+
+def parse_frontend_state_events(raw: dict[str, Any]) -> list[FrontendStateEvent]:
     if not isinstance(raw, dict) or raw.get("event") not in {
         "json_parse_state",
         "timed_context",
         "object_scan",
         "bound_room_object",
     }:
-        return None
+        return []
     fields: list[tuple[str, str, Any]] = []
     raw_hits = raw.get("fields") if raw.get("event") == "timed_context" else raw.get("hits")
     default_path = str(raw.get("path") or raw.get("source") or "JSON.parse")
@@ -378,10 +383,36 @@ def parse_frontend_state_event(raw: dict[str, Any]) -> FrontendStateEvent | None
         value = hit.get("value")
         fields.append((path, key, value))
     if not fields and not raw.get("contexts"):
-        return None
+        return []
 
     candidate_fields = _candidate_field_groups(raw, fields)
+    if raw.get("event") in {"object_scan", "bound_room_object"}:
+        events: list[FrontendStateEvent] = []
+        for fields_path, selected_fields in candidate_fields:
+            score = _score_candidate(fields_path, selected_fields)
+            if score < 40:
+                continue
+            event = _frontend_state_event_from_fields(
+                raw,
+                selected_fields,
+                fields_path[:220],
+                max(0.0, min(1.0, score / 140.0)),
+            )
+            if event and event.has_state:
+                events.append(event)
+        return events
+
     selected_fields, context_path, confidence = _select_candidate(candidate_fields)
+    event = _frontend_state_event_from_fields(raw, selected_fields, context_path, confidence)
+    return [event] if event and event.has_state else []
+
+
+def _frontend_state_event_from_fields(
+    raw: dict[str, Any],
+    selected_fields: list[tuple[str, str, Any]],
+    context_path: str,
+    confidence: float,
+) -> FrontendStateEvent | None:
     if _is_stale_history_context(context_path):
         return None
     batch_id, batch_is_full, short_batch_id = _pick_batch_id(selected_fields)
@@ -730,7 +761,7 @@ def _batch_rank(value: str) -> tuple[int, int, int, int]:
             parsed.append(int(part))
         except Exception:
             parsed.append(0)
-    return tuple(parsed)  # type: ignore[return-value]
+    return (parsed[1], parsed[2], parsed[3], parsed[0])
 
 
 def _pick_bool_by_keys(fields: list[tuple[str, str, Any]], keys: set[str]) -> bool | None:
