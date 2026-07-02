@@ -39,6 +39,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon='assets\\LightweightHedgeConsole.ico',
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
