@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from decimal import Decimal
 from dataclasses import replace
 from pathlib import Path
@@ -486,6 +487,45 @@ def test_dashboard_outcome_stats_infer_banker_and_commission(tmp_path: Path) -> 
     assert dashboard.outcome_labels["player"].text() == "0"
     assert dashboard.outcome_labels["tie"].text() == "0"
     assert dashboard.outcome_labels["commission"].text() == "1.50"
+
+    dashboard.close()
+    app.processEvents()
+
+
+def test_dashboard_outcome_stats_follow_effective_main_account(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    controller = LightweightController(
+        config_store=LightweightConfigStore(tmp_path / "lightweight.json"),
+        adapter=FakeBrowserControlAdapter(max_log_entries=20),
+    )
+    dashboard = LightweightDashboard(controller=controller)
+    controller.set_main_account("a1")
+
+    dashboard._on_account_status_updated([SimpleNamespace(account_id="a2", balance=Decimal("90"), round_id="50-1-1")])
+    controller._handle_runtime_event(
+        "",
+        "round",
+        {
+            "round_number": 1,
+            "round_id": "50-1-1-10001",
+            "legs": [
+                {"account_id": "a2", "role": "main", "side": "banker"},
+                {"account_id": "a1", "role": "sub", "side": "player"},
+                {"account_id": "a3", "role": "sub", "side": "player"},
+            ],
+            "results": [
+                {"instance_id": "a2", "actual_amount": 10, "missing_amount": 0, "status": "COMPLETE"},
+                {"instance_id": "a1", "actual_amount": 5, "missing_amount": 0, "status": "COMPLETE"},
+                {"instance_id": "a3", "actual_amount": 5, "missing_amount": 0, "status": "COMPLETE"},
+            ],
+        },
+    )
+    dashboard._on_account_status_updated([SimpleNamespace(account_id="a2", balance=Decimal("109.50"), round_id="50-1-2")])
+
+    assert dashboard.outcome_labels["banker"].text() == "1"
+    assert dashboard.outcome_labels["player"].text() == "0"
+    assert dashboard.outcome_labels["tie"].text() == "0"
+    assert dashboard.outcome_labels["commission"].text() == "0.50"
 
     dashboard.close()
     app.processEvents()
@@ -1990,8 +2030,43 @@ def test_probe_plan_uses_configured_amount_and_chinese_side(tmp_path: Path) -> N
     main_leg = next(leg for leg in plan["legs"] if leg["role"] == "main")
     assert main_leg["account_id"] == "a2"
     assert main_leg["amount"] == 100
-    assert main_leg["side"] == "banker"
-    assert main_leg["side_text"] == "\u5e84"
+    assert main_leg["side"] in {"banker", "player"}
+    assert main_leg["side_text"] == ("\u5e84" if main_leg["side"] == "banker" else "\u95f2")
+
+
+def test_probe_plan_randomizes_side_and_amount_but_locks_round(tmp_path: Path) -> None:
+    adapter = LightweightProbeAdapter(
+        profile_root=tmp_path / "profiles",
+        log_root=tmp_path,
+        plan_random=random.Random(0),
+    )
+    statuses = {account_id: _balance_status(1000) for account_id in ACCOUNT_IDS}
+
+    first = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=80,
+        amount_max=100,
+        statuses=statuses,
+    )
+    second = adapter._build_plan(
+        1,
+        main_account="a2",
+        sub_accounts=("a1", "a3", "a4"),
+        amount_min=80,
+        amount_max=100,
+        statuses=statuses,
+    )
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    first_main = next(leg for leg in first["legs"] if leg["role"] == "main")
+    second_main = next(leg for leg in second["legs"] if leg["role"] == "main")
+    assert first["amount"] == second["amount"]
+    assert first_main["side"] == second_main["side"]
+    assert first_main["side"] == "player"
+    assert first["amount"] == 90
 
 
 def test_probe_plan_excludes_low_balance_main_and_uses_highest_balance_successor(tmp_path: Path) -> None:

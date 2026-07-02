@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import random
 import re
 import sys
 import threading
@@ -771,6 +772,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         status_poll_seconds: float = 2.0,
         max_log_entries: int = 200,
         on_log: Any = None,
+        plan_random: random.Random | None = None,
     ) -> None:
         super().__init__(max_log_entries=max_log_entries, on_log=on_log)
         self.profile_root = Path(profile_root)
@@ -796,9 +798,41 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         self._participation_lock = threading.Lock()
         self._participation_states: dict[str, str] = {}
         self._round_freshness: dict[str, dict[str, Any]] = {}
+        self._plan_random = plan_random or random.Random()
+        self._plan_side_by_round: dict[int, str] = {}
+        self._plan_amount_order_by_round: dict[tuple[int, tuple[int, ...]], tuple[int, ...]] = {}
         self._output_path = self.log_root / f"lightweight_ui_probe_{probe.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
         self._event_log_path = self.log_root / f"lightweight_ui_probe_events_{probe.datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
         self._status_path = self.log_root / "lightweight_ui_probe.status.txt"
+
+    def _locked_plan_side(self, round_number: int) -> str:
+        key = int(round_number)
+        side = self._plan_side_by_round.get(key)
+        if side not in {"banker", "player"}:
+            side = str(self._plan_random.choice(("banker", "player")))
+            self._plan_side_by_round[key] = side
+            if len(self._plan_side_by_round) > 256:
+                for old_key in sorted(self._plan_side_by_round)[:128]:
+                    self._plan_side_by_round.pop(old_key, None)
+        return side
+
+    def _locked_amount_order(self, round_number: int, valid_amounts: list[int]) -> tuple[int, ...]:
+        amount_key = tuple(int(amount) for amount in valid_amounts)
+        key = (int(round_number), amount_key)
+        ordered = self._plan_amount_order_by_round.get(key)
+        if ordered is None:
+            values = list(amount_key)
+            self._plan_random.shuffle(values)
+            ordered = tuple(values)
+            self._plan_amount_order_by_round[key] = ordered
+            if len(self._plan_amount_order_by_round) > 256:
+                for old_key in list(self._plan_amount_order_by_round)[:128]:
+                    self._plan_amount_order_by_round.pop(old_key, None)
+        return ordered
+
+    def _reset_plan_locks(self) -> None:
+        self._plan_side_by_round.clear()
+        self._plan_amount_order_by_round.clear()
 
     def refresh_runtime_environment(self, platform_slots) -> None:
         self._platform_slots = {slot.account_id: slot for slot in platform_slots}
@@ -1405,8 +1439,9 @@ class LightweightProbeAdapter(BrowserControlAdapter):
                 "legs": [],
                 "excluded_accounts": {},
             }
-        offset = (int(round_number) - 1) % len(valid_amounts)
-        ordered_amounts = (*valid_amounts[offset:], *valid_amounts[:offset])
+        ordered_amounts = self._locked_amount_order(int(round_number), valid_amounts)
+        main_side = self._locked_plan_side(int(round_number))
+        sub_side = "player" if main_side == "banker" else "banker"
         account_pool = list(dict.fromkeys([main_account, *sub_accounts]))
         status_map = self._annotate_round_staleness(statuses or {}, account_pool)
         manual_states = (
@@ -1430,8 +1465,6 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         successor = str(main_successor_account or "").strip()
 
         for amount in ordered_amounts:
-            main_side = "banker" if round_number % 2 else "player"
-            sub_side = "player" if main_side == "banker" else "banker"
             excluded: dict[str, str] = dict(base_excluded)
             main_candidates = [
                 account_id
@@ -1921,6 +1954,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         confirm_ms: int,
         min_countdown: int,
     ) -> None:
+        self._reset_plan_locks()
         for account_id in account_ids:
             await self._ensure_account(account_id, auto_fill_login=False)
         last_round = ""
@@ -1945,6 +1979,7 @@ class LightweightProbeAdapter(BrowserControlAdapter):
         self._hedge_stop_requested = False
         self._hedge_paused = False
         self._hedge_kwargs = dict(kwargs)
+        self._reset_plan_locks()
         account_ids = list(self._hedge_kwargs["account_ids"])
         for account_id in account_ids:
             await self._ensure_account(account_id, auto_fill_login=False)

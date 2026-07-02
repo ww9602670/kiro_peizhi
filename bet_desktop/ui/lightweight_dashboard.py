@@ -1571,6 +1571,12 @@ class LightweightDashboard(QMainWindow):
                     rows[account_id] = item
         return rows
 
+    def _actual_main_account(self, leg_rows: dict[str, dict[str, Any]]) -> str:
+        for account_id, row in leg_rows.items():
+            if str(row.get("role") or "").strip().lower() == "main":
+                return account_id
+        return self.controller.main_account
+
     def _normalized_side(self, value: object) -> str:
         text = str(value or "").strip().lower()
         if text in {"banker", "庄", "庄家"}:
@@ -1586,10 +1592,9 @@ class LightweightDashboard(QMainWindow):
             key = self._outcome_round_key(result)
             if key in self._outcome_recorded_rounds:
                 continue
-            self._outcome_recorded_rounds.add(key)
             result_rows = self._result_by_account(result)
             leg_rows = self._round_leg_by_account(result)
-            main_account = self.controller.main_account
+            main_account = self._actual_main_account(leg_rows)
             main_result = result_rows.get(main_account)
             main_leg = leg_rows.get(main_account, {})
             if not main_result:
@@ -1611,6 +1616,7 @@ class LightweightDashboard(QMainWindow):
                 actual = self._decimal_or_none(row.get("actual_amount"))
                 if actual is not None and actual > 0:
                     banker_total += actual
+            self._outcome_recorded_rounds.add(key)
             self._outcome_pending.append(
                 {
                     "key": key,
